@@ -948,7 +948,15 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         }
 
         {
-            const int32_t requested_slots = params.n_moe_gpu_expert_slot_num;
+            int32_t requested_slots = params.n_moe_gpu_expert_slot_num;
+            // frequency mode auto-activates when slot is default -1
+            if (requested_slots < 0) {
+                const bool is_freq_mode = params.moe_expert_placement &&
+                                          std::string(params.moe_expert_placement) == "frequency";
+                if (is_freq_mode) {
+                    requested_slots = INT32_MAX;
+                }
+            }
             if (requested_slots < 0) {
                 model->moe_gpu_expert_cache.clear();
             } else if (params.no_alloc) {

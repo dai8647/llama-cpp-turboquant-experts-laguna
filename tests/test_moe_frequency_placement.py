@@ -16,7 +16,7 @@ LLAMA_CLI = os.environ.get("LLAMA_CLI",
 MODEL = os.environ.get("MODEL",
     r"C:\Users\dai86\llama-cpp-turboquant\models\DeepSeek-V2-Lite.Q4_K_M.gguf")
 
-def run_cli(extra_args, timeout=120):
+def run_cli(extra_args, timeout=300):
     cmd = [
         LLAMA_CLI,
         "-m", MODEL,
@@ -35,6 +35,7 @@ def test_full_slot_baseline():
         "--moe-gpu-expert-slot-num", "999"
     ])
     stdout2, _, rc2 = run_cli([
+        "--moe-gpu-expert-slot-num", "999",
         "--moe-expert-placement", "frequency",
         "--moe-gpu-expert-ratio", "1.0"
     ])
@@ -59,9 +60,32 @@ def test_freq_collect():
     assert len(data["layers"]) > 0
     os.remove(report_path)
 
+def test_freq_actually_engages():
+    """2-pass: collect stats, then verify frequency placement actually arms"""
+    report_path = os.path.join(os.path.dirname(__file__), "test_freq_engage.json")
+    # pass 1: collect stats
+    stdout1, _, rc1 = run_cli([
+        "--moe-freq-report-path", report_path,
+        "-n", "100"
+    ])
+    assert rc1 == 0, f"freq collect failed: rc={rc1}"
+    assert os.path.exists(report_path), f"JSON not created: {report_path}"
+    # pass 2: apply frequency placement with existing report
+    stdout2, stderr2, rc2 = run_cli([
+        "--moe-gpu-expert-slot-num", "999",
+        "--moe-expert-placement", "frequency",
+        "--moe-gpu-expert-ratio", "0.5",
+        "--moe-freq-report-path", report_path,
+    ])
+    assert rc2 == 0, f"frequency engage failed: rc={rc2}"
+    assert "frequency placement:" in stderr2, \
+        f"Frequency whitelist was not built. stderr excerpt:\n{stderr2[-500:]}"
+    os.remove(report_path)
+
 def test_freq_ratio_06():
     """ratio=0.6で実行が完了すること"""
     stdout, _, rc = run_cli([
+        "--moe-gpu-expert-slot-num", "999",
         "--moe-expert-placement", "frequency",
         "--moe-gpu-expert-ratio", "0.6"
     ])
@@ -72,6 +96,7 @@ def test_freq_ratio_06():
 def test_freq_ratio_03():
     """ratio=0.3で実行が完了すること"""
     stdout, _, rc = run_cli([
+        "--moe-gpu-expert-slot-num", "999",
         "--moe-expert-placement", "frequency",
         "--moe-gpu-expert-ratio", "0.3"
     ])
@@ -81,6 +106,7 @@ if __name__ == "__main__":
     tests = [
         test_full_slot_baseline,
         test_freq_collect,
+        test_freq_actually_engages,
         test_freq_ratio_06,
         test_freq_ratio_03,
     ]

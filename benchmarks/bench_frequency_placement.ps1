@@ -81,14 +81,14 @@ for ($i = 1; $i -le $runs; $i++) {
 
 # HIP frequency placement (ratio=0.6)
 for ($i = 1; $i -le $runs; $i++) {
-    $r = Run-Bench "HIP-freq-0.6" $hip_cli @("-ngl", "999", "--moe-expert-placement", "frequency", "--moe-gpu-expert-ratio", "0.6") $i
+    $r = Run-Bench "HIP-freq-0.6" $hip_cli @("-ngl", "999", "--moe-gpu-expert-slot-num", "999", "--moe-expert-placement", "frequency", "--moe-gpu-expert-ratio", "0.6") $i
     $results += $r
     Start-Sleep -Seconds 2
 }
 
-# HIP full-slot (ratio=1.0)
+# HIP frequency full-slot (ratio=1.0)
 for ($i = 1; $i -le $runs; $i++) {
-    $r = Run-Bench "HIP-freq-1.0" $hip_cli @("-ngl", "999", "--moe-expert-placement", "frequency", "--moe-gpu-expert-ratio", "1.0") $i
+    $r = Run-Bench "HIP-freq-1.0" $hip_cli @("-ngl", "999", "--moe-gpu-expert-slot-num", "999", "--moe-expert-placement", "frequency", "--moe-gpu-expert-ratio", "1.0") $i
     $results += $r
     Start-Sleep -Seconds 2
 }
