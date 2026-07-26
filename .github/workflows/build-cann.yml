@@ -96,6 +96,7 @@ jobs:
 #              cmake -S . -B build \
 #                  -DCMAKE_BUILD_TYPE=${BUILD_TYPE} \
 #                  -DGGML_CANN=on \
+#                  -DLLAMA_UI=OFF \
 #                  -DSOC_TYPE=${SOC_TYPE} \
 #                  -DUSE_ACL_GRAPH=${USE_ACL_GRAPH}
 #              cmake --build build -j $(nproc)
