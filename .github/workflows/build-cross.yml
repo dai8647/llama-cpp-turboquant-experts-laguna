@@ -201,6 +201,7 @@ jobs:
                          -DLLAMA_BUILD_EXAMPLES=ON \
                          -DLLAMA_BUILD_TOOLS=ON \
                          -DLLAMA_BUILD_TESTS=OFF \
+                         -DLLAMA_UI=OFF \
                          -DCMAKE_SYSTEM_NAME=Linux \
                          -DCMAKE_SYSTEM_PROCESSOR=loongarch64 \
                          -DCMAKE_C_COMPILER=loongarch64-linux-gnu-gcc-14 \
@@ -260,6 +261,7 @@ jobs:
                          -DLLAMA_BUILD_EXAMPLES=ON \
                          -DLLAMA_BUILD_TOOLS=ON \
                          -DLLAMA_BUILD_TESTS=OFF \
+                         -DLLAMA_UI=OFF \
                          -DCMAKE_SYSTEM_NAME=Linux \
                          -DCMAKE_SYSTEM_PROCESSOR=loongarch64 \
                          -DCMAKE_C_COMPILER=loongarch64-linux-gnu-gcc-14 \
@@ -305,6 +307,7 @@ jobs:
                          -DGGML_CPU_REPACK=OFF \
                          -DLLAMA_BUILD_TOOLS=ON \
                          -DLLAMA_BUILD_TESTS=OFF \
+                         -DLLAMA_UI=OFF \
                          -DGGML_CPU_RISCV64_SPACEMIT=ON \
                          -DGGML_RVV=ON \
                          -DGGML_RV_ZVFH=ON \
