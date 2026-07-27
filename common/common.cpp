@@ -1189,6 +1189,12 @@ struct common_init_result::impl {
 
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
+    // auto-activate frequency mode: when expert placement is "frequency" and slot-num is default (-1),
+    // set slot-num to INT32_MAX so the fit calculation and model load both see the slot cache overhead
+    if (params.moe_expert_placement == "frequency" && params.n_moe_gpu_expert_slot_num < 0) {
+        params.n_moe_gpu_expert_slot_num = INT32_MAX;
+    }
+
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
