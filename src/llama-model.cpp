@@ -2280,6 +2280,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 }
 
 ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
+    if (params.moe_gpu_expert_cache) {
+        const_cast<llama_moe_gpu_expert_cache *>(params.moe_gpu_expert_cache)->tracker_tensors.clear();
+        // pre-reserve to avoid realloc invalidating tensor pointers across batches
+        const_cast<llama_moe_gpu_expert_cache *>(params.moe_gpu_expert_cache)->tracker_tensors.reserve(64);
+    }
     std::unique_ptr<llm_graph_context> llm = build_arch_graph(params);
 
     // add on pooling layer
@@ -2312,6 +2317,8 @@ llama_model_params llama_model_default_params() {
         /*.n_moe_gpu_expert_slot_num   =*/ -1,
         /*.moe_expert_placement        =*/ nullptr,
         /*.moe_gpu_expert_ratio        =*/ 1.0f,
+        /*.moe_freq_report_in_path     =*/ nullptr,
+        /*.moe_freq_report_out_path    =*/ nullptr,
         /*.moe_freq_report_path        =*/ nullptr,
         /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
         /*.main_gpu                    =*/ 0,

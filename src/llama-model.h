@@ -595,6 +595,14 @@ struct llama_moe_gpu_expert_cache {
     // access tracking for frequency stats
     std::unordered_map<uint64_t, int64_t> access_counts; // key(layer_id, expert_id) -> count
     bool track_access = false;
+    int32_t tracked_n_experts = 0; // model-true n_expert, set at init time
+    std::vector<std::pair<std::string, int32_t>> tracker_tensors; // (tensor_name, layer_id) to read after graph compute. Stores name not pointer because tensor pointers become dangling after graph_context destruction.
+
+    void record_access(int32_t layer_id, int32_t expert_id) {
+        if (!track_access) return;
+        uint64_t k = key(layer_id, expert_id);
+        access_counts[k]++;
+    }
 
     // frequency-based placement: preload experts in this list (frequency order)
     // empty means preload all (full-slot mode)
@@ -719,19 +727,20 @@ struct llama_moe_gpu_expert_cache {
     llama_moe_freq_report generate_access_report(const std::string& fingerprint, int32_t n_active_experts) const {
         llama_moe_freq_report report;
         report.model_fingerprint = fingerprint;
-        report.n_experts = 0;
+        report.n_experts = tracked_n_experts;
         report.n_active_experts = n_active_experts;
 
-        // find max layer and expert IDs
-        int32_t max_layer = 0, max_expert = 0;
+        if (report.n_experts <= 0) {
+            return report;
+        }
+
+        // find max layer ID
+        int32_t max_layer = 0;
         for (const auto& [k, v] : access_counts) {
             int32_t lid = int32_t(k >> 32);
-            int32_t eid = int32_t(k & 0xFFFFFFFF);
             if (lid > max_layer) max_layer = lid;
-            if (eid > max_expert) max_expert = eid;
         }
         report.n_layers = max_layer + 1;
-        report.n_experts = max_expert + 1;
 
         report.stats.resize(report.n_layers * report.n_experts);
         for (int32_t l = 0; l < report.n_layers; l++) {

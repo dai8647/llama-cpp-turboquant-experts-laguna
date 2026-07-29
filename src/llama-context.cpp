@@ -1364,8 +1364,28 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ret = status;
         return nullptr;
     }
-
     ret = GGML_STATUS_SUCCESS;
+
+    // post-compute expert access tracking
+    if (model.moe_gpu_expert_cache.track_access && !model.moe_gpu_expert_cache.enabled()) {
+        for (const auto & [tensor_name, layer_id] : model.moe_gpu_expert_cache.tracker_tensors) {
+            // Find tensor by name in ggml_graph (gf owns the tensors; their lifetime matches this call)
+            ggml_tensor * tensor = (gf != nullptr) ? ggml_graph_get_tensor(gf, tensor_name.c_str()) : nullptr;
+            if (tensor == nullptr) continue;
+            const int64_t n_elems = ggml_nelements(tensor);
+            std::vector<int32_t> cpu_buf(n_elems);
+            ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), tensor);
+            if (backend) {
+                // Use synchronous tensor_get to ensure data is read after graph compute.
+                // The async version requires per-backend synchronize which is fragile across backends.
+                ggml_backend_tensor_get(tensor, cpu_buf.data(), 0, n_elems * sizeof(int32_t));
+                for (int64_t i = 0; i < n_elems; ++i) {
+                    const_cast<llama_moe_gpu_expert_cache &>(model.moe_gpu_expert_cache).record_access(layer_id, cpu_buf[i]);
+                }
+            }
+        }
+        // tracker_tensors is cleared at the start of the next build_graph (with reserve to prevent realloc)
+    }
 
     return res;
 }
@@ -2408,7 +2428,7 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
-        /*.moe_gpu_expert_cache =*/ model.moe_gpu_expert_cache.enabled() ? &model.moe_gpu_expert_cache : nullptr,
+        /*.moe_gpu_expert_cache =*/ (model.moe_gpu_expert_cache.enabled() || model.moe_gpu_expert_cache.track_access) ? &model.moe_gpu_expert_cache : nullptr,
         /*.expert_to_slot =*/ nullptr,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
@@ -3559,11 +3579,11 @@ llama_context * llama_init_from_model(
         }
     }
 
-    // TurboQuant cache types require flash attention — auto-enable if disabled
+    // TurboQuant cache types require flash attention  Eauto-enable if disabled
     if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED &&
         (params.type_k == GGML_TYPE_TURBO2_0 || params.type_k == GGML_TYPE_TURBO3_0 || params.type_k == GGML_TYPE_TURBO4_0 ||
          params.type_v == GGML_TYPE_TURBO2_0 || params.type_v == GGML_TYPE_TURBO3_0 || params.type_v == GGML_TYPE_TURBO4_0)) {
-        LLAMA_LOG_WARN("%s: turbo cache types require flash_attn — enabling automatically\n", __func__);
+        LLAMA_LOG_WARN("%s: turbo cache types require flash_attn  Eenabling automatically\n", __func__);
         params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     }
 

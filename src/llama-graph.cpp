@@ -293,21 +293,34 @@ static void llm_moe_gpu_slot_remap(
     }
 
     auto * remap = static_cast<llm_moe_gpu_slot_remap_userdata *>(userdata);
-    if (remap == nullptr || remap->cache == nullptr || !remap->cache->enabled()) {
+    if (remap == nullptr || remap->cache == nullptr) {
         return;
     }
 
-    GGML_ASSERT(a->type == GGML_TYPE_I32);
-    GGML_ASSERT(dst->type == GGML_TYPE_I32);
-    GGML_ASSERT(ggml_is_contiguous(a));
-    GGML_ASSERT(ggml_is_contiguous(dst));
+    if (remap->cache->track_access && ggml_is_contiguous(a)) {
+        const int32_t * logical = static_cast<const int32_t *>(a->data);
+        const int64_t n = ggml_nelements(a);
+        for (int64_t i = 0; i < n; ++i) {
+            remap->cache->record_access(remap->layer_id, logical[i]);
+        }
+    }
 
-    const int64_t n = ggml_nelements(a);
-    const int32_t * logical = static_cast<const int32_t *>(a->data);
-    int32_t * slots = static_cast<int32_t *>(dst->data);
+    if (remap->cache->enabled()) {
+        GGML_ASSERT(ggml_is_contiguous(a));
+        GGML_ASSERT(a->type == GGML_TYPE_I32);
+        GGML_ASSERT(dst->type == GGML_TYPE_I32);
 
-    for (int64_t i = 0; i < n; ++i) {
-        slots[i] = remap->cache->ensure_resident(remap->layer_id, logical[i], remap->n_experts);
+        const int32_t * logical = static_cast<const int32_t *>(a->data);
+        int32_t * slots = static_cast<int32_t *>(dst->data);
+        const int64_t n = ggml_nelements(a);
+
+        for (int64_t i = 0; i < n; ++i) {
+            slots[i] = remap->cache->ensure_resident(remap->layer_id, logical[i], remap->n_experts);
+        }
+    } else {
+        GGML_ASSERT(dst->type == a->type);
+        GGML_ASSERT(ggml_nelements(dst) == ggml_nelements(a));
+        memcpy(dst->data, a->data, ggml_nbytes(a));
     }
 }
 
@@ -1213,24 +1226,36 @@ ggml_tensor * llm_graph_context::build_moe_gpu_slot_ids(
                   int   il) const {
     if (logical_experts == nullptr ||
         moe_gpu_expert_cache == nullptr ||
-        !moe_gpu_expert_cache->enabled() ||
         il < 0 ||
         n_expert <= 0) {
         return logical_experts;
     }
+    if (!moe_gpu_expert_cache->enabled() && !moe_gpu_expert_cache->track_access) {
+        return logical_experts;
+    }
 
-    auto remap = std::make_unique<llm_moe_gpu_slot_remap_userdata>();
-    remap->cache = const_cast<llama_moe_gpu_expert_cache *>(moe_gpu_expert_cache);
-    remap->layer_id = il;
-    remap->n_experts = (int32_t) n_expert;
+    if (moe_gpu_expert_cache->enabled()) {
+        auto remap = std::make_unique<llm_moe_gpu_slot_remap_userdata>();
+        remap->cache = const_cast<llama_moe_gpu_expert_cache *>(moe_gpu_expert_cache);
+        remap->layer_id = il;
+        remap->n_experts = (int32_t) n_expert;
 
-    llm_moe_gpu_slot_remap_userdata * remap_ptr = remap.get();
-    moe_gpu_slot_remap_userdata.push_back(std::move(remap));
+        llm_moe_gpu_slot_remap_userdata * remap_ptr = remap.get();
+        moe_gpu_slot_remap_userdata.push_back(std::move(remap));
 
-    ggml_tensor * slot_ids = ggml_map_custom1(ctx0, logical_experts, llm_moe_gpu_slot_remap, 1, remap_ptr);
-    cb(slot_ids, "ffn_moe_gpu_slot_ids", il);
+        ggml_tensor * cpu_experts = ggml_cpy(ctx0, logical_experts,
+            ggml_new_tensor_2d(ctx0, logical_experts->type, logical_experts->ne[0], logical_experts->ne[1]));
+        ggml_tensor * slot_ids = ggml_map_custom1(ctx0, cpu_experts, llm_moe_gpu_slot_remap, 1, remap_ptr);
+        cb(slot_ids, "ffn_moe_gpu_slot_ids", il);
+        return slot_ids;
+    }
 
-    return slot_ids;
+    // track_access only: set tensor NAME then save name for post-compute reading
+    char name_buf[GGML_MAX_NAME];
+    snprintf(name_buf, sizeof(name_buf), "ffn_moe_topk.%d", il);
+    ggml_set_name(logical_experts, name_buf);
+    const_cast<llama_moe_gpu_expert_cache *>(moe_gpu_expert_cache)->tracker_tensors.push_back({std::string(name_buf), il});
+    return logical_experts;
 }
 
 ggml_tensor * llm_graph_context::build_norm(
@@ -1700,6 +1725,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         down_exps_b    = moe_gpu_expert_cache->compute_tensor(down_exps_b);
         gate_up_exps_b = moe_gpu_expert_cache->compute_tensor(gate_up_exps_b);
     }
+
+    selected_experts_compute = build_moe_gpu_slot_ids(selected_experts_compute, n_expert, il);
 
     if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT) {
         weights = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens);
