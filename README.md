@@ -48,9 +48,28 @@ llama-cli -ngl 999 --moe-freq-report-path stats.json -m model.gguf
 
 Expert選択頻度を記録し、高頻度ExpertをGPUに優先配置。
 
-- `--moe-expert-placement frequency` : 頻度ベース配置モード
-- `--moe-gpu-expert-ratio 0.6` : GPU配置割合 (0.0-1.0)
-- `--moe-freq-report-path stats.json` : 統計JSON出力
+#### 2パスワークフロー
+
+1. **Pass 1 (計測)**: 全expertをロードして推論し、各expertの使用頻度を記録
+2. **Pass 2 (配置最適化)**: 頻度JSONから高頻度expertだけをGPUに配置
+
+| フラグ | 用途 |
+|---|---|
+| `--moe-freq-report-out PATH` | Pass 1: 頻度統計をJSONに書き出す (track_access有効化) |
+| `--moe-freq-report-in PATH` | Pass 2: 頻度JSONを読み込み、上位expertをGPU配置 |
+| `--moe-freq-report-path PATH` | [DEPRECATED] 両方を兼ねる旧フラグ |
+| `--moe-expert-placement frequency` | 頻度ベース配置モード |
+| `--moe-gpu-expert-ratio 0.6` | GPU配置割合 (0.0-1.0) |
+
+使用例:
+```bash
+# Pass 1: 統計収集 (full-slotでもOK、track_accessだけ有効)
+./llama-cli -m model.gguf --moe-freq-report-out stats.json -p "..." -n 256
+
+# Pass 2: 高頻度expertだけGPU配置
+./llama-cli -m model.gguf --moe-expert-placement frequency \
+    --moe-freq-report-in stats.json --moe-gpu-expert-ratio 0.6 -p "..." -n 256
+```
 
 ## ビルド
 

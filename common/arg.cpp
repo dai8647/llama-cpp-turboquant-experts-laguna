@@ -2413,9 +2413,24 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
-        {"--moe-freq-report-path"}, "PATH",
-        "write MoE expert frequency stats JSON to this path after inference",
+        {"--moe-freq-report-in"}, "PATH",
+        "read-only path to frequency stats JSON (pass 2, does not save or track)",
         [](common_params & params, const std::string & value) {
+            params.moe_freq_report_in_path = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-freq-report-out"}, "PATH",
+        "write MoE expert frequency stats JSON to this path after inference (pass 1, enables tracking)",
+        [](common_params & params, const std::string & value) {
+            params.moe_freq_report_out_path = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-freq-report-path"}, "PATH",
+        "[DEPRECATED] use --moe-freq-report-in and --moe-freq-report-out instead. Sets both.",
+        [](common_params & params, const std::string & value) {
+            fprintf(stderr, "warning: --moe-freq-report-path is deprecated; use --moe-freq-report-in and --moe-freq-report-out instead\n");
             params.moe_freq_report_path = value;
         }
     ));

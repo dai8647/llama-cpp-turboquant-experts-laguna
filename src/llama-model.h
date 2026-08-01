@@ -10,6 +10,7 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <cstring>
 #include <numeric>
 
 #include <map>
@@ -579,6 +580,14 @@ struct llama_moe_gpu_expert_cache {
 
     int32_t n_slots = 0;
 
+    bool record_access_in_callback = false; // off by default; post-compute path handles tracking
+
+    // Set to true in --moe-expert-placement frequency mode. When true, the slot cache
+    // callback path is skipped (AMD driver on RDNA4 GPU triggers SIGSEGV in the callback's
+    // ggml_cpy / ggml_map_custom1 path). Frequency placement still works via the whitelist
+    // check in ensure_resident, but the cache itself is bypassed.
+    bool frequency_mode = false;
+
     std::unordered_map<int32_t, std::vector<llama_moe_gpu_expert_slot>> slots_by_layer;
     std::unordered_map<int32_t, llama_moe_gpu_expert_bank> banks_by_layer;
     std::unordered_map<uint64_t, int32_t> expert_to_slot;
@@ -613,12 +622,18 @@ struct llama_moe_gpu_expert_cache {
     }
 
     void init(int32_t n) {
-        n_slots = n > 0 ? n : 0;
+        // Clamp to a safe per-layer upper bound. The raw `n` (which can be INT32_MAX from
+        // --moe-expert-placement frequency) is interpreted as "how many slots PER LAYER" in
+        // llama_moe_gpu_expert_slot_effective_count, but the previous code stored it directly
+        // as n_slots (total), causing n_slots=INT32_MAX in some paths and downstream SIGSEGV
+        // when iterating slot tables. Cap to the total experts per layer (256) plus headroom.
+        const int32_t capped = n > 0 ? std::min<int32_t>(n, 256) : 0;
+        n_slots = capped;
         slots_by_layer.clear();
         banks_by_layer.clear();
         expert_to_slot.clear();
         compute_tensor_by_src.clear();
-        expert_to_slot.reserve(n_slots);
+        expert_to_slot.reserve(n_slots > 0 ? n_slots * 40 : 0);
         frequency_whitelist.clear();
         clock = 0;
         n_hit = 0;
@@ -665,6 +680,14 @@ struct llama_moe_gpu_expert_cache {
 
     bool enabled() const {
         return n_slots > 0;
+    }
+
+    // record_access_enabled: gate to opt-in for callback-based tracking
+    // The post-compute tracking path (process_ubatch) handles all recording
+    // by default. Set to false in upstream-sync-stable builds unless
+    // callback-based tracking is explicitly desired.
+    bool record_access_enabled() const {
+        return record_access_in_callback;
     }
 
     int32_t size() const {
@@ -938,6 +961,9 @@ struct llama_moe_gpu_expert_cache {
             return expert_id;
         }
 
+        fprintf(stderr, "[SEGFAULT-DEBUG] ensure_resident: layer=%d expert=%d n_experts=%d n_slots=%d\n",
+                layer_id, expert_id, n_experts, n_slots);
+        fflush(stderr);
         int32_t slot = find(layer_id, expert_id);
         if (slot >= 0) {
             ++n_hit;
@@ -960,10 +986,17 @@ struct llama_moe_gpu_expert_cache {
         }
 
         if (slot < 0) {
+            fprintf(stderr, "[SEGFAULT-DEBUG] no slot available, returning expert_id=%d\n", expert_id);
+            fflush(stderr);
             return expert_id;
         }
 
+        fprintf(stderr, "[SEGFAULT-DEBUG] before preload_or_assign_slot: slot=%d layer=%d expert=%d\n",
+                slot, layer_id, expert_id);
+        fflush(stderr);
         slot = preload_or_assign_slot(layer_id, expert_id, ++clock);
+        fprintf(stderr, "[SEGFAULT-DEBUG] after preload_or_assign_slot: slot=%d\n", slot);
+        fflush(stderr);
         if (slot < 0) {
             return expert_id;
         }

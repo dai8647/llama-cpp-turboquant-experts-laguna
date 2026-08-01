@@ -1538,7 +1538,17 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.n_moe_gpu_expert_slot_num = params.n_moe_gpu_expert_slot_num;
     mparams.moe_expert_placement = params.moe_expert_placement.empty() ? nullptr : params.moe_expert_placement.c_str();
     mparams.moe_gpu_expert_ratio = params.moe_gpu_expert_ratio;
-    mparams.moe_freq_report_path = params.moe_freq_report_path.empty() ? nullptr : params.moe_freq_report_path.c_str();
+    // backward compat: legacy --moe-freq-report-path sets both in and out
+    if (!params.moe_freq_report_path.empty()) {
+        if (params.moe_freq_report_in_path.empty()) {
+            params.moe_freq_report_in_path = params.moe_freq_report_path;
+        }
+        if (params.moe_freq_report_out_path.empty()) {
+            params.moe_freq_report_out_path = params.moe_freq_report_path;
+        }
+    }
+    mparams.moe_freq_report_in_path = params.moe_freq_report_in_path.empty() ? nullptr : params.moe_freq_report_in_path.c_str();
+    mparams.moe_freq_report_out_path = params.moe_freq_report_out_path.empty() ? nullptr : params.moe_freq_report_out_path.c_str();
     mparams.main_gpu        = params.main_gpu;
     mparams.split_mode      = params.split_mode;
     mparams.tensor_split    = params.tensor_split;

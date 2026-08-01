@@ -672,12 +672,15 @@ int llama_cli(int argc, char ** argv) {
 
     console::log("\nExiting...\n");
 
-    // save frequency report if path was specified
-    fprintf(stderr, "[cli-debug] moe_freq_report_path='%s'\n", params.moe_freq_report_path.c_str());
-    if (!params.moe_freq_report_path.empty()) {
+    // save frequency report if out path was specified
+    fprintf(stderr, "[cli-debug] moe_freq_report_out_path='%s'\n", params.moe_freq_report_out_path.c_str());
+    const std::string & save_path = !params.moe_freq_report_out_path.empty()
+        ? params.moe_freq_report_out_path
+        : params.moe_freq_report_path;
+    if (!save_path.empty()) {
         llama_context * lctx = ctx_cli.ctx_server.get_llama_context();
-        if (llama_save_moe_freq_report(lctx, params.moe_freq_report_path.c_str())) {
-            console::log("Frequency report saved to %s\n", params.moe_freq_report_path.c_str());
+        if (llama_save_moe_freq_report(lctx, save_path.c_str())) {
+            console::log("Frequency report saved to %s\n", save_path.c_str());
         }
     }
 

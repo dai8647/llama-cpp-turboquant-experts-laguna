@@ -301,7 +301,9 @@ extern "C" {
         int32_t n_moe_gpu_expert_slot_num; // number of GPU-resident MoE expert slots, -1 disables expert-slot mode
         const char * moe_expert_placement; // "all-gpu", "frequency", "cpu-moe", or NULL (default: all-gpu)
         float moe_gpu_expert_ratio; // ratio of experts to place on GPU for frequency mode (0.0-1.0)
-        const char * moe_freq_report_path; // path to write frequency stats JSON, or NULL
+        const char * moe_freq_report_in_path;  // path to read frequency stats JSON (pass 2, read-only), or NULL
+        const char * moe_freq_report_out_path; // path to write frequency stats JSON (pass 1, enables tracking), or NULL
+        const char * moe_freq_report_path; // [DEPRECATED] use in/out flags instead
         enum llama_split_mode split_mode; // how to split the model across multiple GPUs
 
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE

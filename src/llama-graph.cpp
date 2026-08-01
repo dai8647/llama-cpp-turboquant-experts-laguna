@@ -293,19 +293,32 @@ static void llm_moe_gpu_slot_remap(
     }
 
     auto * remap = static_cast<llm_moe_gpu_slot_remap_userdata *>(userdata);
+    fprintf(stderr, "[SEGFAULT-DEBUG] slot_remap cb: ith=%d remap=%p cache=%p enabled=%d track_access=%d a=%p dst=%p a->data=%p dst->data=%p\n",
+            ith, (const void*)remap, (const void*)(remap ? remap->cache : nullptr),
+            remap && remap->cache ? (int)remap->cache->enabled() : -1,
+            remap && remap->cache ? (int)remap->cache->track_access : -1,
+            (const void*)a, (const void*)dst,
+            remap ? (const void*)a->data : nullptr,
+            remap ? (const void*)dst->data : nullptr);
+    fflush(stderr);
     if (remap == nullptr || remap->cache == nullptr) {
         return;
     }
 
     if (remap->cache->track_access && ggml_is_contiguous(a)) {
-        const int32_t * logical = static_cast<const int32_t *>(a->data);
-        const int64_t n = ggml_nelements(a);
-        for (int64_t i = 0; i < n; ++i) {
-            remap->cache->record_access(remap->layer_id, logical[i]);
+        // NOTE: track_access inside callback was stripped in upstream sync (silent regression).
+        // post-compute tracking in process_ubatch reads tracker_tensors instead, so we skip
+        // recording here to avoid the broken callback path.
+        if (remap->cache->record_access_enabled()) {
+            const int32_t * logical = static_cast<const int32_t *>(a->data);
+            const int64_t n = ggml_nelements(a);
+            for (int64_t i = 0; i < n; ++i) {
+                remap->cache->record_access(remap->layer_id, logical[i]);
+            }
         }
     }
 
-    if (remap->cache->enabled()) {
+    if (remap->cache->enabled() && false) { // DISABLED: AMD driver crash on RDNA4 GPU slot cache path
         GGML_ASSERT(ggml_is_contiguous(a));
         GGML_ASSERT(a->type == GGML_TYPE_I32);
         GGML_ASSERT(dst->type == GGML_TYPE_I32);
@@ -318,6 +331,9 @@ static void llm_moe_gpu_slot_remap(
             slots[i] = remap->cache->ensure_resident(remap->layer_id, logical[i], remap->n_experts);
         }
     } else {
+        // Fallback pass-through: skip slot cache. AMD driver on RDNA4 GPU triggers SIGSEGV
+        // in the slot cache path even with n_slots=256 (small). Frequency placement still
+        // functions through the post-compute tracker_tensors path in process_ubatch.
         GGML_ASSERT(dst->type == a->type);
         GGML_ASSERT(ggml_nelements(dst) == ggml_nelements(a));
         memcpy(dst->data, a->data, ggml_nbytes(a));
@@ -1224,6 +1240,11 @@ ggml_tensor * llm_graph_context::build_moe_gpu_slot_ids(
           ggml_tensor * logical_experts,
               int64_t   n_expert,
                   int   il) const {
+    fprintf(stderr, "[SEGFAULT-DEBUG] build_moe_gpu_slot_ids entry: il=%d n_expert=%lld logical_experts=%p cache=%p enabled=%d track_access=%d\n",
+            il, (long long)n_expert, (const void*)logical_experts, (const void*)moe_gpu_expert_cache,
+            moe_gpu_expert_cache ? (int)moe_gpu_expert_cache->enabled() : -1,
+            moe_gpu_expert_cache ? (int)moe_gpu_expert_cache->track_access : -1);
+    fflush(stderr);
     if (logical_experts == nullptr ||
         moe_gpu_expert_cache == nullptr ||
         il < 0 ||
@@ -1234,7 +1255,11 @@ ggml_tensor * llm_graph_context::build_moe_gpu_slot_ids(
         return logical_experts;
     }
 
-    if (moe_gpu_expert_cache->enabled()) {
+    if (moe_gpu_expert_cache->enabled() && !moe_gpu_expert_cache->frequency_mode) {
+        // Pre-reserve to prevent vector realloc from invalidating the raw pointer we pass to ggml_map_custom1.
+        if (moe_gpu_slot_remap_userdata.capacity() <= moe_gpu_slot_remap_userdata.size()) {
+            moe_gpu_slot_remap_userdata.reserve(moe_gpu_slot_remap_userdata.size() + 64);
+        }
         auto remap = std::make_unique<llm_moe_gpu_slot_remap_userdata>();
         remap->cache = const_cast<llama_moe_gpu_expert_cache *>(moe_gpu_expert_cache);
         remap->layer_id = il;
@@ -1242,6 +1267,7 @@ ggml_tensor * llm_graph_context::build_moe_gpu_slot_ids(
 
         llm_moe_gpu_slot_remap_userdata * remap_ptr = remap.get();
         moe_gpu_slot_remap_userdata.push_back(std::move(remap));
+        remap_ptr = moe_gpu_slot_remap_userdata.back().get();
 
         ggml_tensor * cpu_experts = ggml_cpy(ctx0, logical_experts,
             ggml_new_tensor_2d(ctx0, logical_experts->type, logical_experts->ne[0], logical_experts->ne[1]));

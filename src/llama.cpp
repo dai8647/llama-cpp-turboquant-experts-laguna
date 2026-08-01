@@ -957,6 +957,16 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                     requested_slots = INT32_MAX;
                 }
             }
+            // enable access tracking when out path is specified (independent of slot cache)
+            const char * freq_report_out = params.moe_freq_report_out_path && params.moe_freq_report_out_path[0]
+                ? params.moe_freq_report_out_path
+                : (params.moe_freq_report_path && params.moe_freq_report_path[0]
+                    ? params.moe_freq_report_path : nullptr);
+            if (freq_report_out) {
+                model->moe_gpu_expert_cache.track_access = true;
+            }
+            model->moe_gpu_expert_cache.tracked_n_experts = (int32_t)model->hparams.n_expert;
+
             if (requested_slots < 0) {
                 model->moe_gpu_expert_cache.clear();
             } else if (params.no_alloc) {
@@ -972,13 +982,23 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                     model->moe_gpu_expert_cache.clear();
                 } else {
                     model->moe_gpu_expert_cache.init(effective_slots);
-                    LLAMA_LOG_INFO("%s: initialized MoE GPU expert slot cache with %d slots (requested %d)\n", __func__, effective_slots, requested_slots);
+                    LLAMA_LOG_INFO("%s: initialized MoE GPU expert slot cache with %d slots (requested %d), tracked_n_experts=%d\n", __func__, effective_slots, requested_slots, model->hparams.n_expert);
+
+                    // Detect frequency mode early: this disables the broken slot-cache callback path.
+                    if (params.moe_expert_placement &&
+                        std::string(params.moe_expert_placement) == "frequency") {
+                        model->moe_gpu_expert_cache.frequency_mode = true;
+                    }
 
                     // frequency-based placement: set whitelist from freq report
                     const bool is_freq_mode = params.moe_expert_placement &&
                                               std::string(params.moe_expert_placement) == "frequency";
-                    if (is_freq_mode && params.moe_freq_report_path) {
-                        llama_moe_freq_report freq_report = load_freq_report(params.moe_freq_report_path);
+                    const char * freq_report_in = params.moe_freq_report_in_path && params.moe_freq_report_in_path[0]
+                        ? params.moe_freq_report_in_path
+                        : (params.moe_freq_report_path && params.moe_freq_report_path[0]
+                            ? params.moe_freq_report_path : nullptr);
+                    if (is_freq_mode && freq_report_in) {
+                        llama_moe_freq_report freq_report = load_freq_report(freq_report_in);
                         if (!freq_report.stats.empty()) {
                             const int32_t total_experts = freq_report.n_layers * freq_report.n_experts;
                             const int32_t gpu_count = std::max(1, static_cast<int32_t>(
@@ -995,13 +1015,8 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                                     __func__, (int32_t)whitelist.size(), total_experts, params.moe_gpu_expert_ratio);
                         } else {
                             LLAMA_LOG_WARN("%s: frequency report not found or empty at %s, falling back to full-slot mode\n",
-                                    __func__, params.moe_freq_report_path);
+                                    __func__, freq_report_in);
                         }
-                    }
-
-                    // enable access tracking when freq report path is specified
-                    if (params.moe_freq_report_path && params.moe_freq_report_path[0]) {
-                        model->moe_gpu_expert_cache.track_access = true;
                     }
 
                     llama_moe_gpu_expert_slot_preload(*model);
@@ -1259,19 +1274,14 @@ const char * llama_print_system_info(void) {
 
 bool llama_save_moe_freq_report(llama_context * ctx, const char * path) {
     if (!ctx || !path || !path[0]) {
-        fprintf(stderr, "[moe-stats] save called with null ctx or path\n");
         return false;
     }
     const auto & model = ctx->get_model();
-    fprintf(stderr, "[moe-stats] track_access=%d, access_counts=%zu\n",
-        model.moe_gpu_expert_cache.track_access,
-        model.moe_gpu_expert_cache.access_counts.size());
     if (!model.moe_gpu_expert_cache.track_access) return false;
     auto report = model.moe_gpu_expert_cache.generate_access_report("moe-access-tracking", 0);
-    fprintf(stderr, "[moe-stats] report stats=%zu, sorted=%zu\n",
-        report.stats.size(), report.sorted_by_frequency.size());
-    bool ok = save_freq_report(report, path);
-    fprintf(stderr, "[moe-stats] save_freq_report returned %d\n", ok);
-    return ok;
+    if (report.n_experts <= 0) {
+        return false;
+    }
+    return save_freq_report(report, path);
 }
 
