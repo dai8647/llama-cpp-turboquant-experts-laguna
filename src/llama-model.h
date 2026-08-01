@@ -6,6 +6,13 @@
 #include "llama-hparams.h"
 #include "llama-memory.h"
 #include "llama-vocab.h"
+#include "llama-moe-stats.h"
+#include "ggml-cpp.h"
+
+#include <algorithm>
+#include <cstdlib>
+#include <cstring>
+#include <numeric>
 
 #include <map>
 #include <memory>
@@ -548,6 +555,449 @@ struct llama_meta_device_get_split_state_userdata {
 
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata);
 
+struct llama_moe_gpu_expert_slot_tensor {
+    std::string name;
+    struct ggml_tensor * src = nullptr;
+    struct ggml_tensor * dev = nullptr;
+    size_t nbytes = 0;
+};
+
+struct llama_moe_gpu_expert_slot {
+    int32_t layer_id  = -1;
+    int32_t expert_id = -1;
+    int64_t last_used = 0;
+    bool resident     = false;
+    bool bank_backed  = false;
+
+    ggml_context_ptr ctx;
+    ggml_backend_buffer_ptr buf;
+    std::vector<llama_moe_gpu_expert_slot_tensor> tensors;
+
+    void clear_storage() {
+        tensors.clear();
+        buf.reset();
+        ctx.reset();
+        bank_backed = false;
+    }
+};
+
+struct llama_moe_gpu_expert_bank_tensor {
+    std::string name;
+    struct ggml_tensor * src = nullptr;
+    struct ggml_tensor * dev = nullptr;
+    int32_t expert_dim = -1;
+    size_t nbytes_per_expert = 0;
+};
+
+struct llama_moe_gpu_expert_bank {
+    int32_t layer_id  = -1;
+    int32_t n_experts = 0;
+    int32_t n_slots   = 0;
+
+    ggml_context_ptr ctx;
+    ggml_backend_buffer_ptr buf;
+    std::vector<llama_moe_gpu_expert_bank_tensor> tensors;
+
+    void clear_storage() {
+        tensors.clear();
+        buf.reset();
+        ctx.reset();
+    }
+};
+
+struct llama_moe_gpu_expert_cache {
+    using materialize_cb_t = bool (*)(void * userdata, int32_t slot_id, int32_t layer_id, int32_t expert_id, int32_t n_experts);
+
+    int32_t n_slots = 0;
+
+    std::unordered_map<int32_t, std::vector<llama_moe_gpu_expert_slot>> slots_by_layer;
+    std::unordered_map<int32_t, llama_moe_gpu_expert_bank> banks_by_layer;
+    std::unordered_map<uint64_t, int32_t> expert_to_slot;
+    std::unordered_map<const ggml_tensor *, ggml_tensor *> compute_tensor_by_src;
+
+    materialize_cb_t materialize_cb = nullptr;
+    void * materialize_userdata = nullptr;
+
+    int64_t clock = 0;
+    int64_t n_hit = 0;
+    int64_t n_miss = 0;
+    int64_t n_evict = 0;
+
+    // access tracking for frequency stats
+    std::unordered_map<uint64_t, int64_t> access_counts; // key(layer_id, expert_id) -> count
+    bool track_access = false;
+
+    // frequency-based placement: preload experts in this list (frequency order)
+    // empty means preload all (full-slot mode)
+    std::vector<std::pair<int32_t, int32_t>> frequency_whitelist;
+
+    static uint64_t key(int32_t layer_id, int32_t expert_id) {
+        return (uint64_t(uint32_t(layer_id)) << 32) | uint32_t(expert_id);
+    }
+
+    void init(int32_t n) {
+        n_slots = n > 0 ? n : 0;
+        slots_by_layer.clear();
+        banks_by_layer.clear();
+        expert_to_slot.clear();
+        compute_tensor_by_src.clear();
+        expert_to_slot.reserve(n_slots);
+        frequency_whitelist.clear();
+        clock = 0;
+        n_hit = 0;
+        n_miss = 0;
+        n_evict = 0;
+    }
+
+    bool is_in_frequency_whitelist(int32_t layer_id, int32_t expert_id) const {
+        if (frequency_whitelist.empty()) {
+            return true; // no whitelist = full-slot mode
+        }
+        for (const auto& [lid, eid] : frequency_whitelist) {
+            if (lid == layer_id && eid == expert_id) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void set_frequency_whitelist(const std::vector<std::pair<int32_t, int32_t>>& experts) {
+        frequency_whitelist = experts;
+    }
+
+    void clear() {
+        for (auto & layer_slots : slots_by_layer) {
+            for (auto & slot : layer_slots.second) {
+                slot.clear_storage();
+            }
+        }
+        for (auto & layer_bank : banks_by_layer) {
+            layer_bank.second.clear_storage();
+        }
+        n_slots = 0;
+        slots_by_layer.clear();
+        banks_by_layer.clear();
+        expert_to_slot.clear();
+        compute_tensor_by_src.clear();
+        frequency_whitelist.clear();
+        clock = 0;
+        n_hit = 0;
+        n_miss = 0;
+        n_evict = 0;
+    }
+
+    bool enabled() const {
+        return n_slots > 0;
+    }
+
+    int32_t size() const {
+        return n_slots;
+    }
+
+    bool empty() const {
+        return n_slots == 0;
+    }
+
+    void register_compute_tensor(const ggml_tensor * src, ggml_tensor * compute) {
+        if (src != nullptr && compute != nullptr) {
+            compute_tensor_by_src[src] = compute;
+        }
+    }
+
+    ggml_tensor * compute_tensor(const ggml_tensor * src) const {
+        if (src == nullptr) {
+            return nullptr;
+        }
+        const auto it = compute_tensor_by_src.find(src);
+        if (it == compute_tensor_by_src.end()) {
+            return const_cast<ggml_tensor *>(src);
+        }
+        // track access for frequency stats
+        if (track_access && src->name[0] != '\0') {
+            // parse tensor name: blk.{bid}.ffn_{type}_exps.weight
+            // or: model.layers.{bid}.mlp.experts.{eid}.{w}.weight
+            const char * name = src->name;
+            int32_t layer_id = -1;
+            int32_t expert_id = 0; // default: all experts (packed tensor)
+
+            const char * blk_pos = strstr(name, "blk.");
+            const char * layers_pos = strstr(name, "layers.");
+            const char * experts_pos = strstr(name, "experts.");
+
+            if (blk_pos) {
+                layer_id = atoi(blk_pos + 4);
+            } else if (layers_pos) {
+                layer_id = atoi(layers_pos + 7);
+            }
+
+            if (experts_pos) {
+                expert_id = atoi(experts_pos + 8);
+            }
+
+            if (layer_id >= 0) {
+                uint64_t k = key(layer_id, expert_id);
+                const_cast<llama_moe_gpu_expert_cache*>(this)->access_counts[k]++;
+            }
+        }
+        return it->second;
+    }
+
+    bool uses_compute_tensor(const ggml_tensor * src) const {
+        return src != nullptr && compute_tensor_by_src.find(src) != compute_tensor_by_src.end();
+    }
+
+    // Generate frequency report from access counts
+    llama_moe_freq_report generate_access_report(const std::string& fingerprint, int32_t n_active_experts) const {
+        llama_moe_freq_report report;
+        report.model_fingerprint = fingerprint;
+        report.n_experts = 0;
+        report.n_active_experts = n_active_experts;
+
+        // find max layer and expert IDs
+        int32_t max_layer = 0, max_expert = 0;
+        for (const auto& [k, v] : access_counts) {
+            int32_t lid = int32_t(k >> 32);
+            int32_t eid = int32_t(k & 0xFFFFFFFF);
+            if (lid > max_layer) max_layer = lid;
+            if (eid > max_expert) max_expert = eid;
+        }
+        report.n_layers = max_layer + 1;
+        report.n_experts = max_expert + 1;
+
+        report.stats.resize(report.n_layers * report.n_experts);
+        for (int32_t l = 0; l < report.n_layers; l++) {
+            for (int32_t e = 0; e < report.n_experts; e++) {
+                auto& s = report.stats[l * report.n_experts + e];
+                s.layer_id = l;
+                s.expert_id = e;
+                s.prompt_selections = 0;
+                s.gen_selections = 0;
+                s.total_selections = 0;
+                s.estimated_weight_bytes = 0;
+                auto it = access_counts.find(key(l, e));
+                if (it != access_counts.end()) {
+                    s.total_selections = it->second;
+                    s.gen_selections = it->second;
+                }
+            }
+        }
+
+        report.sorted_by_frequency.resize(report.n_layers * report.n_experts);
+        std::iota(report.sorted_by_frequency.begin(), report.sorted_by_frequency.end(), 0);
+        std::sort(report.sorted_by_frequency.begin(), report.sorted_by_frequency.end(),
+            [&](int32_t a, int32_t b) {
+                return report.stats[a].total_selections > report.stats[b].total_selections;
+            });
+
+        return report;
+    }
+
+    std::vector<llama_moe_gpu_expert_slot> & slots_for_layer(int32_t layer_id) {
+        auto & layer_slots = slots_by_layer[layer_id];
+        if ((int32_t) layer_slots.size() != n_slots) {
+            layer_slots.resize(n_slots);
+        }
+        return layer_slots;
+    }
+
+    const std::vector<llama_moe_gpu_expert_slot> * slots_for_layer(int32_t layer_id) const {
+        const auto it = slots_by_layer.find(layer_id);
+        if (it == slots_by_layer.end()) {
+            return nullptr;
+        }
+        return &it->second;
+    }
+
+    llama_moe_gpu_expert_bank & bank_for_layer(int32_t layer_id) {
+        return banks_by_layer[layer_id];
+    }
+
+    const llama_moe_gpu_expert_bank * bank_for_layer(int32_t layer_id) const {
+        const auto it = banks_by_layer.find(layer_id);
+        if (it == banks_by_layer.end()) {
+            return nullptr;
+        }
+        return &it->second;
+    }
+
+    llama_moe_gpu_expert_slot * slot_at(int32_t layer_id, int32_t slot_id) {
+        if (slot_id < 0 || slot_id >= n_slots) {
+            return nullptr;
+        }
+        return &slots_for_layer(layer_id)[slot_id];
+    }
+
+    const llama_moe_gpu_expert_slot * slot_at(int32_t layer_id, int32_t slot_id) const {
+        if (slot_id < 0 || slot_id >= n_slots) {
+            return nullptr;
+        }
+        const auto * layer_slots = slots_for_layer(layer_id);
+        if (layer_slots == nullptr || slot_id >= (int32_t) layer_slots->size()) {
+            return nullptr;
+        }
+        return &(*layer_slots)[slot_id];
+    }
+
+    int32_t find(int32_t layer_id, int32_t expert_id) const {
+        const auto it = expert_to_slot.find(key(layer_id, expert_id));
+        if (it == expert_to_slot.end()) {
+            return -1;
+        }
+        const int32_t slot_id = it->second;
+        if (slot_id < 0 || slot_id >= n_slots) {
+            return -1;
+        }
+        const auto * slot = slot_at(layer_id, slot_id);
+        if (slot == nullptr || !slot->resident || slot->layer_id != layer_id || slot->expert_id != expert_id) {
+            return -1;
+        }
+        return slot_id;
+    }
+
+    int32_t find_free(int32_t layer_id) const {
+        const auto * layer_slots = slots_for_layer(layer_id);
+        if (layer_slots == nullptr) {
+            return 0;
+        }
+        for (int32_t i = 0; i < n_slots; ++i) {
+            if (!(*layer_slots)[i].resident) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    int32_t find_lru_victim(int32_t layer_id) const {
+        if (n_slots <= 0) {
+            return -1;
+        }
+        const auto * layer_slots = slots_for_layer(layer_id);
+        if (layer_slots == nullptr) {
+            return 0;
+        }
+        int32_t victim = 0;
+        for (int32_t i = 1; i < n_slots; ++i) {
+            if ((*layer_slots)[i].last_used < (*layer_slots)[victim].last_used) {
+                victim = i;
+            }
+        }
+        return victim;
+    }
+
+    void assign_slot(int32_t slot_id, int32_t layer_id, int32_t expert_id, int64_t step) {
+        if (slot_id < 0 || slot_id >= n_slots) {
+            return;
+        }
+        auto & s = slots_for_layer(layer_id)[slot_id];
+        if (s.resident) {
+            expert_to_slot.erase(key(s.layer_id, s.expert_id));
+            s.clear_storage();
+        }
+        s.layer_id = layer_id;
+        s.expert_id = expert_id;
+        s.last_used = step;
+        s.resident = true;
+        expert_to_slot[key(layer_id, expert_id)] = slot_id;
+    }
+
+    int32_t get_or_assign_slot(int32_t layer_id, int32_t expert_id, int64_t step) {
+        clock = std::max(clock, step);
+
+        const int32_t hit_slot = find(layer_id, expert_id);
+        if (hit_slot >= 0) {
+            ++n_hit;
+            if (auto * slot = slot_at(layer_id, hit_slot)) {
+                slot->last_used = step;
+            }
+            return hit_slot;
+        }
+
+        ++n_miss;
+        int32_t slot = find_free(layer_id);
+        if (slot < 0) {
+            slot = find_lru_victim(layer_id);
+            const auto * victim = slot_at(layer_id, slot);
+            if (victim != nullptr && victim->resident) {
+                ++n_evict;
+            }
+        }
+
+        if (slot >= 0) {
+            assign_slot(slot, layer_id, expert_id, step);
+        }
+        return slot;
+    }
+
+    int32_t preload_or_assign_slot(int32_t layer_id, int32_t expert_id, int64_t step) {
+        clock = std::max(clock, step);
+
+        const int32_t hit_slot = find(layer_id, expert_id);
+        if (hit_slot >= 0) {
+            if (auto * slot = slot_at(layer_id, hit_slot)) {
+                slot->last_used = step;
+            }
+            return hit_slot;
+        }
+
+        int32_t slot = find_free(layer_id);
+        if (slot < 0) {
+            slot = find_lru_victim(layer_id);
+        }
+
+        if (slot >= 0) {
+            assign_slot(slot, layer_id, expert_id, step);
+        }
+        return slot;
+    }
+
+    int32_t ensure_resident(int32_t layer_id, int32_t expert_id, int32_t n_experts) {
+        if (!enabled() || expert_id < 0 || expert_id >= n_experts) {
+            return expert_id;
+        }
+
+        // frequency placement: skip experts not in whitelist
+        if (!frequency_whitelist.empty() && !is_in_frequency_whitelist(layer_id, expert_id)) {
+            return expert_id;
+        }
+
+        int32_t slot = find(layer_id, expert_id);
+        if (slot >= 0) {
+            ++n_hit;
+            if (auto * s = slot_at(layer_id, slot)) {
+                s->last_used = ++clock;
+            }
+            return slot;
+        }
+
+        ++n_miss;
+        slot = find_free(layer_id);
+        if (slot < 0) {
+            slot = find_lru_victim(layer_id);
+            if (slot >= 0) {
+                const auto * victim = slot_at(layer_id, slot);
+                if (victim != nullptr && victim->resident) {
+                    ++n_evict;
+                }
+            }
+        }
+
+        if (slot < 0) {
+            return expert_id;
+        }
+
+        slot = preload_or_assign_slot(layer_id, expert_id, ++clock);
+        if (slot < 0) {
+            return expert_id;
+        }
+
+        if (materialize_cb != nullptr && !materialize_cb(materialize_userdata, slot, layer_id, expert_id, n_experts)) {
+            return expert_id;
+        }
+
+        return slot;
+    }
+};
+
 struct llama_model {
     llm_type type = LLM_TYPE_UNKNOWN;
     llm_arch arch = LLM_ARCH_UNKNOWN;
@@ -639,6 +1089,8 @@ struct llama_model {
 
     // statically allocated context for assigning
     struct llama_meta_device_get_split_state_userdata get_split_state_ud;
+
+    llama_moe_gpu_expert_cache moe_gpu_expert_cache;
 
     int64_t t_load_us  = 0;
     int64_t t_start_us = 0;

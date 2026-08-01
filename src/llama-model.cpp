@@ -339,6 +339,27 @@ llama_model * llama_model_create(llama_model_loader & ml, const llama_model_para
     return llama_model_create(arch, params);
 }
 
+static bool llama_moe_is_expert_tensor_name(const char * tensor_name) {
+    if (tensor_name == nullptr) {
+        return false;
+    }
+    const std::string name(tensor_name);
+    return name.find(".ffn_gate_exps.")    != std::string::npos ||
+           name.find(".ffn_down_exps.")    != std::string::npos ||
+           name.find(".ffn_up_exps.")      != std::string::npos ||
+           name.find(".ffn_gate_up_exps.") != std::string::npos;
+}
+
+static bool llama_moe_should_keep_expert_on_host(
+        bool expert_slot_mode_enabled,
+        const ggml_tensor * tensor,
+        const char * tensor_name) {
+    if (!expert_slot_mode_enabled) {
+        return false;
+    }
+    return tensor != nullptr && llama_moe_is_expert_tensor_name(tensor_name);
+}
+
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata) {
     const llama_meta_device_get_split_state_userdata * ud = (const llama_meta_device_get_split_state_userdata *) userdata;
     const llama_hparams & hparams = ud->model->hparams;
@@ -1250,13 +1271,33 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
     vocab.load(ml, kv);
 }
 
+static bool llama_moe_tensor_is_expert_slot_source(llm_tensor tensor) {
+    switch (tensor) {
+        case LLM_TENSOR_FFN_DOWN_EXP:
+        case LLM_TENSOR_FFN_GATE_EXP:
+        case LLM_TENSOR_FFN_UP_EXP:
+        case LLM_TENSOR_FFN_NORM_EXPS:
+        case LLM_TENSOR_FFN_DOWN_EXPS:
+        case LLM_TENSOR_FFN_GATE_EXPS:
+        case LLM_TENSOR_FFN_UP_EXPS:
+        case LLM_TENSOR_FFN_GATE_UP_EXPS:
+        case LLM_TENSOR_FFN_DOWN_CHEXPS:
+        case LLM_TENSOR_FFN_GATE_CHEXPS:
+        case LLM_TENSOR_FFN_UP_CHEXPS:
+            return true;
+        default:
+            return false;
+    }
+}
+
 bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const auto & split_mode   = params.split_mode;
     const bool use_mlock      = params.load_mode == LLAMA_LOAD_MODE_MLOCK || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
     const auto & tensor_split = params.tensor_split;
 
     const int n_layer_all = hparams.n_layer_all;
-    const int n_gpu_layers = this->n_gpu_layers();
+    const bool moe_gpu_expert_slot_mode = params.n_moe_gpu_expert_slot_num >= 0 && hparams.n_expert > 0;
+    const int n_gpu_layers = moe_gpu_expert_slot_mode ? n_layer_all + 1 : this->n_gpu_layers();
 
     const bool use_mmap_buffer = true;
 
@@ -1264,6 +1305,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     LLAMA_LOG_INFO("%s: loading model tensors, this can take a while... (load_mode = %s)\n",
         __func__, llama_load_mode_name(params.load_mode));
+    LLAMA_LOG_INFO("%s: loading model tensors, this can take a while... (mmap = %s, direct_io = %s)\n",
+        __func__, ml.use_mmap ? "true" : "false", ml.use_direct_io ? "true" : "false");
+    if (moe_gpu_expert_slot_mode) {
+        LLAMA_LOG_INFO("%s: MoE GPU expert slot mode enabled; ignoring n_gpu_layers for MoE placement\n", __func__);
+        LLAMA_LOG_INFO("%s: MoE GPU expert slot mode: routed expert tensors stay CPU-resident; dense/shared and router tensors prefer GPU\n", __func__);
+    }
 
     // build a list of buffer types for the CPU and GPU devices
     pimpl->cpu_buft_list = make_cpu_buft_list(devices, params.use_extra_bufts, params.no_host);
@@ -1665,7 +1712,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 }
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
-    const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
+    const bool force_cpu = (params.n_moe_gpu_expert_slot_num >= 0) && (hparams.n_expert > 0) && llama_moe_tensor_is_expert_slot_source(tn.tensor);
+    const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : force_cpu ? &pimpl->cpu_buft_list : pimpl->dev_layer.at(tn.bid).buft_list;
     return ml.create_tensor(
         hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
         tn, ne, flags);
@@ -2378,6 +2426,10 @@ llama_model_params llama_model_default_params() {
         /*.devices                     =*/ nullptr,
         /*.tensor_buft_overrides       =*/ nullptr,
         /*.n_gpu_layers                =*/ -1,
+        /*.n_moe_gpu_expert_slot_num   =*/ -1,
+        /*.moe_expert_placement        =*/ nullptr,
+        /*.moe_gpu_expert_ratio        =*/ 1.0f,
+        /*.moe_freq_report_path        =*/ nullptr,
         /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
         /*.load_mode                   =*/ LLAMA_LOAD_MODE_MMAP,
         /*.main_gpu                    =*/ 0,

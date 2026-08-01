@@ -156,6 +156,8 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_NVFP4         = 39, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q1_0          = 40, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q2_0          = 41, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_TQ3_1S        = 43, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_TQ4_1S        = 44, // except 1d tensors
 
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };
@@ -311,6 +313,10 @@ extern "C" {
         const struct llama_model_tensor_buft_override * tensor_buft_overrides;
 
         int32_t n_gpu_layers; // number of layers to store in VRAM, a negative value means all layers
+        int32_t n_moe_gpu_expert_slot_num; // number of GPU-resident MoE expert slots, -1 disables expert-slot mode
+        const char * moe_expert_placement; // "all-gpu", "frequency", "cpu-moe", or NULL (default: all-gpu)
+        float moe_gpu_expert_ratio; // ratio of experts to place on GPU for frequency mode (0.0-1.0)
+        const char * moe_freq_report_path; // path to write frequency stats JSON, or NULL
         enum llama_split_mode split_mode; // how to split the model across multiple GPUs
         enum llama_load_mode  load_mode;  // how to load the model
 
@@ -1601,6 +1607,12 @@ extern "C" {
             int64_t                   idata_split,
             ggml_opt_epoch_callback   callback_train,
             ggml_opt_epoch_callback   callback_eval);
+
+    // Save MoE expert access frequency report to JSON file.
+    // Returns true on success. Call after inference to capture access patterns.
+    LLAMA_API bool llama_save_moe_freq_report(
+            struct llama_context * ctx,
+            const char           * path);
 
 #ifdef __cplusplus
 }

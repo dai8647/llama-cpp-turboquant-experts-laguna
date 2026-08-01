@@ -309,6 +309,9 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_IQ4_NL,
     GGML_TYPE_Q5_0,
     GGML_TYPE_Q5_1,
+    GGML_TYPE_TURBO2_0,
+    GGML_TYPE_TURBO3_0,
+    GGML_TYPE_TURBO4_0,
 };
 
 static ggml_type kv_cache_type_from_str(const std::string & s) {
@@ -2665,6 +2668,55 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_N_GPU_LAYERS"));
     add_opt(common_arg(
+        {"--moe-gpu-expert-slot-num"}, "N",
+        "number of GPU-resident MoE expert slots for router-aware expert paging (default: -1, disabled; 0 = active_expert_count)",
+        [](common_params & params, int value) {
+            if (value < -1) {
+                throw std::invalid_argument("--moe-gpu-expert-slot-num must be >= -1");
+            }
+            params.n_moe_gpu_expert_slot_num = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-expert-placement"}, "{all-gpu,frequency,cpu-moe,map}",
+        "MoE expert placement strategy (default: all-gpu)\n"
+        "- all-gpu: all experts on GPU (full-slot mode)\n"
+        "- frequency: place top-N experts on GPU by selection frequency\n"
+        "- cpu-moe: all experts on CPU\n"
+        "- map: use expert_map.json for explicit placement",
+        [](common_params & params, const std::string & value) {
+            if (value != "all-gpu" && value != "frequency" && value != "cpu-moe" && value != "map") {
+                throw std::invalid_argument("--moe-expert-placement must be one of: all-gpu, frequency, cpu-moe, map");
+            }
+            params.moe_expert_placement = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-gpu-expert-ratio"}, "RATIO",
+        "ratio of experts to place on GPU for frequency mode (0.0-1.0, default: 1.0)",
+        [](common_params & params, const std::string & value) {
+            float ratio = std::stof(value);
+            if (ratio < 0.0f || ratio > 1.0f) {
+                throw std::invalid_argument("--moe-gpu-expert-ratio must be between 0.0 and 1.0");
+            }
+            params.moe_gpu_expert_ratio = ratio;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-freq-report-path"}, "PATH",
+        "write MoE expert frequency stats JSON to this path after inference",
+        [](common_params & params, const std::string & value) {
+            params.moe_freq_report_path = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-expert-map-path"}, "PATH",
+        "path to expert_map.json for explicit expert placement (for future map mode)",
+        [](common_params & params, const std::string & value) {
+            params.moe_expert_map_path = value;
+        }
+    ));
+    add_opt(common_arg(
         {"-sm", "--split-mode"}, "{none,layer,row,tensor}",
         "how to split the model across multiple GPUs, one of:\n"
         "- none: use one GPU only\n"
@@ -3635,6 +3687,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("how much the prompt of a request must match the prompt of a slot in order to use that slot (default: %.2f, 0.0 = disabled)\n", params.slot_prompt_similarity),
         [](common_params & params, const std::string & value) {
             params.slot_prompt_similarity = std::stof(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--slot-cache-key-similarity"}, "SIMILARITY",
+        string_format("how much the prompt of a cache_key request must match the cached slot prompt before reusing it (default: %.2f, 0.0 = disable ratio check)\n", params.slot_cache_key_similarity),
+        [](common_params & params, const std::string & value) {
+            params.slot_cache_key_similarity = std::stof(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--slot-cache-key-min-prefix"}, "N",
+        string_format("minimum common-prefix tokens required before reusing a cache_key slot (default: %d, 0 = disabled)\n", params.slot_cache_key_min_prefix),
+        [](common_params & params, const std::string & value) {
+            params.slot_cache_key_min_prefix = std::stoi(value);
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(

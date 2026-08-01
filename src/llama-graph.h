@@ -20,6 +20,13 @@ struct llama_cparams;
 struct llama_layer;
 
 struct llama_memory_context_i;
+struct llama_moe_gpu_expert_cache;
+
+struct llm_moe_gpu_slot_remap_userdata {
+    llama_moe_gpu_expert_cache * cache = nullptr;
+    int32_t layer_id = -1;
+    int32_t n_experts = 0;
+};
 
 class llama_kv_cache_context;
 class llama_kv_cache_dsa_context;
@@ -228,6 +235,27 @@ public:
     const llama_cparams cparams;
 
     const uint32_t n_outputs;
+};
+
+class llm_graph_input_moe_gpu_slot_map : public llm_graph_input_i {
+public:
+    llm_graph_input_moe_gpu_slot_map(
+            const llama_moe_gpu_expert_cache * cache,
+            int32_t layer_id,
+            int64_t n_expert,
+            int64_t n_tokens) : cache(cache), layer_id(layer_id), n_expert(n_expert), n_tokens(n_tokens) {}
+    virtual ~llm_graph_input_moe_gpu_slot_map() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * slot_map = nullptr; // I32 [1, n_expert, n_tokens]
+
+    const llama_moe_gpu_expert_cache * cache = nullptr;
+    const int32_t layer_id = -1;
+    const int64_t n_expert = 0;
+    const int64_t n_tokens = 0;
 };
 
 class llm_graph_input_mean : public llm_graph_input_i {
@@ -683,10 +711,15 @@ struct llm_graph_params {
     ggml_backend_sched_t sched;
     ggml_backend_t backend_cpu;
 
-    const llama_adapter_cvec     * cvec;
-    const llama_adapter_loras    * loras;
-    const llama_memory_context_i * mctx;
-    const llama_cross            * cross;
+    const llama_adapter_cvec           * cvec;
+    const llama_adapter_loras          * loras;
+    const llama_memory_context_i       * mctx;
+    const llama_cross                  * cross;
+    const llama_moe_gpu_expert_cache   * moe_gpu_expert_cache;
+
+    // frequency-based placement: maps flat expert ID -> GPU slot ID
+    // nullptr means no frequency placement (full-slot or disabled)
+    const std::unordered_map<int32_t, int32_t> * expert_to_slot = nullptr;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -781,6 +814,8 @@ struct llm_graph_params {
             gtype == other.gtype &&
             cvec  == other.cvec  &&
             loras == other.loras &&
+            moe_gpu_expert_cache == other.moe_gpu_expert_cache &&
+            expert_to_slot == other.expert_to_slot &&
             cross == other.cross;
     }
 };
@@ -923,10 +958,12 @@ struct llm_graph_context {
 
     ggml_backend_t backend_cpu; // TODO: needed by build_attn_mha, figure out a way to remove?
 
-    const llama_adapter_cvec     * cvec;
-    const llama_adapter_loras    * loras;
-    const llama_memory_context_i * mctx;
-    const llama_cross            * cross;
+    const llama_adapter_cvec           * cvec;
+    const llama_adapter_loras          * loras;
+    const llama_memory_context_i       * mctx;
+    const llama_cross                  * cross;
+    const llama_moe_gpu_expert_cache   * moe_gpu_expert_cache;
+    mutable std::vector<std::unique_ptr<llm_moe_gpu_slot_remap_userdata>> moe_gpu_slot_remap_userdata;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -962,6 +999,11 @@ struct llm_graph_context {
               ggml_tensor * cur, // ggml_tensor * b
               ggml_tensor * ids,
               ggml_tensor * w_s = nullptr) const;
+
+    ggml_tensor * build_moe_gpu_slot_ids(
+              ggml_tensor * logical_experts,
+                  int64_t   n_expert,
+                      int   il) const;
 
     ggml_tensor * build_norm(
              ggml_tensor * cur,

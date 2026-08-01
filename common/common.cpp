@@ -44,6 +44,12 @@
 #include <string.h>
 #include <fcntl.h>
 #include <io.h>
+#ifndef fileno
+#define fileno _fileno
+#endif
+#ifndef isatty
+#define isatty _isatty
+#endif
 #else
 #include <sys/ioctl.h>
 #include <sys/stat.h>
@@ -1216,6 +1222,12 @@ struct common_init_result::impl {
 
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
+    // auto-activate frequency mode: when expert placement is "frequency" and slot-num is default (-1),
+    // set slot-num to INT32_MAX so the fit calculation and model load both see the slot cache overhead
+    if (params.moe_expert_placement == "frequency" && params.n_moe_gpu_expert_slot_num < 0) {
+        params.n_moe_gpu_expert_slot_num = INT32_MAX;
+    }
+
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
@@ -1595,6 +1607,10 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     }
 
     mparams.n_gpu_layers    = params.n_gpu_layers;
+    mparams.n_moe_gpu_expert_slot_num = params.n_moe_gpu_expert_slot_num;
+    mparams.moe_expert_placement = params.moe_expert_placement.empty() ? nullptr : params.moe_expert_placement.c_str();
+    mparams.moe_gpu_expert_ratio = params.moe_gpu_expert_ratio;
+    mparams.moe_freq_report_path = params.moe_freq_report_path.empty() ? nullptr : params.moe_freq_report_path.c_str();
     mparams.main_gpu        = params.main_gpu;
     mparams.split_mode      = params.split_mode;
     mparams.load_mode       = params.load_mode;
@@ -1630,6 +1646,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
 
     cparams.n_ctx             = params.n_ctx;
     cparams.n_seq_max         = params.n_parallel;
+    cparams.n_outputs_max     = params.n_outputs_max;
     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
     cparams.n_batch           = params.n_batch;

@@ -407,8 +407,8 @@ write_basic_package_version_file(
     COMPATIBILITY SameMajorVersion)
 
 target_compile_definitions(ggml-base PRIVATE
-    GGML_VERSION="${GGML_INSTALL_VERSION}"
-    GGML_COMMIT="${GGML_BUILD_COMMIT}"
+    GGML_VERSION=${GGML_INSTALL_VERSION}
+    GGML_COMMIT=${GGML_BUILD_COMMIT}
 )
 message(STATUS "ggml version: ${GGML_INSTALL_VERSION}")
 message(STATUS "ggml commit:  ${GGML_BUILD_COMMIT}")

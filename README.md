@@ -1,6 +1,6 @@
-# llama.cpp
+# llama-cpp-turboquant: Experts-First + Laguna MoE
 
-![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
+## 概要
 
 <div align="center">
 
@@ -90,10 +90,7 @@ The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-or
 
 #### Tools
 
-- [cli](tools/cli/README.md)
-- [completion](tools/completion/README.md)
-- [server](tools/server/README.md)
-- [GBNF grammars](grammars/README.md)
+## テスト結果
 
 #### Development
 
@@ -117,8 +114,4 @@ The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-or
 
 ## Acknowledgements
 
-- [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) - Single-header HTTP server, used by `llama-server` - MIT license
-- [stb-image](https://github.com/nothings/stb) - Single-header image format decoder, used by multimodal subsystem - Public domain
-- [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
-- [miniaudio.h](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
-- [subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain
+TheTom/llama-cpp-turboquant と同一 (MIT)

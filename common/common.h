@@ -470,6 +470,11 @@ struct common_params {
     std::vector<ggml_backend_dev_t> devices; // devices to use for offloading
 
     int32_t n_gpu_layers       = -1;    // number of layers to store in VRAM, -1 is auto, <= -2 is all
+    int32_t n_moe_gpu_expert_slot_num = -1; // number of GPU-resident MoE expert slots, -1 disables expert-slot mode
+    std::string moe_expert_placement = "all-gpu"; // placement strategy: all-gpu, frequency, cpu-moe, map
+    float   moe_gpu_expert_ratio   = 1.0f;       // ratio of experts to place on GPU (0.0-1.0) for frequency mode
+    std::string moe_freq_report_path;              // path to write frequency stats JSON (empty = no collection)
+    std::string moe_expert_map_path;               // path to expert_map.json (for future map mode)
     int32_t main_gpu           = 0;     // the GPU that is used for scratch and small tensors
     float   tensor_split[128]  = {0};   // how split tensors should be distributed across GPUs
     bool    fit_params         = true;  // whether to fit unset model/context parameters to free device memory
@@ -681,7 +686,9 @@ struct common_params {
     std::string slot_save_path;
     std::string media_path; // path to directory for loading media files
 
-    float slot_prompt_similarity = 0.1f;
+    float   slot_prompt_similarity        = 0.1f;
+    float   slot_cache_key_similarity     = 0.5f;
+    int32_t slot_cache_key_min_prefix     = 32;
 
     // batched-bench params
     bool is_pp_shared   = false;
