@@ -25,6 +25,53 @@ set(STAMP_FILE   "${UI_BINARY_DIR}/.ui-stamp")
 set(UI_CPP       "${UI_BINARY_DIR}/ui.cpp")
 set(UI_H         "${UI_BINARY_DIR}/ui.h")
 
+# A dist directory is only usable if it holds the COMPLETE asset set that
+# llama-ui-embed requires. A partial dist -- e.g. an npm PWA-assets build that
+# died in the native `sharp` step (common on Termux / very new Node), leaving
+# only index.html -- must not be trusted, or llama-ui-embed aborts the whole
+# build with "missing required asset(s): loading.html ...". Treat an incomplete
+# dist as unusable so provisioning falls through to the HF download instead of
+# hard-failing. Mirrors the required-asset list in tools/ui/embed.cpp.
+function(dist_is_complete dir out_var)
+    set(${out_var} FALSE PARENT_SCOPE)
+    if(NOT EXISTS "${dir}/index.html")
+        return()
+    endif()
+    file(GLOB_RECURSE _files RELATIVE "${dir}" "${dir}/*")
+    set(_have_loading    FALSE)
+    set(_have_manifest   FALSE)
+    set(_have_sw         FALSE)
+    set(_have_build      FALSE)
+    set(_have_version    FALSE)
+    set(_have_bundle_js  FALSE)
+    set(_have_bundle_css FALSE)
+    set(_have_workbox    FALSE)
+    foreach(_f ${_files})
+        get_filename_component(_b "${_f}" NAME)
+        if(_b STREQUAL "loading.html")
+            set(_have_loading TRUE)
+        elseif(_b STREQUAL "manifest.webmanifest")
+            set(_have_manifest TRUE)
+        elseif(_b STREQUAL "sw.js")
+            set(_have_sw TRUE)
+        elseif(_b STREQUAL "build.json")
+            set(_have_build TRUE)
+        elseif(_b STREQUAL "version.json")
+            set(_have_version TRUE)
+        elseif(_b MATCHES "^bundle.*\\.js$")
+            set(_have_bundle_js TRUE)
+        elseif(_b MATCHES "^bundle.*\\.css$")
+            set(_have_bundle_css TRUE)
+        elseif(_b MATCHES "^workbox.*\\.js$")
+            set(_have_workbox TRUE)
+        endif()
+    endforeach()
+    if(_have_loading AND _have_manifest AND _have_sw AND _have_build AND _have_version
+       AND _have_bundle_js AND _have_bundle_css AND _have_workbox)
+        set(${out_var} TRUE PARENT_SCOPE)
+    endif()
+endfunction()
+
 function(npm_build_should_skip out_var)
     set(${out_var} FALSE PARENT_SCOPE)
 
@@ -238,7 +285,13 @@ function(hf_download version out_var out_resolved)
 
         file(ARCHIVE_EXTRACT INPUT "${archive}" DESTINATION "${DIST_DIR}")
 
-        if(NOT EXISTS "${DIST_DIR}/index.html")
+        # The archive must hold the COMPLETE asset set, not just index.html: a
+        # bucket that is older than llama-ui-embed's required-asset list (e.g.
+        # published before loading.html was added) extracts fine but then kills
+        # the whole build in emit_files. Reject it here so we can try the next
+        # candidate, and ultimately degrade to a no-embedded-UI build.
+        dist_is_complete("${DIST_DIR}" archive_ok)
+        if(NOT archive_ok)
             message(STATUS "UI: archive from ${resolved} is missing required assets")
             continue()
         endif()
