@@ -582,10 +582,8 @@ struct llama_moe_gpu_expert_cache {
 
     bool record_access_in_callback = false; // off by default; post-compute path handles tracking
 
-    // Set to true in --moe-expert-placement frequency mode. When true, the slot cache
-    // callback path is skipped (AMD driver on RDNA4 GPU triggers SIGSEGV in the callback's
-    // ggml_cpy / ggml_map_custom1 path). Frequency placement still works via the whitelist
-    // check in ensure_resident, but the cache itself is bypassed.
+    // When true, the slot-cache callback path is skipped (AMD RDNA4 driver SEGV in ggml_map_custom1
+    // callback). Frequency placement still works via whitelist + post-compute tracking.
     bool frequency_mode = false;
 
     std::unordered_map<int32_t, std::vector<llama_moe_gpu_expert_slot>> slots_by_layer;
@@ -956,14 +954,6 @@ struct llama_moe_gpu_expert_cache {
             return expert_id;
         }
 
-        // frequency placement: skip experts not in whitelist
-        if (!frequency_whitelist.empty() && !is_in_frequency_whitelist(layer_id, expert_id)) {
-            return expert_id;
-        }
-
-        fprintf(stderr, "[SEGFAULT-DEBUG] ensure_resident: layer=%d expert=%d n_experts=%d n_slots=%d\n",
-                layer_id, expert_id, n_experts, n_slots);
-        fflush(stderr);
         int32_t slot = find(layer_id, expert_id);
         if (slot >= 0) {
             ++n_hit;
@@ -986,17 +976,10 @@ struct llama_moe_gpu_expert_cache {
         }
 
         if (slot < 0) {
-            fprintf(stderr, "[SEGFAULT-DEBUG] no slot available, returning expert_id=%d\n", expert_id);
-            fflush(stderr);
             return expert_id;
         }
 
-        fprintf(stderr, "[SEGFAULT-DEBUG] before preload_or_assign_slot: slot=%d layer=%d expert=%d\n",
-                slot, layer_id, expert_id);
-        fflush(stderr);
         slot = preload_or_assign_slot(layer_id, expert_id, ++clock);
-        fprintf(stderr, "[SEGFAULT-DEBUG] after preload_or_assign_slot: slot=%d\n", slot);
-        fflush(stderr);
         if (slot < 0) {
             return expert_id;
         }

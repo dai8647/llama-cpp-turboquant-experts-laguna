@@ -856,6 +856,21 @@ static void llama_moe_gpu_expert_slot_preload(const llama_model & model) {
                 llama_moe_gpu_expert_slot_materialize(model_mut, assigned >= 0 ? assigned : slot, layer_id, wl_expert, info.n_experts);
                 ++n_preloaded;
             }
+
+            // When the bank can hold the full layer, also materialize non-whitelisted
+            // experts so the packed bank is complete and remap hits on all selections.
+            if (cache.size() >= info.n_experts) {
+                for (int32_t expert_id = 0; expert_id < info.n_experts; ++expert_id) {
+                    if (cache.is_in_frequency_whitelist(layer_id, expert_id)) {
+                        continue;
+                    }
+                    int32_t assigned = cache.preload_or_assign_slot(layer_id, expert_id, step++);
+                    if (assigned >= 0) {
+                        llama_moe_gpu_expert_slot_materialize(model_mut, assigned, layer_id, expert_id, info.n_experts);
+                        ++n_preloaded;
+                    }
+                }
+            }
         } else {
             // full-slot mode: preload all experts sequentially
             for (int32_t expert_id = 0; expert_id < max_layer_experts && expert_id < cache.size(); ++expert_id) {
@@ -984,15 +999,12 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                     model->moe_gpu_expert_cache.init(effective_slots);
                     LLAMA_LOG_INFO("%s: initialized MoE GPU expert slot cache with %d slots (requested %d), tracked_n_experts=%d\n", __func__, effective_slots, requested_slots, model->hparams.n_expert);
 
-                    // Detect frequency mode early: this disables the broken slot-cache callback path.
-                    if (params.moe_expert_placement &&
-                        std::string(params.moe_expert_placement) == "frequency") {
-                        model->moe_gpu_expert_cache.frequency_mode = true;
-                    }
-
                     // frequency-based placement: set whitelist from freq report
                     const bool is_freq_mode = params.moe_expert_placement &&
                                               std::string(params.moe_expert_placement) == "frequency";
+                    if (is_freq_mode) {
+                        model->moe_gpu_expert_cache.frequency_mode = true;
+                    }
                     const char * freq_report_in = params.moe_freq_report_in_path && params.moe_freq_report_in_path[0]
                         ? params.moe_freq_report_in_path
                         : (params.moe_freq_report_path && params.moe_freq_report_path[0]
