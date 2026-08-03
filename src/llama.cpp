@@ -1303,7 +1303,8 @@ bool llama_save_moe_freq_report(llama_context * ctx, const char * path) {
     }
     const auto & model = ctx->get_model();
     if (!model.moe_gpu_expert_cache.track_access) return false;
-    auto report = model.moe_gpu_expert_cache.generate_access_report("moe-access-tracking", 0);
+    int32_t n_active = model.hparams.n_expert_used > 0 ? model.hparams.n_expert_used : model.hparams.n_expert;
+    auto report = model.moe_gpu_expert_cache.generate_access_report("moe-access-tracking", n_active);
     if (report.n_experts <= 0) {
         return false;
     }
