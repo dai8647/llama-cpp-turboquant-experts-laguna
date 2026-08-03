@@ -1015,16 +1015,29 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                             const int32_t total_experts = freq_report.n_layers * freq_report.n_experts;
                             const int32_t gpu_count = std::max(1, static_cast<int32_t>(
                                 total_experts * params.moe_gpu_expert_ratio));
-                            // Build whitelist from sorted frequency list
+                            // Build whitelist: layer-wise top experts (B-optimization)
                             std::vector<std::pair<int32_t, int32_t>> whitelist;
-                            for (int32_t i = 0; i < gpu_count && i < (int32_t)freq_report.sorted_by_frequency.size(); i++) {
-                                int32_t idx = freq_report.sorted_by_frequency[i];
-                                whitelist.push_back({freq_report.stats[idx].layer_id,
-                                                     freq_report.stats[idx].expert_id});
+                            const int32_t per_layer_budget = std::max(1, static_cast<int32_t>(
+                                std::round(static_cast<double>(freq_report.n_experts) * params.moe_gpu_expert_ratio)));
+                            for (int32_t l = 0; l < freq_report.n_layers; l++) {
+                                std::vector<int32_t> layer_expert_ids(freq_report.n_experts);
+                                std::iota(layer_expert_ids.begin(), layer_expert_ids.end(), 0);
+                                std::sort(layer_expert_ids.begin(), layer_expert_ids.end(),
+                                          [&](int32_t a, int32_t b) {
+                                              int32_t idx_a = l * freq_report.n_experts + a;
+                                              int32_t idx_b = l * freq_report.n_experts + b;
+                                              return freq_report.stats[idx_a].total_selections > freq_report.stats[idx_b].total_selections;
+                                          });
+                                int32_t take = std::min(per_layer_budget, (int32_t)freq_report.n_experts);
+                                for (int32_t i = 0; i < take; i++) {
+                                    int32_t expert_idx = layer_expert_ids[i];
+                                    int32_t idx = l * freq_report.n_experts + expert_idx;
+                                    whitelist.push_back({freq_report.stats[idx].layer_id, freq_report.stats[idx].expert_id});
+                                }
                             }
                             model->moe_gpu_expert_cache.set_frequency_whitelist(whitelist);
-                            LLAMA_LOG_INFO("%s: frequency placement: %d/%d experts on GPU (ratio=%.2f)\n",
-                                    __func__, (int32_t)whitelist.size(), total_experts, params.moe_gpu_expert_ratio);
+                            LLAMA_LOG_INFO("%s: frequency placement (layer-wise): %d/%d experts on GPU (per-layer budget=%d, ratio=%.2f)\n",
+                                    __func__, (int32_t)whitelist.size(), total_experts, per_layer_budget, params.moe_gpu_expert_ratio);
                         } else {
                             LLAMA_LOG_WARN("%s: frequency report not found or empty at %s, falling back to full-slot mode\n",
                                     __func__, freq_report_in);

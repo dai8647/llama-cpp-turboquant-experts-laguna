@@ -307,7 +307,7 @@ static void llm_moe_gpu_slot_remap(
         }
     }
 
-    if (remap->cache->enabled() && !remap->cache->frequency_mode) { // slot remap: logical expert IDs -> GPU slot indices
+    if (remap->cache->enabled()) { // slot remap: logical expert IDs -> GPU slot indices
         GGML_ASSERT(ggml_is_contiguous(a));
         GGML_ASSERT(a->type == GGML_TYPE_I32);
         GGML_ASSERT(dst->type == GGML_TYPE_I32);
