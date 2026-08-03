@@ -375,8 +375,6 @@ int llama_cli(int argc, char ** argv) {
         return 1;
     }
 
-    fprintf(stderr, "[cli-debug] parsed: moe_freq_report_path='%s'\n", params.moe_freq_report_path.c_str());
-
     // TODO: maybe support it later?
     if (params.conversation_mode == COMMON_CONVERSATION_MODE_DISABLED) {
         console::error("--no-conversation is not supported by llama-cli\n");
@@ -673,7 +671,6 @@ int llama_cli(int argc, char ** argv) {
     console::log("\nExiting...\n");
 
     // save frequency report if out path was specified
-    fprintf(stderr, "[cli-debug] moe_freq_report_out_path='%s'\n", params.moe_freq_report_out_path.c_str());
     const std::string & save_path = !params.moe_freq_report_out_path.empty()
         ? params.moe_freq_report_out_path
         : params.moe_freq_report_path;
