@@ -89,8 +89,18 @@ llama-cli -ngl 999 --moe-gpu-expert-slot-num 999 -m model.gguf
 
 #### DFlash 投機デコード (DFlash speculative decoding)
 
-Laguna 専用の draft モデル **DFlash** を使った投機デコードに対応
-(`src/models/dflash.cpp`)。公式レシピは K=15 (`num_speculative_tokens=15`)。
+**DFlash** は汎用ブロック拡散 draft エンジンで、Laguna 専用ではなく任意の対象
+モデルと組み合わせ可能です (`src/models/dflash.cpp`)。対象モデル向けに学習
+された DFlash 形式の draft モデル (hidden size・抽出レイヤ・語彙が対象と一致
+するもの) を `--spec-draft-model` で指定すれば使えます。組み合わせ不一致時は
+起動時に明確なエラーを出します (クラッシュしません)。公式レシピは K=15
+(`num_speculative_tokens=15`)。
+
+**DSpark (DeepSeek V4 の MTP 用 Markov-head draft) も同じエンジンを共有**します
+(`common/speculative.cpp` の同一クラス、`is_dspark` フラグで分岐)。したがって
+同じ検証 - hidden size 一致 / 抽出レイヤ範囲チェック / 最終層スロット
+(`layer_id == n_layer`) の nextn 抽出へのフォールバック - が DSpark にも適用され、
+不一致の組み合わせは DFlash と同じく起動時に明確なエラーになります。
 
 ```bash
 # DFlash draft モデル + K 指定 (--spec-draft-n-max)
@@ -112,9 +122,19 @@ llama-server -m model.gguf --spec-type draft-dflash \
 
 #### DFlash speculative decoding
 
-Speculative decoding with **DFlash**, Laguna's dedicated draft model, is
-supported (`src/models/dflash.cpp`). The official recipe uses K=15
-(`num_speculative_tokens=15`).
+Speculative decoding with **DFlash**, a generic block-diffusion draft engine, is
+supported (`src/models/dflash.cpp`). It is not Laguna-only: any target model can
+be paired with a DFlash-format draft trained for it (matching hidden size,
+extract layers, and vocab), supplied via `--spec-draft-model`. A mismatched
+pairing now fails at startup with a clear error instead of crashing. The
+official recipe uses K=15 (`num_speculative_tokens=15`).
+
+**DSpark (the Markov-head draft used by DeepSeek V4 MTP) shares the same engine**
+(`common/speculative.cpp`, same class toggled by the `is_dspark` flag). The same
+validation therefore applies to both: hidden-size match, extract-layer bounds,
+and the final-layer slot (`layer_id == n_layer`) falling back to nextn
+extraction. A mismatched pairing fails at startup with a clear error, exactly
+like DFlash.
 
 ```bash
 # DFlash draft model + K tuning (--spec-draft-n-max)
@@ -162,6 +182,10 @@ llama-server -hf heath0xFF/DeepSeek-V4-Flash-0731-REAP-GGUF:Q4_K_M \
 # DFlash/DSpark サイドカー (Markov head を含む) を使う場合: --dflash
 ```
 
+投機デコードの draft として使う場合は `--spec-type draft-dspark` (または
+Markov head を持つサイドカーを `--dflash` で取得) で有効化され、DFlash と
+同じ検証 (hidden size / レイヤ範囲 / 最終層スロット) を受けます。
+
 #### REAP について
 
 **REAP** (Router-weighted Expert Activation Pruning、Cerebras) はモデル**作成時**の
@@ -183,6 +207,10 @@ llama-server -hf heath0xFF/DeepSeek-V4-Flash-0731-REAP-GGUF:Q4_K_M \
   --mtp -c 32768 -ngl 99 --cpu-moe
 # DFlash/DSpark sidecar (carries the extra Markov head): --dflash
 ```
+
+To use it as a speculative-draft, enable `--spec-type draft-dspark` (or fetch
+the Markov-head sidecar with `--dflash`); it receives the same validation as
+DFlash (hidden size, layer bounds, final-layer slot).
 
 #### About REAP
 

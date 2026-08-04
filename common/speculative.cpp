@@ -925,6 +925,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     int32_t n_embd_dec = 0;  // draft hidden size
     int32_t n_embd_enc = 0;  // target_layer_ids_n * target_hidden_size
     int32_t n_embd_tgt = 0;  // target model hidden size
+    int32_t n_layer_tgt = 0; // target model layer count
 
     int32_t     block_size    = 0;
     llama_token mask_token_id = 0;
@@ -955,9 +956,26 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         target_layer_ids_n = llama_model_target_layer_ids_n(model_dft);
         GGML_ASSERT(target_layer_ids_n > 0 && "DFlash model has no target_layer_ids");
 
-        n_embd_tgt    = llama_model_n_embd(model_tgt);
-        n_embd_dec    = llama_model_n_embd(model_dft);
-        n_embd_enc    = (int32_t) target_layer_ids_n * n_embd_tgt;
+        n_embd_tgt  = llama_model_n_embd(model_tgt);
+        n_embd_dec  = llama_model_n_embd(model_dft);
+        n_embd_enc  = (int32_t) target_layer_ids_n * n_embd_tgt;
+        n_layer_tgt = llama_model_n_layer(model_tgt);
+
+        // DFlash is a generic block-diffusion draft engine: any target model can be
+        // paired with a DFlash draft trained for it. Validate the pairing here so a
+        // mismatched draft fails with a clear message instead of a crash.
+        if (n_embd_tgt != n_embd_dec) {
+            throw std::runtime_error("DFlash: draft hidden size (" + std::to_string(n_embd_dec) +
+                    ") must match target hidden size (" + std::to_string(n_embd_tgt) +
+                    ") - draft was trained for a different model");
+        }
+        for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+            if (target_layer_ids[k] > n_layer_tgt) {
+                throw std::runtime_error("DFlash: target layer id " + std::to_string(target_layer_ids[k]) +
+                        " exceeds target n_layer " + std::to_string(n_layer_tgt) +
+                        " - draft was trained for a different model");
+            }
+        }
 
         // read the trained block size from the dflash.block_size metadata key
         block_size = 16;
@@ -996,8 +1014,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         // turn on extraction of the target layers' input embeddings
+        // (a layer id of n_layer_tgt extracts the final hidden state instead)
         for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
-            llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
+            if (target_layer_ids[k] < n_layer_tgt) {
+                llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
+            } else {
+                llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
+            }
         }
 
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
@@ -1070,7 +1093,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 // gather this chunk's target features, interleaved by extract layer
                 features_buf.resize((size_t) n_chunk * n_embd_enc);
                 for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
-                    const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
+                    const float * layer = target_layer_ids[k] < n_layer_tgt
+                        ? llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k])
+                        : llama_get_embeddings_nextn(ctx_tgt);
                     if (!layer) {
                         GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
                     }
