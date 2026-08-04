@@ -3,6 +3,7 @@
 #include "fattn-mma-f16.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
+#include "fattn-wmma-f16.cuh"
 #include "fattn.cuh"
 
 template <int DKQ, int DV, int ncols2>
@@ -394,6 +395,7 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_NONE    =   0,
     BEST_FATTN_KERNEL_TILE    = 200,
     BEST_FATTN_KERNEL_VEC     = 100,
+    BEST_FATTN_KERNEL_WMMA_F16 = 300,
     BEST_FATTN_KERNEL_MMA_F16 = 400,
 };
 

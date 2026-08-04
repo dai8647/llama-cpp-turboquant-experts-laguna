@@ -127,6 +127,35 @@ static cudaError_t ggml_cuda_copy2d_across_devices(
     const void * src, int src_device, size_t spitch,
     size_t width, size_t height, cudaStream_t dst_stream, cudaStream_t src_stream);
 
+static cudaError_t ggml_cuda_copy_across_devices(
+    void * dst, int dst_device, const void * src, int src_device,
+    size_t size, cudaStream_t dst_stream, cudaStream_t src_stream) {
+
+    const auto & info = ggml_cuda_info();
+    if (info.peer_access[src_device][dst_device]) {
+        return cudaMemcpyPeerAsync(dst, dst_device, src, src_device, size, dst_stream);
+    }
+
+    // Fallback: stage through pinned host memory
+    int prev_device = ggml_cuda_get_device();
+    void * tmp = nullptr;
+    cudaError_t err = cudaMallocHost(&tmp, size);
+    if (err != cudaSuccess) { return err; }
+
+    ggml_cuda_set_device(src_device);
+    err = cudaMemcpyAsync(tmp, src, size, cudaMemcpyDeviceToHost, src_stream);
+    if (err == cudaSuccess) {
+        err = cudaStreamSynchronize(src_stream);
+    }
+    if (err == cudaSuccess) {
+        ggml_cuda_set_device(dst_device);
+        err = cudaMemcpyAsync(dst, tmp, size, cudaMemcpyHostToDevice, dst_stream);
+    }
+    cudaFreeHost(tmp);
+    ggml_cuda_set_device(prev_device);
+    return err;
+}
+
 void ggml_cuda_set_device(int device) {
     // translate the (possibly virtual) device id to the physical CUDA device that backs it
     const int physical_device = ggml_cuda_get_physical_device(device);
@@ -1874,8 +1903,17 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     return use_mul_mat_vec_q;
 }
 
+struct ggml_backend_cuda_split_buffer_type_context {
+    int main_device;
+    std::array<float, GGML_CUDA_MAX_DEVICES> tensor_split;
+    std::string name;
+};
+
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
+
+    // CUDA multi-GPU split buffer is not built in this fork; HIP runs single-GPU.
+    const bool split = false;
 
     const int32_t hint = ggml_get_op_params_i32(dst, 1);
     if (hint == GGML_HINT_SRC0_IS_HADAMARD && ggml_cuda_op_fwht(ctx, src1, dst)) {
@@ -1938,16 +1976,6 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     //printf("src1 is contiguous %d, transposed %d, type = %s, name = %s\n", ggml_is_contiguous(src1), ggml_is_transposed(src1), ggml_type_name(src1->type), src1->name);
 
     //TODO update for generic tensor parallelism
-    const int cc                 = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    bool use_batched_cublas_f16  = src0->type == GGML_TYPE_F16 && (src1->type == GGML_TYPE_F16 || !any_gpus_with_slow_fp16);
-    bool use_batched_cublas_bf16 = src0->type == GGML_TYPE_BF16 && bf16_mma_hardware_available(cc);
-    bool use_batched_cublas_f32  = src0->type == GGML_TYPE_F32;
-
-    const int32_t hint = ggml_get_op_params_i32(dst, 1);
-    if (hint == GGML_HINT_SRC0_IS_HADAMARD && !split && ggml_cuda_op_fwht(ctx, src1, dst)) {
-        return;
-    }
-
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
 
