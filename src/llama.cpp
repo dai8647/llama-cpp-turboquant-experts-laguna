@@ -1002,8 +1002,8 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                     // frequency-based placement: set whitelist from freq report
                     const bool is_freq_mode = params.moe_expert_placement &&
                                               std::string(params.moe_expert_placement) == "frequency";
-                    if (is_freq_mode && params.moe_freq_report_path) {
-                        llama_moe_freq_report freq_report = load_freq_report(params.moe_freq_report_path);
+                    if (is_freq_mode && params.moe_freq_report_in) {
+                        llama_moe_freq_report freq_report = load_freq_report(params.moe_freq_report_in);
                         if (!freq_report.stats.empty()) {
                             const int32_t total_experts = freq_report.n_layers * freq_report.n_experts;
                             const int32_t gpu_count = std::max(1, static_cast<int32_t>(
@@ -1020,12 +1020,12 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                                     __func__, (int32_t)whitelist.size(), total_experts, params.moe_gpu_expert_ratio);
                         } else {
                             LLAMA_LOG_WARN("%s: frequency report not found or empty at %s, falling back to full-slot mode\n",
-                                    __func__, params.moe_freq_report_path);
+                                    __func__, params.moe_freq_report_in);
                         }
                     }
 
-                    // enable access tracking when freq report path is specified
-                    if (params.moe_freq_report_path && params.moe_freq_report_path[0]) {
+                    // enable access tracking when an output freq report path is specified (Pass 1)
+                    if (params.moe_freq_report_out && params.moe_freq_report_out[0]) {
                         model->moe_gpu_expert_cache.track_access = true;
                     }
 
