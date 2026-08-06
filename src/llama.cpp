@@ -917,6 +917,45 @@ static void llama_moe_gpu_expert_slot_preload(const llama_model & model) {
     LLAMA_LOG_INFO("%s: MoE GPU expert slot preload complete: %d experts preloaded across %zu MoE layers\n", __func__, n_preloaded, moe_layers.size());
 }
 
+// Build a fingerprint that identifies a specific model for MoE frequency
+// reports. Derived from GGUF metadata (general.name), the model description,
+// the parameter count and the total model size: stable across runs of the same
+// file, and different between different models or quantizations. Sanitized so
+// the value is safe to embed in the JSON report.
+static std::string llama_moe_model_fingerprint(const llama_model & model) {
+    auto sanitize = [](const char * s) -> std::string {
+        std::string out;
+        if (s == nullptr) {
+            return out;
+        }
+        for (const char * p = s; *p; ++p) {
+            const unsigned char c = (unsigned char) *p;
+            if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.') {
+                out += (char) c;
+            } else {
+                out += '_';
+            }
+        }
+        return out;
+    };
+    char buf[512];
+    std::string name;
+    if (llama_model_meta_val_str(&model, "general.name", buf, sizeof(buf)) > 0) {
+        name = sanitize(buf);
+    }
+    std::string desc;
+    if (llama_model_desc(&model, buf, sizeof(buf)) > 0) {
+        desc = sanitize(buf);
+    }
+    char fp[1024];
+    snprintf(fp, sizeof(fp), "%s|%s|%llu|%llu",
+             name.c_str(), desc.c_str(),
+             (unsigned long long) llama_model_n_params(&model),
+             (unsigned long long) llama_model_size(&model));
+    return std::string(fp);
+}
+
 static std::pair<int, llama_model *> llama_model_load(struct gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * set_tensor_data_ud,
         const std::string & fname, std::vector<std::string> & splits, FILE * file, llama_model_params & params) {
     try {
@@ -1005,6 +1044,14 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                     if (is_freq_mode && params.moe_freq_report_in) {
                         llama_moe_freq_report freq_report = load_freq_report(params.moe_freq_report_in);
                         if (!freq_report.stats.empty()) {
+                            // verify the report was generated for this model before applying it
+                            const std::string model_fingerprint = llama_moe_model_fingerprint(*model);
+                            const bool fingerprint_ok = !freq_report.model_fingerprint.empty() &&
+                                                        freq_report.model_fingerprint == model_fingerprint;
+                            if (!fingerprint_ok) {
+                                LLAMA_LOG_WARN("%s: frequency report fingerprint mismatch (report: '%s', model: '%s'); ignoring report and falling back to full-slot mode\n",
+                                        __func__, freq_report.model_fingerprint.c_str(), model_fingerprint.c_str());
+                            } else {
                             const int32_t total_experts = freq_report.n_layers * freq_report.n_experts;
                             const int32_t gpu_count = std::max(1, static_cast<int32_t>(
                                 total_experts * params.moe_gpu_expert_ratio));
@@ -1018,6 +1065,7 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                             model->moe_gpu_expert_cache.set_frequency_whitelist(whitelist);
                             LLAMA_LOG_INFO("%s: frequency placement: %d/%d experts on GPU (ratio=%.2f)\n",
                                     __func__, (int32_t)whitelist.size(), total_experts, params.moe_gpu_expert_ratio);
+                            }
                         } else {
                             LLAMA_LOG_WARN("%s: frequency report not found or empty at %s, falling back to full-slot mode\n",
                                     __func__, params.moe_freq_report_in);
@@ -1292,7 +1340,7 @@ bool llama_save_moe_freq_report(llama_context * ctx, const char * path) {
         model.moe_gpu_expert_cache.track_access,
         model.moe_gpu_expert_cache.access_counts.size());
     if (!model.moe_gpu_expert_cache.track_access) return false;
-    auto report = model.moe_gpu_expert_cache.generate_access_report("moe-access-tracking", 0);
+    auto report = model.moe_gpu_expert_cache.generate_access_report(llama_moe_model_fingerprint(model), 0);
     fprintf(stderr, "[moe-stats] report stats=%zu, sorted=%zu\n",
         report.stats.size(), report.sorted_by_frequency.size());
     bool ok = save_freq_report(report, path);
