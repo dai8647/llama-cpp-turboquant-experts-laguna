@@ -10,6 +10,8 @@ A fork of [TheTom/llama-cpp-turboquant](https://github.com/TheTom/llama-cpp-turb
 - **Laguna architecture support** — port of upstream PR #25165 (merged 2026-07-22)
 - **Frequency-based expert placement** — GPU placement based on expert selection frequency
 - **DeepSeek V4 (`deepseek4`) support** — merged from upstream master (2026-08-03)
+- **Generic MTP speculative decoding** — architecture-agnostic `draft-mtp` engine with `graph_mtp` in 12+ model families (DeepSeek V2/3/4, Qwen3.5/3.6, Step3.5, GLM-DSA, MiMo2, Cohere2, HY-V3, ...)
+- **Ling-3.0-flash (`bailing-hybrid`) support** — hybrid KDA + gated-MLA MoE (127.5B-A5.1B), including its MTP head (`--mtp`)
 
 Upstream sync status: **fully caught up with `ggml-org/llama.cpp` master as of
 2026-08-03** (merge commit `c461b278`). See `TURBOQUANT_UPSTREAM_MERGE.md` and
@@ -27,6 +29,8 @@ Upstream sync status: **fully caught up with `ggml-org/llama.cpp` master as of
 - **Laguna architecture support** — upstream PR #25165 (merged 2026-07-22) の移植
 - **Frequency-based expert placement** — Expert選択頻度に基づくGPU配置
 - **DeepSeek V4 (`deepseek4`) 対応** — 上流 master からマージ (2026-08-03)
+- **汎用 MTP 投機デコード** — アーキ非依存の `draft-mtp` エンジン。`graph_mtp` を持つ 12+ モデルファミリー (DeepSeek V2/3/4, Qwen3.5/3.6, Step3.5, GLM-DSA, MiMo2, Cohere2, HY-V3 など) で使用可
+- **Ling-3.0-flash (`bailing-hybrid`) 対応** — KDA + gated MLA ハイブリッド MoE (127.5B-A5.1B)。MTP ヘッドも `--mtp` で使用可
 
 上流追従状況: **2026-08-03 時点で `ggml-org/llama.cpp` master に完全追従**
 (マージコミット `c461b278`)。詳細は `TURBOQUANT_UPSTREAM_MERGE.md` および
@@ -186,6 +190,12 @@ llama-server -hf heath0xFF/DeepSeek-V4-Flash-0731-REAP-GGUF:Q4_K_M \
 Markov head を持つサイドカーを `--dflash` で取得) で有効化され、DFlash と
 同じ検証 (hidden size / レイヤ範囲 / 最終層スロット) を受けます。
 
+> MTP は DeepSeek 専用ではなく、**汎用エンジン**です。`graph_mtp` を実装した
+> 12+ モデルファミリー (deepseek4 / deepseek2 / deepseek32 / step35 / qwen35 /
+> qwen35moe / qwen3next / cohere2moe / glm-dsa / mimo2 / hy-v3 / bailing-hybrid)
+> すべてで `--mtp` が有効で、ドライバにアーキ依存の分岐はありません
+> (レイヤ数・hidden size・チェーンヘッド位置はモデルのメタデータから自動取得)。
+
 #### REAP について
 
 **REAP** (Router-weighted Expert Activation Pruning、Cerebras) はモデル**作成時**の
@@ -211,6 +221,13 @@ llama-server -hf heath0xFF/DeepSeek-V4-Flash-0731-REAP-GGUF:Q4_K_M \
 To use it as a speculative-draft, enable `--spec-type draft-dspark` (or fetch
 the Markov-head sidecar with `--dflash`); it receives the same validation as
 DFlash (hidden size, layer bounds, final-layer slot).
+
+> MTP is **not** DeepSeek-specific: it is a generic engine. Any model family
+> with `graph_mtp` (deepseek4 / deepseek2 / deepseek32 / step35 / qwen35 /
+> qwen35moe / qwen3next / cohere2moe / glm-dsa / mimo2 / hy-v3 /
+> bailing-hybrid) enables `--mtp`, and the driver has zero architecture-
+> specific branches (layer count, hidden size and chain-head positions are read
+> from the model metadata).
 
 #### About REAP
 
@@ -245,6 +262,65 @@ Expert選択頻度を記録し、高頻度ExpertをGPUに優先配置。
 ./llama-cli -m model.gguf --moe-expert-placement frequency \
     --moe-freq-report-in stats.json --moe-gpu-expert-ratio 0.6 -p "..." -n 256
 ```
+
+### 5. Ling-3.0-flash (`bailing-hybrid`)
+
+inclusionAI [Ling-3.0-flash](https://huggingface.co/inclusionAI/Ling-3.0-flash)
+(MIT, 127.5B total / 5.1B active) をネイティブサポート。`model_type`
+`bailing_hybrid` は **KDA (Kimi Delta Attention / 線形アテンション) 35 層 +
+gated MLA 7 層 + 512 エキスパート MoE (top-8)** のハイブリッド構成で、KDA 層は
+KV cache を持たないためコンテキストの VRAM コストが非常に軽い
+(約 8.2 KB/token、全-MLA モデルの約 1/9)。
+
+- 実装: `src/models/bailing-hybrid.cpp`。KDA ブロックは kimi-linear、MLA は
+  既存 ggml カーネルを再利用 (ggml コアは無変更)。MoE router は bailingmoe2 と
+  同一の noaux_tc grouped top-k + sigmoid
+- **MTP 対応**: layer 42 の `BailingMoeV3MTPLayer` (enorm/hnorm + eh_proj +
+  gated MLA + MoE + shared head) を `graph_mtp` として実装済み。`--mtp` で
+  投機デコードに使用可。MTP ヘッドの重み (blk.42 の全 21 テンソル) は GGUF に
+  含まれ、`--mtp` 指定時のみロードされます (通常推論ではスキップ)
+- GGUF: `prometheusAIR/Ling-3.0-flash-GGUF` (Q4_K_M / Q5_K_M / Q5_K_XL /
+  Q5_K_XXL / Q8_0) が公開済み。256K コンテキスト対応
+
+```bash
+# MTP 投機デコード付き
+llama-server -hf prometheusAIR/Ling-3.0-flash-GGUF:Q4_K_M \
+  --mtp -c 32768 -ngl 99
+```
+
+注意: `sakamakismile/Ling-3.0-flash-W4A4-NVFP4` は safetensors + vLLM フォーク
+専用 (NVFP4 W4A4 / compressed-tensors) のため、llama.cpp では直接ロードできません。
+llama.cpp で使う場合は上記の GGUF、または bf16 ベースを本フォークの
+`convert_hf_to_gguf.py` (conversion/bailing_hybrid.py) で変換したものを使います。
+
+#### Ling-3.0-flash (`bailing-hybrid`) / EN
+
+Native support for inclusionAI [Ling-3.0-flash](https://huggingface.co/inclusionAI/Ling-3.0-flash)
+(MIT, 127.5B total / 5.1B active). The `bailing_hybrid` model_type is a hybrid of
+**35 KDA (Kimi Delta Attention / linear attention) layers + 7 gated MLA layers +
+512-expert MoE (top-8)**. KDA layers carry no KV cache, so context memory is very
+cheap (~8.2 KB/token, roughly 1/9th of an all-MLA model).
+
+- Implementation: `src/models/bailing-hybrid.cpp`. The KDA block reuses
+  kimi-linear, MLA reuses existing ggml kernels (no ggml core changes); the MoE
+  router is the same noaux_tc grouped top-k + sigmoid as bailingmoe2
+- **MTP**: layer 42's `BailingMoeV3MTPLayer` (enorm/hnorm + eh_proj + gated MLA
+  + MoE + shared head) is implemented as `graph_mtp` and usable with `--mtp`.
+  The MTP head weights (all 21 blk.42 tensors) are in the GGUF and loaded only
+  when `--mtp` is requested (skipped otherwise)
+- GGUF: published at `prometheusAIR/Ling-3.0-flash-GGUF` (Q4_K_M / Q5_K_M /
+  Q5_K_XL / Q5_K_XXL / Q8_0), verified at 256K context
+
+```bash
+# with MTP speculative decoding
+llama-server -hf prometheusAIR/Ling-3.0-flash-GGUF:Q4_K_M \
+  --mtp -c 32768 -ngl 99
+```
+
+Note: `sakamakismile/Ling-3.0-flash-W4A4-NVFP4` is a safetensors + vLLM-fork-only
+repo (NVFP4 W4A4 / compressed-tensors) and cannot be loaded by llama.cpp directly.
+Use the GGUFs above, or convert the bf16 base with this fork's
+`convert_hf_to_gguf.py` (conversion/bailing_hybrid.py).
 
 ## ビルド / Build
 

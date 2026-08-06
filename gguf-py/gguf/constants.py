@@ -245,7 +245,9 @@ class Keys:
         DT_B_C_RMS     = "{arch}.ssm.dt_b_c_rms"
 
     class KDA:
-        HEAD_DIM = "{arch}.kda.head_dim"
+        HEAD_DIM    = "{arch}.kda.head_dim"
+        # bailing-hybrid safe-gate: g = LOWER_BOUND * sigmoid(exp(A_log) * (f(x) + dt_bias))
+        LOWER_BOUND = "{arch}.kda.lower_bound"
 
     class WKV:
         HEAD_SIZE = "{arch}.wkv.head_size"
@@ -568,6 +570,7 @@ class MODEL_ARCH(IntEnum):
     LLAMA_EMBED      = auto()
     MAINCODER        = auto()
     KIMI_LINEAR      = auto()
+    BAILING_HYBRID   = auto()
     TALKIE           = auto()
     MELLUM           = auto()
     NANBEIGE         = auto()
@@ -685,6 +688,8 @@ class MODEL_TENSOR(IntEnum):
     SSM_BETA             = auto() # Kimi Linear qwen3.5
     SSM_G_A              = auto() # Kimi Linear
     SSM_G_B              = auto() # Kimi Linear
+    SSM_F                = auto() # bailing-hybrid (full-rank forget gate)
+    SSM_G                = auto() # bailing-hybrid (full-rank output gate)
     TIME_MIX_W0          = auto()
     TIME_MIX_W1          = auto()
     TIME_MIX_W2          = auto()
@@ -1240,6 +1245,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.LLAMA_EMBED:      "llama-embed",
     MODEL_ARCH.MAINCODER:        "maincoder",
     MODEL_ARCH.KIMI_LINEAR:      "kimi-linear",
+    MODEL_ARCH.BAILING_HYBRID:   "bailing-hybrid",
     MODEL_ARCH.TALKIE:           "talkie",
     MODEL_ARCH.MELLUM:           "mellum",
     MODEL_ARCH.NANBEIGE:         "nanbeige",
@@ -1355,6 +1361,8 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.SSM_BETA:                  "blk.{bid}.ssm_beta",             # Kimi Linear qwen3.5
     MODEL_TENSOR.SSM_G_A:                   "blk.{bid}.ssm_g_a",              # Kimi Linear
     MODEL_TENSOR.SSM_G_B:                   "blk.{bid}.ssm_g_b",              # Kimi Linear
+    MODEL_TENSOR.SSM_F:                     "blk.{bid}.ssm_f",                # bailing-hybrid
+    MODEL_TENSOR.SSM_G:                     "blk.{bid}.ssm_g",                # bailing-hybrid
     MODEL_TENSOR.TIME_MIX_W0:               "blk.{bid}.time_mix_w0",
     MODEL_TENSOR.TIME_MIX_W1:               "blk.{bid}.time_mix_w1",
     MODEL_TENSOR.TIME_MIX_W2:               "blk.{bid}.time_mix_w2",
@@ -4748,6 +4756,47 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_GATE,
         MODEL_TENSOR.FFN_DOWN,
         MODEL_TENSOR.FFN_UP,
+    ],
+    MODEL_ARCH.BAILING_HYBRID: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_Q,
+        MODEL_TENSOR.ATTN_K,
+        MODEL_TENSOR.ATTN_V,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.ATTN_GATE,
+        MODEL_TENSOR.ATTN_KV_A_MQA,
+        MODEL_TENSOR.ATTN_KV_A_NORM,
+        MODEL_TENSOR.ATTN_KV_B,
+        MODEL_TENSOR.ATTN_K_B,
+        MODEL_TENSOR.ATTN_V_B,
+        MODEL_TENSOR.SSM_CONV1D_Q,
+        MODEL_TENSOR.SSM_CONV1D_K,
+        MODEL_TENSOR.SSM_CONV1D_V,
+        MODEL_TENSOR.SSM_F,
+        MODEL_TENSOR.SSM_G,
+        MODEL_TENSOR.SSM_BETA,
+        MODEL_TENSOR.SSM_A,
+        MODEL_TENSOR.SSM_DT,
+        MODEL_TENSOR.SSM_NORM,
+        MODEL_TENSOR.FFN_NORM,
+        MODEL_TENSOR.FFN_GATE,
+        MODEL_TENSOR.FFN_DOWN,
+        MODEL_TENSOR.FFN_UP,
+        MODEL_TENSOR.FFN_GATE_INP,
+        MODEL_TENSOR.FFN_GATE_EXP,
+        MODEL_TENSOR.FFN_DOWN_EXP,
+        MODEL_TENSOR.FFN_UP_EXP,
+        MODEL_TENSOR.FFN_EXP_PROBS_B,
+        MODEL_TENSOR.FFN_GATE_SHEXP,
+        MODEL_TENSOR.FFN_DOWN_SHEXP,
+        MODEL_TENSOR.FFN_UP_SHEXP,
+        MODEL_TENSOR.NEXTN_EH_PROJ,
+        MODEL_TENSOR.NEXTN_ENORM,
+        MODEL_TENSOR.NEXTN_HNORM,
+        MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM,
     ],
     MODEL_ARCH.KIMI_LINEAR: [
         MODEL_TENSOR.TOKEN_EMBD,

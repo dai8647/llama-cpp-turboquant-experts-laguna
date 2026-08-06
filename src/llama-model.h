@@ -517,6 +517,11 @@ struct llama_layer {
     struct ggml_tensor * ssm_g_b    = nullptr;
     struct ggml_tensor * ssm_o_norm = nullptr;
 
+    // full-rank KDA forget/output gates (bailing-hybrid, no_kda_lora=true):
+    // single matmuls that replace the ssm_{f,g}_{a,b} low-rank pairs above
+    struct ggml_tensor * ssm_f      = nullptr;
+    struct ggml_tensor * ssm_g      = nullptr;
+
     // DSA (deepseek sparse attention)
     struct ggml_tensor * indexer_k_norm   = nullptr;
     struct ggml_tensor * indexer_k_norm_b = nullptr;

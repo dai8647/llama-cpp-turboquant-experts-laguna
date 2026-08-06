@@ -269,6 +269,7 @@ class TensorNameMap:
             "layers.{bid}.self_attn.q_proj",                             # qwen3-embedding
             "backbone.layers.{bid}.mixer.q_proj",                        # nemotron-h
             "model.blocks.{bid}.attn.attn_query",                        # talkie
+            "model.layers.{bid}.attention.q_proj",  # bailing-hybrid
         ),
 
         # Attention key
@@ -290,6 +291,7 @@ class TensorNameMap:
             "layers.{bid}.self_attn.k_proj",                           # qwen3-embedding
             "backbone.layers.{bid}.mixer.k_proj",                      # nemotron-h
             "model.blocks.{bid}.attn.attn_key",                        # talkie
+            "model.layers.{bid}.attention.k_proj",  # bailing-hybrid
         ),
 
         # Attention value
@@ -310,6 +312,7 @@ class TensorNameMap:
             "layers.{bid}.self_attn.v_proj",                             # qwen3-embedding
             "backbone.layers.{bid}.mixer.v_proj",                        # nemotron-h
             "model.blocks.{bid}.attn.attn_value",                        # talkie
+            "model.layers.{bid}.attention.v_proj",  # bailing-hybrid
         ),
 
         # Attention output
@@ -349,6 +352,7 @@ class TensorNameMap:
             "backbone.layers.{bid}.mixer.o_proj",                           # nemotron-h
             "model.layers.{bid}.self_attn.language_expert_dense",           # cogvlm
             "model.blocks.{bid}.attn.attn_resid",                           # talkie
+            "model.layers.{bid}.attention.o_proj",  # bailing-hybrid
         ),
 
         # Attention output norm
@@ -385,6 +389,7 @@ class TensorNameMap:
             "model.layers.{bid}.self_attn.gate_proj", # afmoe
             "model.layers.{bid}.linear_attn.in_proj_z",  # qwen3.5
             "model.layers.{bid}.self_attn.g_proj",    # step3.5 head-wise attention gate
+            "model.layers.{bid}.attention.g_proj",  # bailing-hybrid
         ),
 
         # Feed-forward norm
@@ -832,6 +837,7 @@ class TensorNameMap:
             "model.layers.{bid}.linear_attn.dt_proj",   # qwen3next
             "backbone.layers.{bid}.mixer.dt",           # nemotron-h-moe
             "model.layers.{bid}.self_attn.dt_proj",     # kimi
+            "model.layers.{bid}.attention.dt_proj",  # bailing-hybrid
         ),
 
         MODEL_TENSOR.SSM_DT_NORM: (
@@ -846,6 +852,7 @@ class TensorNameMap:
             "model.layers.layers.{bid}.mixer.A_log",  # plamo2
             "model.layers.{bid}.linear_attn.A_log",   # qwen3next
             "model.layers.{bid}.self_attn.A_log",     # kimi
+            "model.layers.{bid}.attention.A_log",  # bailing-hybrid
         ),
 
         MODEL_TENSOR.SSM_B_NORM: (
@@ -872,6 +879,7 @@ class TensorNameMap:
             "model.layers.{bid}.linear_attn.norm",  # qwen3next
             "backbone.layers.{bid}.mixer.norm",     # mamba2
             "model.layers.{bid}.self_attn.o_norm",  # kimi
+            "model.layers.{bid}.attention.o_norm",  # bailing-hybrid
         ),
 
         MODEL_TENSOR.SSM_OUT: (
@@ -893,12 +901,15 @@ class TensorNameMap:
         # Kimi Linear KDA (using SSM_ prefix for consistency)
         MODEL_TENSOR.SSM_CONV1D_Q: (
             "model.layers.{bid}.self_attn.q_conv1d",
+            "model.layers.{bid}.attention.q_conv1d",  # bailing-hybrid
         ),
         MODEL_TENSOR.SSM_CONV1D_K: (
             "model.layers.{bid}.self_attn.k_conv1d",
+            "model.layers.{bid}.attention.k_conv1d",  # bailing-hybrid
         ),
         MODEL_TENSOR.SSM_CONV1D_V: (
             "model.layers.{bid}.self_attn.v_conv1d",
+            "model.layers.{bid}.attention.v_conv1d",  # bailing-hybrid
         ),
         MODEL_TENSOR.SSM_F_A: (
             "model.layers.{bid}.self_attn.f_a_proj",
@@ -909,12 +920,19 @@ class TensorNameMap:
         MODEL_TENSOR.SSM_BETA: (
             "model.layers.{bid}.linear_attn.in_proj_b",  # qwen3.5
             "model.layers.{bid}.self_attn.b_proj",       # Kimi Linear
+            "model.layers.{bid}.attention.b_proj",  # bailing-hybrid
         ),
         MODEL_TENSOR.SSM_G_A: (
             "model.layers.{bid}.self_attn.g_a_proj",
         ),
         MODEL_TENSOR.SSM_G_B: (
             "model.layers.{bid}.self_attn.g_b_proj",
+        ),
+        MODEL_TENSOR.SSM_F: (
+            "model.layers.{bid}.attention.f_proj",       # bailing-hybrid (full-rank)
+        ),
+        MODEL_TENSOR.SSM_G: (
+            "model.layers.{bid}.attention.g_full_proj",  # bailing-hybrid (renamed by converter)
         ),
         MODEL_TENSOR.TIME_MIX_W0: (
             "model.layers.{bid}.attention.w0",            # rwkv7
@@ -1099,20 +1117,24 @@ class TensorNameMap:
         MODEL_TENSOR.ATTN_KV_A_MQA: (
             "model.layers.{bid}.self_attn.kv_a_proj_with_mqa", # deepseek2
             "layers.{bid}.attention.wkv_a_with_mqa",           # mistral-large
+            "model.layers.{bid}.attention.kv_a_proj_with_mqa",  # bailing-hybrid
         ),
 
         MODEL_TENSOR.ATTN_KV_B: (
             "model.layers.{bid}.self_attn.kv_b_proj", # deepseek2
+            "model.layers.{bid}.attention.kv_b_proj",  # bailing-hybrid
         ),
 
         MODEL_TENSOR.ATTN_K_B: (
             "model.layers.{bid}.self_attn.k_b_proj",  # deepseek2
             "layers.{bid}.attention.k_b_proj",        # mistral-large
+            "model.layers.{bid}.attention.k_b_proj",  # bailing-hybrid
         ),
 
         MODEL_TENSOR.ATTN_V_B: (
             "model.layers.{bid}.self_attn.v_b_proj",  # deepseek2
             "layers.{bid}.attention.v_b_proj",        # mistral-large
+            "model.layers.{bid}.attention.v_b_proj",  # bailing-hybrid
         ),
 
         MODEL_TENSOR.ATTN_Q_A_NORM: (
@@ -1123,6 +1145,7 @@ class TensorNameMap:
         MODEL_TENSOR.ATTN_KV_A_NORM: (
             "model.layers.{bid}.self_attn.kv_a_layernorm", # deepseek2
             "layers.{bid}.attention.kv_a_norm",            # mistral-large
+            "model.layers.{bid}.attention.kv_a_layernorm",  # bailing-hybrid
         ),
 
         MODEL_TENSOR.ATTN_SUB_NORM: (
@@ -2564,6 +2587,7 @@ class TensorNameMap:
 
         MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM: (
             "model.layers.{bid}.shared_head.norm",
+            "model.layers.{bid}.final_layernorm",  # bailing-hybrid
         ),
     }
 
