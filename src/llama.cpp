@@ -10,7 +10,6 @@
 #include "llama-model-saver.h"
 #include "llama-model.h"
 #include "llama-moe-stats.h"
-#include "llama-moe-placement.h"
 
 #include <string>
 
