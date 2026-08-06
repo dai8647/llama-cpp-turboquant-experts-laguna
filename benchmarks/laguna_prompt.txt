@@ -1,1 +1,0 @@
-﻿Explain the concept of Mixture of Experts (MoE) in large language models. Include details about how expert routing works, the benefits of sparse activation, and how it differs from dense transformer architectures. Provide a concrete example with a model that has 8 experts and a top-2 routing strategy.

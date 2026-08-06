@@ -10,6 +10,7 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 
@@ -42,6 +43,7 @@ enum llm_type {
     LLM_TYPE_160M,
     LLM_TYPE_190M,
     LLM_TYPE_220M,
+    LLM_TYPE_230M,
     LLM_TYPE_250M,
     LLM_TYPE_256M,
     LLM_TYPE_270M,
@@ -135,10 +137,12 @@ enum llm_type {
     LLM_TYPE_100B_A6B,
     LLM_TYPE_102B_A12B, // Solar-Open
     LLM_TYPE_106B_A12B, // GLM-4.5-Air
+    LLM_TYPE_118B_A8B,  // Laguna-S-2
     LLM_TYPE_120B_A12B, // Nemotron 3 Super
     LLM_TYPE_122B_A10B, // Qwen3.5
     LLM_TYPE_196B_A11B, // Step3.5-Flash
     LLM_TYPE_230B_A10B, // Minimax M2
+    LLM_TYPE_428B_A23B, // Minimax M3
     LLM_TYPE_235B_A22B,
     LLM_TYPE_300B_A47B, // Ernie MoE big
     LLM_TYPE_310B_A15B, // /MiMo-V2-Flash
@@ -260,9 +264,11 @@ struct llama_layer {
     struct ggml_tensor * wq_b      = nullptr;
     struct ggml_tensor * wkv_a_mqa = nullptr;
     struct ggml_tensor * wkv_b     = nullptr;
+    struct ggml_tensor * wkv       = nullptr;
     struct ggml_tensor * wk_b      = nullptr;
     struct ggml_tensor * wv_b      = nullptr;
     struct ggml_tensor * wqkv_b    = nullptr;
+    struct ggml_tensor * wo_a      = nullptr;
     struct ggml_tensor * wo_b      = nullptr;
     struct ggml_tensor * wq_cross  = nullptr;
     struct ggml_tensor * wk_cross  = nullptr;
@@ -338,6 +344,7 @@ struct llama_layer {
     struct ggml_tensor * ffn_up_b   = nullptr; // b3
     struct ggml_tensor * ffn_act    = nullptr;
     struct ggml_tensor * ffn_exp_probs_b = nullptr;
+    struct ggml_tensor * ffn_gate_tid2eid = nullptr;
 
     // mamba proj
     struct ggml_tensor * ssm_in  = nullptr;
@@ -468,6 +475,23 @@ struct llama_layer {
     // openai-moe
     struct ggml_tensor * attn_sinks = nullptr;
 
+    // DeepSeek-V4
+    struct ggml_tensor * attn_kv_norm = nullptr;
+    struct ggml_tensor * hc_attn_fn   = nullptr;
+    struct ggml_tensor * hc_attn_base = nullptr;
+    struct ggml_tensor * hc_attn_scale = nullptr;
+    struct ggml_tensor * hc_ffn_fn    = nullptr;
+    struct ggml_tensor * hc_ffn_base  = nullptr;
+    struct ggml_tensor * hc_ffn_scale = nullptr;
+    struct ggml_tensor * attn_comp_wkv   = nullptr;
+    struct ggml_tensor * attn_comp_wgate = nullptr;
+    struct ggml_tensor * attn_comp_ape   = nullptr;
+    struct ggml_tensor * attn_comp_norm  = nullptr;
+    struct ggml_tensor * indexer_comp_wkv   = nullptr;
+    struct ggml_tensor * indexer_comp_wgate = nullptr;
+    struct ggml_tensor * indexer_comp_ape   = nullptr;
+    struct ggml_tensor * indexer_comp_norm  = nullptr;
+
     // cogvlm
     struct ggml_tensor * visexp_attn_wqkv = nullptr;
     struct ggml_tensor * visexp_attn_wo   = nullptr;
@@ -493,12 +517,23 @@ struct llama_layer {
     struct ggml_tensor * ssm_g_b    = nullptr;
     struct ggml_tensor * ssm_o_norm = nullptr;
 
+    // full-rank KDA forget/output gates (bailing-hybrid, no_kda_lora=true):
+    // single matmuls that replace the ssm_{f,g}_{a,b} low-rank pairs above
+    struct ggml_tensor * ssm_f      = nullptr;
+    struct ggml_tensor * ssm_g      = nullptr;
+
     // DSA (deepseek sparse attention)
     struct ggml_tensor * indexer_k_norm   = nullptr;
     struct ggml_tensor * indexer_k_norm_b = nullptr;
     struct ggml_tensor * indexer_proj     = nullptr;
     struct ggml_tensor * indexer_attn_k   = nullptr;
     struct ggml_tensor * indexer_attn_q_b = nullptr; // note: for lora a/b, not bias
+
+    // MSA
+    struct ggml_tensor * index_q_proj = nullptr;
+    struct ggml_tensor * index_k_proj = nullptr;
+    struct ggml_tensor * index_q_norm = nullptr;
+    struct ggml_tensor * index_k_norm = nullptr;
 
     // gemma4 layer output scale, reused for talkie embedding skip scale
     struct ggml_tensor * out_scale = nullptr;
@@ -580,12 +615,6 @@ struct llama_moe_gpu_expert_cache {
 
     int32_t n_slots = 0;
 
-    bool record_access_in_callback = false; // off by default; post-compute path handles tracking
-
-    // When true, the slot-cache callback path is skipped (AMD RDNA4 driver SEGV in ggml_map_custom1
-    // callback). Frequency placement still works via whitelist + post-compute tracking.
-    bool frequency_mode = false;
-
     std::unordered_map<int32_t, std::vector<llama_moe_gpu_expert_slot>> slots_by_layer;
     std::unordered_map<int32_t, llama_moe_gpu_expert_bank> banks_by_layer;
     std::unordered_map<uint64_t, int32_t> expert_to_slot;
@@ -602,14 +631,6 @@ struct llama_moe_gpu_expert_cache {
     // access tracking for frequency stats
     std::unordered_map<uint64_t, int64_t> access_counts; // key(layer_id, expert_id) -> count
     bool track_access = false;
-    int32_t tracked_n_experts = 0; // model-true n_expert, set at init time
-    std::vector<std::pair<std::string, int32_t>> tracker_tensors; // (tensor_name, layer_id) to read after graph compute. Stores name not pointer because tensor pointers become dangling after graph_context destruction.
-
-    void record_access(int32_t layer_id, int32_t expert_id) {
-        if (!track_access) return;
-        uint64_t k = key(layer_id, expert_id);
-        access_counts[k]++;
-    }
 
     // frequency-based placement: preload experts in this list (frequency order)
     // empty means preload all (full-slot mode)
@@ -620,18 +641,12 @@ struct llama_moe_gpu_expert_cache {
     }
 
     void init(int32_t n) {
-        // Clamp to a safe per-layer upper bound. The raw `n` (which can be INT32_MAX from
-        // --moe-expert-placement frequency) is interpreted as "how many slots PER LAYER" in
-        // llama_moe_gpu_expert_slot_effective_count, but the previous code stored it directly
-        // as n_slots (total), causing n_slots=INT32_MAX in some paths and downstream SIGSEGV
-        // when iterating slot tables. Cap to the total experts per layer (256) plus headroom.
-        const int32_t capped = n > 0 ? std::min<int32_t>(n, 256) : 0;
-        n_slots = capped;
+        n_slots = n > 0 ? n : 0;
         slots_by_layer.clear();
         banks_by_layer.clear();
         expert_to_slot.clear();
         compute_tensor_by_src.clear();
-        expert_to_slot.reserve(n_slots > 0 ? n_slots * 40 : 0);
+        expert_to_slot.reserve(n_slots);
         frequency_whitelist.clear();
         clock = 0;
         n_hit = 0;
@@ -678,14 +693,6 @@ struct llama_moe_gpu_expert_cache {
 
     bool enabled() const {
         return n_slots > 0;
-    }
-
-    // record_access_enabled: gate to opt-in for callback-based tracking
-    // The post-compute tracking path (process_ubatch) handles all recording
-    // by default. Set to false in upstream-sync-stable builds unless
-    // callback-based tracking is explicitly desired.
-    bool record_access_enabled() const {
-        return record_access_in_callback;
     }
 
     int32_t size() const {
@@ -748,20 +755,19 @@ struct llama_moe_gpu_expert_cache {
     llama_moe_freq_report generate_access_report(const std::string& fingerprint, int32_t n_active_experts) const {
         llama_moe_freq_report report;
         report.model_fingerprint = fingerprint;
-        report.n_experts = tracked_n_experts;
+        report.n_experts = 0;
         report.n_active_experts = n_active_experts;
 
-        if (report.n_experts <= 0) {
-            return report;
-        }
-
-        // find max layer ID
-        int32_t max_layer = 0;
+        // find max layer and expert IDs
+        int32_t max_layer = 0, max_expert = 0;
         for (const auto& [k, v] : access_counts) {
             int32_t lid = int32_t(k >> 32);
+            int32_t eid = int32_t(k & 0xFFFFFFFF);
             if (lid > max_layer) max_layer = lid;
+            if (eid > max_expert) max_expert = eid;
         }
         report.n_layers = max_layer + 1;
+        report.n_experts = max_expert + 1;
 
         report.stats.resize(report.n_layers * report.n_experts);
         for (int32_t l = 0; l < report.n_layers; l++) {
@@ -954,6 +960,11 @@ struct llama_moe_gpu_expert_cache {
             return expert_id;
         }
 
+        // frequency placement: skip experts not in whitelist
+        if (!frequency_whitelist.empty() && !is_in_frequency_whitelist(layer_id, expert_id)) {
+            return expert_id;
+        }
+
         int32_t slot = find(layer_id, expert_id);
         if (slot >= 0) {
             ++n_hit;
@@ -1025,6 +1036,11 @@ struct llama_model {
     struct ggml_tensor * nextn_proj_pre  = nullptr;
     struct ggml_tensor * nextn_proj_post = nullptr;
 
+    // DeepSeek-V4
+    struct ggml_tensor * hc_head_fn    = nullptr;
+    struct ggml_tensor * hc_head_base  = nullptr;
+    struct ggml_tensor * hc_head_scale = nullptr;
+
     // classifier
     struct ggml_tensor * cls       = nullptr;
     struct ggml_tensor * cls_b     = nullptr;
@@ -1045,6 +1061,12 @@ struct llama_model {
     // eagle3
     struct ggml_tensor * fc  = nullptr;  // feature fusion layer
     struct ggml_tensor * d2t = nullptr;  // draft to target vocabulary mapping
+
+    // dspark
+    struct ggml_tensor * dspark_markov_w1   = nullptr;
+    struct ggml_tensor * dspark_markov_w2   = nullptr;
+    struct ggml_tensor * dspark_conf_proj   = nullptr;
+    struct ggml_tensor * dspark_conf_proj_b = nullptr;
 
     // unified vector to store target-model extracted layer ids in eagle3, dflash, etc.
     std::vector<int32_t> target_layer_ids;
@@ -1085,6 +1107,8 @@ struct llama_model {
     std::string type_name() const;
 
     std::string desc() const;
+
+    llama_ftype ftype() const;
 
     size_t size() const; // file size
     size_t n_tensors() const;
@@ -1152,6 +1176,7 @@ struct llama_model_base : public llama_model {
     const int TENSOR_NOT_REQUIRED;
     const int TENSOR_SKIP;
     const int TENSOR_SKIP_IF_VIRTUAL;
+    const int TENSOR_ALLOW_RESHAPE;
 
     explicit llama_model_base(const llama_model_params & params);
     virtual ~llama_model_base() = default;

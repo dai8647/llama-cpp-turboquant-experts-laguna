@@ -20,9 +20,57 @@ set(LLAMA_UI_GZIP     "" CACHE STRING "Apply gzip compress to assets to save ban
 
 set(DIST_DIR     "${UI_BINARY_DIR}/dist")
 set(SRC_DIST_DIR "${UI_SOURCE_DIR}/dist")
+set(WORK_DIR     "${UI_BINARY_DIR}/ui-src")
 set(STAMP_FILE   "${UI_BINARY_DIR}/.ui-stamp")
 set(UI_CPP       "${UI_BINARY_DIR}/ui.cpp")
 set(UI_H         "${UI_BINARY_DIR}/ui.h")
+
+# A dist directory is only usable if it holds the COMPLETE asset set that
+# llama-ui-embed requires. A partial dist -- e.g. an npm PWA-assets build that
+# died in the native `sharp` step (common on Termux / very new Node), leaving
+# only index.html -- must not be trusted, or llama-ui-embed aborts the whole
+# build with "missing required asset(s): loading.html ...". Treat an incomplete
+# dist as unusable so provisioning falls through to the HF download instead of
+# hard-failing. Mirrors the required-asset list in tools/ui/embed.cpp.
+function(dist_is_complete dir out_var)
+    set(${out_var} FALSE PARENT_SCOPE)
+    if(NOT EXISTS "${dir}/index.html")
+        return()
+    endif()
+    file(GLOB_RECURSE _files RELATIVE "${dir}" "${dir}/*")
+    set(_have_loading    FALSE)
+    set(_have_manifest   FALSE)
+    set(_have_sw         FALSE)
+    set(_have_build      FALSE)
+    set(_have_version    FALSE)
+    set(_have_bundle_js  FALSE)
+    set(_have_bundle_css FALSE)
+    set(_have_workbox    FALSE)
+    foreach(_f ${_files})
+        get_filename_component(_b "${_f}" NAME)
+        if(_b STREQUAL "loading.html")
+            set(_have_loading TRUE)
+        elseif(_b STREQUAL "manifest.webmanifest")
+            set(_have_manifest TRUE)
+        elseif(_b STREQUAL "sw.js")
+            set(_have_sw TRUE)
+        elseif(_b STREQUAL "build.json")
+            set(_have_build TRUE)
+        elseif(_b STREQUAL "version.json")
+            set(_have_version TRUE)
+        elseif(_b MATCHES "^bundle.*\\.js$")
+            set(_have_bundle_js TRUE)
+        elseif(_b MATCHES "^bundle.*\\.css$")
+            set(_have_bundle_css TRUE)
+        elseif(_b MATCHES "^workbox.*\\.js$")
+            set(_have_workbox TRUE)
+        endif()
+    endforeach()
+    if(_have_loading AND _have_manifest AND _have_sw AND _have_build AND _have_version
+       AND _have_bundle_js AND _have_bundle_css AND _have_workbox)
+        set(${out_var} TRUE PARENT_SCOPE)
+    endif()
+endfunction()
 
 function(npm_build_should_skip out_var)
     set(${out_var} FALSE PARENT_SCOPE)
@@ -64,6 +112,22 @@ function(npm_build_should_skip out_var)
     set(${out_var} TRUE PARENT_SCOPE)
 endfunction()
 
+function(stage_sources)
+    if(EXISTS "${WORK_DIR}")
+        file(GLOB staged RELATIVE "${WORK_DIR}" "${WORK_DIR}/*")
+        list(REMOVE_ITEM staged "node_modules")
+        foreach(entry ${staged})
+            file(REMOVE_RECURSE "${WORK_DIR}/${entry}")
+        endforeach()
+    endif()
+
+    file(COPY "${UI_SOURCE_DIR}/"
+        DESTINATION "${WORK_DIR}"
+        NO_SOURCE_PERMISSIONS
+        PATTERN "node_modules" EXCLUDE
+    )
+endfunction()
+
 function(npm_build out_var)
     set(${out_var} FALSE PARENT_SCOPE)
 
@@ -89,14 +153,16 @@ function(npm_build out_var)
         return()
     endif()
 
+    stage_sources()
+
     # npm writes node_modules/.package-lock.json on every successful install,
     # so a package-lock.json newer than this marker means node_modules is stale
-    set(NPM_MARKER "${UI_SOURCE_DIR}/node_modules/.package-lock.json")
+    set(NPM_MARKER "${WORK_DIR}/node_modules/.package-lock.json")
     set(need_install FALSE)
     if(NOT EXISTS "${NPM_MARKER}")
         set(need_install TRUE)
     else()
-        file(TIMESTAMP "${UI_SOURCE_DIR}/package-lock.json" lock_ts)
+        file(TIMESTAMP "${WORK_DIR}/package-lock.json" lock_ts)
         file(TIMESTAMP "${NPM_MARKER}" marker_ts)
         if(lock_ts STRGREATER marker_ts)
             set(need_install TRUE)
@@ -104,15 +170,15 @@ function(npm_build out_var)
     endif()
 
     if(need_install)
-        message(STATUS "UI: running npm install")
+        message(STATUS "UI: running npm ci")
         execute_process(
-            COMMAND ${NPM_EXECUTABLE} install
-            WORKING_DIRECTORY "${UI_SOURCE_DIR}"
+            COMMAND ${NPM_EXECUTABLE} ci
+            WORKING_DIRECTORY "${WORK_DIR}"
             RESULT_VARIABLE rc
             ERROR_VARIABLE  err
         )
         if(NOT rc EQUAL 0)
-            message(STATUS "UI: npm install failed (${rc})")
+            message(STATUS "UI: npm ci failed (${rc})")
             message(STATUS "  stderr: ${err}")
             return()
         endif()
@@ -124,7 +190,7 @@ function(npm_build out_var)
     execute_process(
         COMMAND ${CMAKE_COMMAND} -E env "LLAMA_UI_OUT_DIR=${DIST_DIR}" "LLAMA_UI_VERSION=${HF_VERSION}" "LLAMA_BUILD_NUMBER=${LLAMA_BUILD_NUMBER}"
                 ${NPM_EXECUTABLE} run build
-        WORKING_DIRECTORY "${UI_SOURCE_DIR}"
+        WORKING_DIRECTORY "${WORK_DIR}"
         RESULT_VARIABLE rc
         ERROR_VARIABLE  err
     )
@@ -167,6 +233,12 @@ function(hf_download version out_var out_resolved)
 
     set(archive "${UI_BINARY_DIR}/dist.tar.gz")
 
+    # Use HF_TOKEN to benefit from higher rate limits
+    set(auth_headers "")
+    if(DEFINED ENV{HF_TOKEN} AND NOT "$ENV{HF_TOKEN}" STREQUAL "")
+        list(APPEND auth_headers "HTTPHEADER" "Authorization: Bearer $ENV{HF_TOKEN}")
+    endif()
+
     set(candidates "")
     if(NOT "${version}" STREQUAL "")
         list(APPEND candidates "${version}")
@@ -179,7 +251,7 @@ function(hf_download version out_var out_resolved)
         message(STATUS "UI: downloading from ${resolved}: ${base}/dist.tar.gz")
 
         file(DOWNLOAD "${base}/dist.tar.gz?download=true" "${archive}"
-            STATUS status TIMEOUT 300
+            STATUS status TIMEOUT 300 ${auth_headers}
         )
         list(GET status 0 rc)
         if(NOT rc EQUAL 0)
@@ -189,7 +261,7 @@ function(hf_download version out_var out_resolved)
         endif()
 
         file(DOWNLOAD "${base}/dist.tar.gz.sha256?download=true" "${archive}.sha256"
-            STATUS status TIMEOUT 30
+            STATUS status TIMEOUT 30 ${auth_headers}
         )
         list(GET status 0 rc)
         if(NOT rc EQUAL 0)
@@ -213,7 +285,13 @@ function(hf_download version out_var out_resolved)
 
         file(ARCHIVE_EXTRACT INPUT "${archive}" DESTINATION "${DIST_DIR}")
 
-        if(NOT EXISTS "${DIST_DIR}/index.html")
+        # The archive must hold the COMPLETE asset set, not just index.html: a
+        # bucket that is older than llama-ui-embed's required-asset list (e.g.
+        # published before loading.html was added) extracts fine but then kills
+        # the whole build in emit_files. Reject it here so we can try the next
+        # candidate, and ultimately degrade to a no-embedded-UI build.
+        dist_is_complete("${DIST_DIR}" archive_ok)
+        if(NOT archive_ok)
             message(STATUS "UI: archive from ${resolved} is missing required assets")
             continue()
         endif()

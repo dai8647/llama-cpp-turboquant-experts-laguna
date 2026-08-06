@@ -50,6 +50,31 @@ const char * llama_flash_attn_type_name(enum llama_flash_attn_type flash_attn_ty
     GGML_ABORT("fatal error");
 }
 
+const char * llama_load_mode_name(enum llama_load_mode load_mode) {
+    switch (load_mode) {
+        case LLAMA_LOAD_MODE_NONE:
+            return "none";
+        case LLAMA_LOAD_MODE_MMAP:
+            return "mmap";
+        case LLAMA_LOAD_MODE_MLOCK:
+            return "mlock";
+        case LLAMA_LOAD_MODE_MMAP_MLOCK:
+            return "mmap+mlock";
+        case LLAMA_LOAD_MODE_DIRECT_IO:
+            return "dio";
+    }
+    GGML_ABORT("fatal error");
+}
+
+enum llama_load_mode llama_load_mode_from_str(const char * str) {
+    if (std::strcmp(str, "none") == 0)       { return LLAMA_LOAD_MODE_NONE;       }
+    if (std::strcmp(str, "mmap") == 0)       { return LLAMA_LOAD_MODE_MMAP;       }
+    if (std::strcmp(str, "mlock") == 0)      { return LLAMA_LOAD_MODE_MLOCK;      }
+    if (std::strcmp(str, "mmap+mlock") == 0) { return LLAMA_LOAD_MODE_MMAP_MLOCK; }
+    if (std::strcmp(str, "dio") == 0)        { return LLAMA_LOAD_MODE_DIRECT_IO;  }
+    throw std::invalid_argument(std::string("unknown load mode: ") + str);
+}
+
 struct llama_sampler_chain_params llama_sampler_chain_default_params() {
     struct llama_sampler_chain_params result = {
         /*.no_perf =*/ true,
@@ -253,7 +278,7 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
     }
 
     // if using single GPU mode, remove all except the main GPU
-    if (params.split_mode == LLAMA_SPLIT_MODE_NONE) {
+    if (params.split_mode == LLAMA_SPLIT_MODE_NONE && !model->devices.empty()) {
         if (params.main_gpu < 0) {
             model->devices.clear();
         } else {
@@ -856,21 +881,6 @@ static void llama_moe_gpu_expert_slot_preload(const llama_model & model) {
                 llama_moe_gpu_expert_slot_materialize(model_mut, assigned >= 0 ? assigned : slot, layer_id, wl_expert, info.n_experts);
                 ++n_preloaded;
             }
-
-            // When the bank can hold the full layer, also materialize non-whitelisted
-            // experts so the packed bank is complete and remap hits on all selections.
-            if (cache.size() >= info.n_experts) {
-                for (int32_t expert_id = 0; expert_id < info.n_experts; ++expert_id) {
-                    if (cache.is_in_frequency_whitelist(layer_id, expert_id)) {
-                        continue;
-                    }
-                    int32_t assigned = cache.preload_or_assign_slot(layer_id, expert_id, step++);
-                    if (assigned >= 0) {
-                        llama_moe_gpu_expert_slot_materialize(model_mut, assigned, layer_id, expert_id, info.n_experts);
-                        ++n_preloaded;
-                    }
-                }
-            }
         } else {
             // full-slot mode: preload all experts sequentially
             for (int32_t expert_id = 0; expert_id < max_layer_experts && expert_id < cache.size(); ++expert_id) {
@@ -910,8 +920,8 @@ static void llama_moe_gpu_expert_slot_preload(const llama_model & model) {
 static std::pair<int, llama_model *> llama_model_load(struct gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * set_tensor_data_ud,
         const std::string & fname, std::vector<std::string> & splits, FILE * file, llama_model_params & params) {
     try {
-        llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.use_mmap, params.use_direct_io,
-            params.check_tensors, params.no_alloc, params.kv_overrides, params.tensor_buft_overrides);
+        llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.load_mode,
+            params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, params.tensor_buft_overrides);
 
         ml.print_info();
         std::unique_ptr<llama_model> model_ptr(llama_model_create(ml, params));
@@ -972,16 +982,6 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                     requested_slots = INT32_MAX;
                 }
             }
-            // enable access tracking when out path is specified (independent of slot cache)
-            const char * freq_report_out = params.moe_freq_report_out_path && params.moe_freq_report_out_path[0]
-                ? params.moe_freq_report_out_path
-                : (params.moe_freq_report_path && params.moe_freq_report_path[0]
-                    ? params.moe_freq_report_path : nullptr);
-            if (freq_report_out) {
-                model->moe_gpu_expert_cache.track_access = true;
-            }
-            model->moe_gpu_expert_cache.tracked_n_experts = (int32_t)model->hparams.n_expert;
-
             if (requested_slots < 0) {
                 model->moe_gpu_expert_cache.clear();
             } else if (params.no_alloc) {
@@ -997,51 +997,36 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                     model->moe_gpu_expert_cache.clear();
                 } else {
                     model->moe_gpu_expert_cache.init(effective_slots);
-                    LLAMA_LOG_INFO("%s: initialized MoE GPU expert slot cache with %d slots (requested %d), tracked_n_experts=%d\n", __func__, effective_slots, requested_slots, model->hparams.n_expert);
+                    LLAMA_LOG_INFO("%s: initialized MoE GPU expert slot cache with %d slots (requested %d)\n", __func__, effective_slots, requested_slots);
 
                     // frequency-based placement: set whitelist from freq report
                     const bool is_freq_mode = params.moe_expert_placement &&
                                               std::string(params.moe_expert_placement) == "frequency";
-                    if (is_freq_mode) {
-                        model->moe_gpu_expert_cache.frequency_mode = true;
-                    }
-                    const char * freq_report_in = params.moe_freq_report_in_path && params.moe_freq_report_in_path[0]
-                        ? params.moe_freq_report_in_path
-                        : (params.moe_freq_report_path && params.moe_freq_report_path[0]
-                            ? params.moe_freq_report_path : nullptr);
-                    if (is_freq_mode && freq_report_in) {
-                        llama_moe_freq_report freq_report = load_freq_report(freq_report_in);
+                    if (is_freq_mode && params.moe_freq_report_path) {
+                        llama_moe_freq_report freq_report = load_freq_report(params.moe_freq_report_path);
                         if (!freq_report.stats.empty()) {
                             const int32_t total_experts = freq_report.n_layers * freq_report.n_experts;
                             const int32_t gpu_count = std::max(1, static_cast<int32_t>(
                                 total_experts * params.moe_gpu_expert_ratio));
-                            // Build whitelist: layer-wise top experts (B-optimization)
+                            // Build whitelist from sorted frequency list
                             std::vector<std::pair<int32_t, int32_t>> whitelist;
-                            const int32_t per_layer_budget = std::max(1, static_cast<int32_t>(
-                                std::round(static_cast<double>(freq_report.n_experts) * params.moe_gpu_expert_ratio)));
-                            for (int32_t l = 0; l < freq_report.n_layers; l++) {
-                                std::vector<int32_t> layer_expert_ids(freq_report.n_experts);
-                                std::iota(layer_expert_ids.begin(), layer_expert_ids.end(), 0);
-                                std::sort(layer_expert_ids.begin(), layer_expert_ids.end(),
-                                          [&](int32_t a, int32_t b) {
-                                              int32_t idx_a = l * freq_report.n_experts + a;
-                                              int32_t idx_b = l * freq_report.n_experts + b;
-                                              return freq_report.stats[idx_a].total_selections > freq_report.stats[idx_b].total_selections;
-                                          });
-                                int32_t take = std::min(per_layer_budget, (int32_t)freq_report.n_experts);
-                                for (int32_t i = 0; i < take; i++) {
-                                    int32_t expert_idx = layer_expert_ids[i];
-                                    int32_t idx = l * freq_report.n_experts + expert_idx;
-                                    whitelist.push_back({freq_report.stats[idx].layer_id, freq_report.stats[idx].expert_id});
-                                }
+                            for (int32_t i = 0; i < gpu_count && i < (int32_t)freq_report.sorted_by_frequency.size(); i++) {
+                                int32_t idx = freq_report.sorted_by_frequency[i];
+                                whitelist.push_back({freq_report.stats[idx].layer_id,
+                                                     freq_report.stats[idx].expert_id});
                             }
                             model->moe_gpu_expert_cache.set_frequency_whitelist(whitelist);
-                            LLAMA_LOG_INFO("%s: frequency placement (layer-wise): %d/%d experts on GPU (per-layer budget=%d, ratio=%.2f)\n",
-                                    __func__, (int32_t)whitelist.size(), total_experts, per_layer_budget, params.moe_gpu_expert_ratio);
+                            LLAMA_LOG_INFO("%s: frequency placement: %d/%d experts on GPU (ratio=%.2f)\n",
+                                    __func__, (int32_t)whitelist.size(), total_experts, params.moe_gpu_expert_ratio);
                         } else {
                             LLAMA_LOG_WARN("%s: frequency report not found or empty at %s, falling back to full-slot mode\n",
-                                    __func__, freq_report_in);
+                                    __func__, params.moe_freq_report_path);
                         }
+                    }
+
+                    // enable access tracking when freq report path is specified
+                    if (params.moe_freq_report_path && params.moe_freq_report_path[0]) {
+                        model->moe_gpu_expert_cache.track_access = true;
                     }
 
                     llama_moe_gpu_expert_slot_preload(*model);
@@ -1130,7 +1115,7 @@ struct llama_model * llama_model_init_from_user(
     GGML_ASSERT(metadata != nullptr);
     std::string path_model;
     std::vector<std::string> splits = {};
-    params.use_mmap = false;
+    params.load_mode = LLAMA_LOAD_MODE_NONE;
     params.use_extra_bufts = false;
     return llama_model_load_from_file_impl(metadata, set_tensor_data, set_tensor_data_ud, path_model, splits, /*file*/ nullptr, params);
 }
@@ -1299,15 +1284,19 @@ const char * llama_print_system_info(void) {
 
 bool llama_save_moe_freq_report(llama_context * ctx, const char * path) {
     if (!ctx || !path || !path[0]) {
+        fprintf(stderr, "[moe-stats] save called with null ctx or path\n");
         return false;
     }
     const auto & model = ctx->get_model();
+    fprintf(stderr, "[moe-stats] track_access=%d, access_counts=%zu\n",
+        model.moe_gpu_expert_cache.track_access,
+        model.moe_gpu_expert_cache.access_counts.size());
     if (!model.moe_gpu_expert_cache.track_access) return false;
-    int32_t n_active = model.hparams.n_expert_used > 0 ? model.hparams.n_expert_used : model.hparams.n_expert;
-    auto report = model.moe_gpu_expert_cache.generate_access_report("moe-access-tracking", n_active);
-    if (report.n_experts <= 0) {
-        return false;
-    }
-    return save_freq_report(report, path);
+    auto report = model.moe_gpu_expert_cache.generate_access_report("moe-access-tracking", 0);
+    fprintf(stderr, "[moe-stats] report stats=%zu, sorted=%zu\n",
+        report.stats.size(), report.sorted_by_frequency.size());
+    bool ok = save_freq_report(report, path);
+    fprintf(stderr, "[moe-stats] save_freq_report returned %d\n", ok);
+    return ok;
 }
 

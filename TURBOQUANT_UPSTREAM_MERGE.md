@@ -1,13 +1,29 @@
 # TurboQuant+ fork — upstream catch-up merge notes
 
-Merges `upstream/master` (ggml-org/llama.cpp) into
-`feature/turboquant-kv-cache` (the fork's active branch). This is a **merge**
-(not a rebase): every fork commit, hash, and author is retained, and the merge
-commit keeps `feature/turboquant-kv-cache` as its first parent.
+## Status update (2026-08-03): latest merge is `merge-upstream-next`
 
-Base: `feature/turboquant-kv-cache` (the canonical branch, 262 fork commits +
-a prior partial upstream sync). Note: `master` is a stale snapshot (2 months
-behind feature); do not catch that up instead.
+This document describes an earlier merge round. As of 2026-08-03 the fork has
+been merged again with upstream master (commit `c461b278`, parent 1 =
+`merge-upstream`/`8bd5ba0b`, parent 2 = upstream `fe2adf0e72`). That merge
+includes **DeepSeek V4 (`deepseek4`) support** (PR #24162 + follow-ups) and
+resolves the upstream MSA refactor (#26338) in `src/llama-kv-cache.cpp` while
+keeping all TurboQuant deltas. See `DEEPSEEK4_MERGE_GUIDE.md` (EN) and
+`DEEPSEEK4_MERGE_GUIDE.ja.md` (JA) for details and verification steps.
+
+Branch note: `feature/turboquant-kv-cache` does not exist on origin; the fork's
+canonical branch on GitHub is `main`. Merge work happens on `merge-upstream`,
+with per-round branches like `merge-upstream-next`.
+
+---
+
+Merges `upstream/master` (ggml-org/llama.cpp) into
+`feature/turboquant-kv-cache` (the fork's active branch at the time). This is a
+**merge** (not a rebase): every fork commit, hash, and author is retained, and
+the merge commit keeps `feature/turboquant-kv-cache` as its first parent.
+
+Base (historical): `feature/turboquant-kv-cache` (the canonical branch, 262
+fork commits + a prior partial upstream sync). Note: `master` is a stale
+snapshot (2 months behind feature); do not catch that up instead.
 
 ## Verified on M5 Max (Metal)
 

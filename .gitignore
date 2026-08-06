@@ -153,17 +153,3 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
-
-# Local bench / smoke artifacts
-
-smoke_*
-bench-smem-*.txt
-bench_basic*.txt
-bench_basic*_err.txt
-bench_freq*.txt
-bench_freq*_err.txt
-bench_run_out.txt
-bench_run_err.txt
-bench_out.txt
-/benchmarks/frequency_placement_results.json
-/benchmarks/s118b_last_result.json
