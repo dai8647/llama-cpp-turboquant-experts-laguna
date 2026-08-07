@@ -77,8 +77,8 @@ llama-cli -ngl 999 --moe-gpu-expert-slot-num 999 -m model.gguf
 
 # 頻度ベースの部分配置 (例: 上位50%だけGPU)
 # frequencyモードは2-pass方式 (詳細は「4. Frequency-Based Expert Placement」参照):
-#   Pass 1: --moe-freq-report-out stats.json で統計収集 (track_access有効化)
-#   Pass 2: --moe-expert-placement frequency --moe-freq-report-in stats.json で配置適用
+#   Pass 1: --moe-freq-report-path stats.json で統計収集 (track_access有効化)
+#   Pass 2: --moe-expert-placement frequency --moe-freq-report-path stats.json で配置適用 (frequencyモードで自動読み込み)
 # または --moe-gpu-expert-slot-num を省略 = 自動全slot有効化
 ```
 
@@ -263,18 +263,19 @@ DeepSeek-V4-Flash-0731-REAP-K216-UD-IQ3_XXS-00003-of-00003.gguf
 ```bash
 # Pass 1: 普段の使い方に近いプロンプトで使用頻度を計測 (1回だけ)
 ./llama-cli -m DeepSeek-V4-Flash-0731-REAP-K216-UD-IQ3_XXS-00001-of-00003.gguf \
-  --moe-freq-report-out stats.json -p "<代表的なプロンプト>" -n 256
+  --moe-freq-report-path stats.json -p "<代表的なプロンプト>" -n 256
 
 # Pass 2: 高頻度エキスパートだけ GPU 配置して起動
 ./llama-server -m DeepSeek-V4-Flash-0731-REAP-K216-UD-IQ3_XXS-00001-of-00003.gguf \
   -c 32768 -ngl 99 \
   --moe-expert-placement frequency \
-  --moe-freq-report-in stats.json \
+  --moe-freq-report-path stats.json \
   --moe-gpu-expert-ratio 0.18 \
   -t 6
 ```
 
 - `--moe-gpu-expert-ratio`: 16GB VRAM なら **0.15-0.25 から調整** (~18% 目安)
+- `--moe-freq-report-path` は Pass 1 (書き出し) / Pass 2 (読み込み) を兼ねる単一フラグです
 - 7800 XT の帯域 (624 GB/s) は DDR4 の約 14 倍。トークン生成の大半を占める
   エキスパート演算が GPU に載れば **2-4 倍の向上**が見込めます
 
@@ -340,18 +341,19 @@ theoretical ceiling. The fix is to make the GPU do real work.
 ```bash
 # Pass 1: measure usage with a prompt close to your real workload (once)
 ./llama-cli -m DeepSeek-V4-Flash-0731-REAP-K216-UD-IQ3_XXS-00001-of-00003.gguf \
-  --moe-freq-report-out stats.json -p "<representative prompt>" -n 256
+  --moe-freq-report-path stats.json -p "<representative prompt>" -n 256
 
 # Pass 2: start with only high-frequency experts on GPU
 ./llama-server -m DeepSeek-V4-Flash-0731-REAP-K216-UD-IQ3_XXS-00001-of-00003.gguf \
   -c 32768 -ngl 99 \
   --moe-expert-placement frequency \
-  --moe-freq-report-in stats.json \
+  --moe-freq-report-path stats.json \
   --moe-gpu-expert-ratio 0.18 \
   -t 6
 ```
 
 - `--moe-gpu-expert-ratio`: tune **0.15-0.25** for 16 GB VRAM (~18% works well)
+- `--moe-freq-report-path` is a single flag used for both Pass 1 (write) and Pass 2 (read)
 - RX 7800 XT bandwidth (624 GB/s) is ~14x DDR4. Offloading the hot experts can
   give **2-4x** on generation
 
@@ -406,20 +408,18 @@ Expert選択頻度を記録し、高頻度ExpertをGPUに優先配置。
 
 | フラグ / Flag | 用途 / Purpose |
 |---|---|
-| `--moe-freq-report-out PATH` | Pass 1: 頻度統計をJSONに書き出す (track_access有効化) |
-| `--moe-freq-report-in PATH` | Pass 2: 頻度JSONを読み込み、上位expertをGPU配置 |
-| `--moe-freq-report-path PATH` | [DEPRECATED] 両方を兼ねる旧フラグ |
+| `--moe-freq-report-path PATH` | 単一フラグで両方を兼ねる: Pass 1 は統計をJSONに書き出し (track_access有効化)、Pass 2 は `--moe-expert-placement frequency` と併用で自動読み込み |
 | `--moe-expert-placement frequency` | 頻度ベース配置モード |
 | `--moe-gpu-expert-ratio 0.6` | GPU配置割合 (0.0-1.0) |
 
 使用例 / Example:
 ```bash
-# Pass 1: 統計収集 (full-slotでもOK、track_accessだけ有効)
-./llama-cli -m model.gguf --moe-freq-report-out stats.json -p "..." -n 256
+# Pass 1: 統計収集 (--moe-freq-report-path で書き出し)
+./llama-cli -m model.gguf --moe-freq-report-path stats.json -p "..." -n 256
 
-# Pass 2: 高頻度expertだけGPU配置
+# Pass 2: 高頻度expertだけGPU配置 (frequencyモードが同じPATHを自動読み込み)
 ./llama-cli -m model.gguf --moe-expert-placement frequency \
-    --moe-freq-report-in stats.json --moe-gpu-expert-ratio 0.6 -p "..." -n 256
+    --moe-freq-report-path stats.json --moe-gpu-expert-ratio 0.6 -p "..." -n 256
 ```
 
 ### 5. Ling-3.0-flash (`bailing-hybrid`)
