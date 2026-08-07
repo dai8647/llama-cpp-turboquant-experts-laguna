@@ -74,10 +74,32 @@ def _apply_wifsignaled_patch(path: str) -> None:
         f.write(content)
 
 
+# TODO @ngxson : this is temporary, to be removed in the future
+patches = [
+    # https://github.com/sheredom/subprocess.h/pull/102
+    "vendor/sheredom/patch-bsd.patch",
+    # https://github.com/sheredom/subprocess.h/pull/101
+    "vendor/sheredom/patch-windows-quote-backslash.patch",
+    # https://github.com/sheredom/subprocess.h/pull/104
+    # note: must be applied after patch-bsd.patch, they touch adjacent lines
+    "vendor/sheredom/patch-glibc-older-than-2.29.patch",
+]
+
 for url, filename in vendor.items():
     print(f"downloading {url} to {filename}") # noqa: NP100
     urllib.request.urlretrieve(url, filename)
 
+for patch in patches:
+    print(f"applying {patch}") # noqa: NP100
+    try:
+        subprocess.check_call([
+            "git", "apply", "--directory", os.path.dirname(patch), patch
+        ])
+    except Exception as e:
+        print(f"Error: {e}") # noqa: NP100
+        sys.exit(1)
+
+# fork: keep the WIFSIGNALED signal-death encoding on top of upstream patches
 _apply_wifsignaled_patch("vendor/sheredom/subprocess.h")
 
 print("Splitting httplib.h...") # noqa: NP100
