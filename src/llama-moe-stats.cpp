@@ -1,136 +1,174 @@
 #include "llama-moe-stats.h"
+#include <nlohmann/json.hpp>
+
 #include <algorithm>
-#include <cstdlib>
+#include <cstdio>
 #include <fstream>
 #include <numeric>
 
+using ordered_json = nlohmann::ordered_json;
+
 bool save_freq_report(const llama_moe_freq_report& report,
                       const std::string& path) {
-    std::ofstream f(path);
-    if (!f.is_open()) return false;
+    // Defensive: refuse structurally inconsistent reports instead of reading
+    // out of bounds. Callers build reports via generate_access_report, which
+    // maintains stats.size() == n_layers * n_experts; a mismatch here means a
+    // bug upstream and the file should not be written.
+    if (report.n_layers < 0 || report.n_experts < 0 ||
+        (int64_t) report.stats.size() != (int64_t) report.n_layers * report.n_experts) {
+        fprintf(stderr, "[moe-stats] error: refusing to save structurally inconsistent "
+                "frequency report (n_layers=%d, n_experts=%d, stats=%zu)\n",
+                report.n_layers, report.n_experts, report.stats.size());
+        return false;
+    }
 
-    f << "{\n";
-    f << "  \"schema_version\": 1,\n";
-    f << "  \"model_fingerprint\": \"" << report.model_fingerprint << "\",\n";
-    f << "  \"n_layers\": " << report.n_layers << ",\n";
-    f << "  \"n_experts\": " << report.n_experts << ",\n";
-    f << "  \"n_active_experts\": " << report.n_active_experts << ",\n";
-    f << "  \"layers\": [\n";
+    ordered_json j;
+    j["schema_version"] = 1;
+    j["model_fingerprint"] = report.model_fingerprint;
+    j["n_layers"] = report.n_layers;
+    j["n_experts"] = report.n_experts;
+    j["n_active_experts"] = report.n_active_experts;
+    j["layers"] = ordered_json::array();
 
     for (int32_t l = 0; l < report.n_layers; l++) {
-        f << "    {\n";
-        f << "      \"layer\": " << l << ",\n";
-        f << "      \"experts\": [\n";
+        ordered_json jl;
+        jl["layer"] = l;
+        jl["experts"] = ordered_json::array();
 
         for (int32_t e = 0; e < report.n_experts; e++) {
-            const auto& s = report.stats[l * report.n_experts + e];
-            f << "        {";
-            f << "\"expert\": " << e << ", ";
-            f << "\"prompt_selections\": " << s.prompt_selections << ", ";
-            f << "\"gen_selections\": " << s.gen_selections << ", ";
-            f << "\"total_selections\": " << s.total_selections;
-            f << "}";
-            if (e < report.n_experts - 1) f << ",";
-            f << "\n";
+            const auto & s = report.stats[l * report.n_experts + e];
+            jl["experts"].push_back(ordered_json{
+                {"expert", e},
+                {"prompt_selections", s.prompt_selections},
+                {"gen_selections", s.gen_selections},
+                {"total_selections", s.total_selections},
+            });
         }
 
-        f << "      ]\n";
-        f << "    }";
-        if (l < report.n_layers - 1) f << ",";
-        f << "\n";
+        j["layers"].push_back(std::move(jl));
     }
 
-    f << "  ]\n";
-    f << "}\n";
-    return true;
+    std::ofstream f(path);
+    if (!f.is_open()) return false;
+    f << j.dump(2) << "\n";
+    return f.good();
 }
 
-static std::string json_get_string(const std::string& json,
-                                   const std::string& key) {
-    auto pos = json.find("\"" + key + "\"");
-    if (pos == std::string::npos) return "";
-    pos = json.find(':', pos);
-    if (pos == std::string::npos) return "";
-    pos = json.find('"', pos + 1);
-    if (pos == std::string::npos) return "";
-    auto end = json.find('"', pos + 1);
-    return json.substr(pos + 1, end - pos - 1);
-}
-
-static int64_t json_get_int(const std::string& json,
-                            const std::string& key, int64_t def = 0) {
-    auto pos = json.find("\"" + key + "\"");
-    if (pos == std::string::npos) return def;
-    pos = json.find(':', pos);
-    if (pos == std::string::npos) return def;
-    pos++;
-    while (pos < json.size() && json[pos] == ' ') pos++;
-    char* end = nullptr;
-    long long val = std::strtoll(json.c_str() + pos, &end, 10);
-    return (end != json.c_str() + pos) ? val : def;
-}
-
-static std::vector<std::string> json_split_objects(const std::string& arr) {
-    std::vector<std::string> result;
-    int depth = 0;
-    size_t start = 0;
-    for (size_t i = 0; i < arr.size(); i++) {
-        if (arr[i] == '{') depth++;
-        else if (arr[i] == '}') {
-            depth--;
-            if (depth == 0) {
-                result.push_back(arr.substr(start, i - start + 1));
-                start = i + 1;
-                while (start < arr.size() && (arr[start] == ',' || arr[start] == ' ' || arr[start] == '\n'))
-                    start++;
-            }
-        }
-    }
-    return result;
+static void report_parse_error(const char * path, const char * what) {
+    fprintf(stderr, "[moe-stats] error: frequency report '%s': %s; refusing to apply the report\n",
+            path, what);
 }
 
 llama_moe_freq_report load_freq_report(const std::string& path) {
     llama_moe_freq_report report = {};
+
     std::ifstream f(path);
-    if (!f.is_open()) return report;
+    if (!f.is_open()) {
+        fprintf(stderr, "[moe-stats] error: cannot open frequency report '%s'\n", path.c_str());
+        return report;
+    }
 
-    std::string json((std::istreambuf_iterator<char>(f)),
-                     std::istreambuf_iterator<char>());
+    const std::string text((std::istreambuf_iterator<char>(f)),
+                           std::istreambuf_iterator<char>());
 
-    report.model_fingerprint = json_get_string(json, "model_fingerprint");
-    report.n_layers = (int32_t)json_get_int(json, "n_layers");
-    report.n_experts = (int32_t)json_get_int(json, "n_experts");
-    report.n_active_experts = (int32_t)json_get_int(json, "n_active_experts");
+    ordered_json j;
+    try {
+        j = ordered_json::parse(text);
+    } catch (const nlohmann::json::parse_error & e) {
+        report_parse_error(path.c_str(), e.what());
+        return report;
+    }
 
-    auto layers_pos = json.find("\"layers\"");
-    if (layers_pos == std::string::npos) return report;
+    // ---- header ----
+    try {
+        report.model_fingerprint = j.value("model_fingerprint", std::string());
+        report.n_layers          = j.value("n_layers", 0);
+        report.n_experts         = j.value("n_experts", 0);
+        report.n_active_experts  = j.value("n_active_experts", 0);
+    } catch (const nlohmann::json::exception & e) {
+        report_parse_error(path.c_str(), e.what());
+        return report;
+    }
 
-    auto arr_start = json.find('[', layers_pos);
-    auto arr_end = json.rfind(']');
-    if (arr_start == std::string::npos || arr_end == std::string::npos) return report;
-    std::string layers_arr = json.substr(arr_start + 1, arr_end - arr_start - 1);
+    if (report.n_layers < 0 || report.n_experts < 0) {
+        report_parse_error(path.c_str(), "negative n_layers or n_experts");
+        return report;
+    }
 
-    auto layer_objs = json_split_objects(layers_arr);
-    for (auto& lo : layer_objs) {
-        int32_t layer = (int32_t)json_get_int(lo, "layer");
-        auto exp_pos = lo.find("\"experts\"");
-        if (exp_pos == std::string::npos) continue;
-        auto ea_start = lo.find('[', exp_pos);
-        auto ea_end = lo.rfind(']');
-        if (ea_start == std::string::npos || ea_end == std::string::npos) continue;
-        std::string exp_arr = lo.substr(ea_start + 1, ea_end - ea_start - 1);
-        auto expert_objs = json_split_objects(exp_arr);
-        for (auto& eo : expert_objs) {
-            int32_t expert = (int32_t)json_get_int(eo, "expert");
-            llama_moe_expert_stats s = {};
-            s.layer_id = layer;
-            s.expert_id = expert;
-            s.prompt_selections = json_get_int(eo, "prompt_selections");
-            s.gen_selections = json_get_int(eo, "gen_selections");
-            s.total_selections = json_get_int(eo, "total_selections");
-            s.estimated_weight_bytes = 0;
-            report.stats.push_back(s);
+    if (!j.contains("layers") || !j["layers"].is_array()) {
+        report_parse_error(path.c_str(), "missing 'layers' array");
+        return report;
+    }
+
+    const auto & layers = j["layers"];
+
+    // The header must describe the actual array contents. A mismatch means the
+    // report was truncated, hand-edited, or generated for a different model
+    // shape -- applying it would misplace experts, so refuse it outright.
+    if (layers.size() != (size_t) report.n_layers) {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "header n_layers=%d but 'layers' contains %zu entries",
+                 report.n_layers, layers.size());
+        report_parse_error(path.c_str(), msg);
+        return report;
+    }
+
+    try {
+        std::vector<llama_moe_expert_stats> stats;
+        stats.reserve((size_t) report.n_layers * report.n_experts);
+        for (size_t l = 0; l < layers.size(); l++) {
+            const auto & jl = layers[l];
+            if (!jl.is_object() || !jl.contains("layer") || !jl["layer"].is_number_integer()) {
+                report_parse_error(path.c_str(), "malformed layer entry (missing or non-integer 'layer')");
+                return report;
+            }
+            const int32_t layer = jl["layer"].get<int32_t>();
+            if (layer < 0) {
+                report_parse_error(path.c_str(), "negative layer id");
+                return report;
+            }
+            if (!jl.contains("experts") || !jl["experts"].is_array()) {
+                report_parse_error(path.c_str(), "layer entry has no 'experts' array");
+                return report;
+            }
+
+            const auto & experts = jl["experts"];
+            if (experts.size() != (size_t) report.n_experts) {
+                char msg[256];
+                snprintf(msg, sizeof(msg), "header n_experts=%d but layer %d contains %zu experts",
+                         report.n_experts, layer, experts.size());
+                report_parse_error(path.c_str(), msg);
+                return report;
+            }
+
+            for (size_t e = 0; e < experts.size(); e++) {
+                const auto & je = experts[e];
+                if (!je.is_object() || !je.contains("expert") || !je["expert"].is_number_integer()) {
+                    report_parse_error(path.c_str(), "malformed expert entry (missing or non-integer 'expert')");
+                    return report;
+                }
+                const int32_t expert = je["expert"].get<int32_t>();
+                if (expert < 0) {
+                    report_parse_error(path.c_str(), "negative expert id");
+                    return report;
+                }
+
+                llama_moe_expert_stats s = {};
+                s.layer_id = layer;
+                s.expert_id = expert;
+                s.prompt_selections = je.value("prompt_selections", (int64_t) 0);
+                s.gen_selections    = je.value("gen_selections", (int64_t) 0);
+                s.total_selections  = je.value("total_selections", (int64_t) 0);
+                s.estimated_weight_bytes = 0;
+                stats.push_back(s);
+            }
         }
+        // Only assign on full success: any error path above returns an empty
+        // report so the caller can never apply a partially-parsed file.
+        report.stats = std::move(stats);
+    } catch (const nlohmann::json::exception & e) {
+        report_parse_error(path.c_str(), e.what());
+        return report;
     }
 
     report.sorted_by_frequency.resize(report.stats.size());
