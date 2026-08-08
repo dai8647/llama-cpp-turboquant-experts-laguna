@@ -19,9 +19,10 @@ extern "C" {
 // the two happen to unify is a property of the platform's symbol resolution
 // (ELF interposition may merge them; two-level-namespace and DLL targets will
 // not), which made the group-size propagation silently link-order dependent.
-// Note: plain `extern` (no GGML_API) because GGML_API expands to `extern` in
-// non-shared builds, which would make `GGML_API extern` a double-extern error.
-extern int turbo3_cpu_wht_group_size;
+// GGML_API on a shared/static build expands to `extern` and on a Windows shared
+// build adds __declspec(dllimport/dllexport), so the cross-DLL reference in the
+// MSVC/lld link resolves against libggml-base.
+GGML_API int turbo3_cpu_wht_group_size;
 }
 
 // ggml_compute_forward_dup
