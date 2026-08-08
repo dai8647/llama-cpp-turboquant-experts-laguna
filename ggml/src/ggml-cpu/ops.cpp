@@ -13,7 +13,15 @@
 #include <cmath>
 
 extern "C" {
-GGML_API int turbo3_cpu_wht_group_size;
+// Declaration only. The definition lives in ggml-turbo-quant.c (libggml-base).
+// Without `extern` this is a second definition in libggml-cpu, so the SET_ROWS
+// handler here and the quantizer there operate on different variables. Whether
+// the two happen to unify is a property of the platform's symbol resolution
+// (ELF interposition may merge them; two-level-namespace and DLL targets will
+// not), which made the group-size propagation silently link-order dependent.
+// Note: plain `extern` (no GGML_API) because GGML_API expands to `extern` in
+// non-shared builds, which would make `GGML_API extern` a double-extern error.
+extern int turbo3_cpu_wht_group_size;
 }
 
 // ggml_compute_forward_dup

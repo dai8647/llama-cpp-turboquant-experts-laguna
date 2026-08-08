@@ -320,10 +320,9 @@ static_assert(sizeof(block_turbo3_0) == sizeof(ggml_half) + QK_TURBO3/4 + QK_TUR
 // = 68 bytes per 128 values = 4.25 bits/value → 3.8× compression vs fp16
 typedef struct {
     ggml_half  norm;                    //  2 bytes
-    ggml_half  rnorm;                   //  2 bytes (reserved, unused in 4-bit mode)
     uint8_t    qs[QK_TURBO4 / 2];      // 64 bytes: 4-bit PolarQuant indices (nibble packed)
-} block_turbo4_0;                       // 68 bytes total
-static_assert(sizeof(block_turbo4_0) == 68, "wrong turbo4_0 block size");
+} block_turbo4_0;                       // 66 bytes total (4.125 bpw, dropped dead rnorm)
+static_assert(sizeof(block_turbo4_0) == 66, "wrong turbo4_0 block size");
 #else
 // Legacy 3-bit PolarQuant + 1-bit QJL (original paper design)
 // Per block: norm(fp16) + rnorm(fp16) + 3-bit indices (48 bytes) + 1-bit QJL signs (16 bytes)

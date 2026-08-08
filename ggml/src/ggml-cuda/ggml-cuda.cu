@@ -465,10 +465,12 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
     struct ggml_cuda_buffer {
         void * ptr = nullptr;
         size_t size = 0;
+        uint64_t last_use = 0;
     };
 
     ggml_cuda_buffer buffer_pool[MAX_BUFFERS] = {};
     size_t pool_size = 0;
+    uint64_t usage_counter = 0;
 
     explicit ggml_cuda_pool_leg(int device) :
         device(device) {
@@ -492,7 +494,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         }
     }
 
-    void * alloc(size_t size, size_t * actual_size) override {
+    void * alloc(size_t size, size_t * actual_size, float lookahead = 1.05f) override {
 #ifdef DEBUG_CUDA_MALLOC
         int nnz = 0;
         size_t max_size = 0;
@@ -531,20 +533,64 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
             return ptr;
         }
         void * ptr;
-        size_t look_ahead_size = (size_t) (1.05 * size);
+        size_t look_ahead_size = (size_t) (lookahead * size);
         look_ahead_size = 256 * ((look_ahead_size + 255)/256);
         ggml_cuda_set_device(device);
         cudaError_t err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
         if (err == cudaErrorMemoryAllocation) {
             (void)cudaGetLastError();
-            const size_t cached_bytes = pool_size;
-            GGML_LOG_DEBUG(GGML_CUDA_NAME " pool[%d]: alloc of %.2f MiB failed, flushing %.2f MiB of cached buffers and retrying\n",
-                           device, look_ahead_size/1024.0/1024.0, cached_bytes/1024.0/1024.0);
+            GGML_LOG_DEBUG(GGML_CUDA_NAME " pool[%d]: alloc of %.2f MiB failed, evicting LRU from %.2f MiB cached\n",
+                           device, look_ahead_size/1024.0/1024.0, pool_size/1024.0/1024.0);
             CUDA_CHECK(cudaDeviceSynchronize());
-            clear_pool();
-            err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
-            if (err == cudaSuccess) {
-                GGML_LOG_DEBUG(GGML_CUDA_NAME " pool[%d]: retry succeeded\n", device);
+#if defined(GGML_USE_HIP)
+            // ROCm/rocm-systems#4817: LRU free/realloc cycles amplify a
+            // hipMemcpyAsync host-mapping race on multi-GPU.  Fall back to
+            // the original clear_pool() path to avoid the timing change.
+            if (ggml_backend_cuda_get_device_count() > 1) {
+                GGML_LOG_DEBUG(GGML_CUDA_NAME " pool[%d]: HIP multi-GPU, flushing %.2f MiB cached\n",
+                               device, pool_size/1024.0/1024.0);
+                clear_pool();
+                err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
+                if (err == cudaSuccess) {
+                    GGML_LOG_DEBUG(GGML_CUDA_NAME " pool[%d]: retry succeeded\n", device);
+                }
+            } else
+#endif
+            {
+                // evict LRU buffers up to 3x the requested size
+                size_t freed = 0;
+                size_t evict_target = 3 * look_ahead_size;
+                while (freed < evict_target) {
+                    int oldest = -1;
+                    uint64_t oldest_use = UINT64_MAX;
+                    for (int i = 0; i < MAX_BUFFERS; ++i) {
+                        if (buffer_pool[i].ptr != nullptr && buffer_pool[i].last_use < oldest_use) {
+                            oldest_use = buffer_pool[i].last_use;
+                            oldest = i;
+                        }
+                    }
+                    if (oldest < 0) {
+                        break;
+                    }
+                    ggml_cuda_buffer & b = buffer_pool[oldest];
+                    CUDA_CHECK(cudaFree(b.ptr));
+                    freed += b.size;
+                    pool_size -= b.size;
+                    b.ptr = nullptr;
+                    b.size = 0;
+                }
+                err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
+                if (err == cudaErrorMemoryAllocation) {
+                    // LRU eviction wasn't enough, flush everything
+                    (void)cudaGetLastError();
+                    GGML_LOG_DEBUG(GGML_CUDA_NAME " pool[%d]: LRU freed %.2f MiB, still OOM, flushing all\n",
+                                   device, freed/1024.0/1024.0);
+                    clear_pool();
+                    err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
+                }
+                if (err == cudaSuccess) {
+                    GGML_LOG_DEBUG(GGML_CUDA_NAME " pool[%d]: retry succeeded after eviction\n", device);
+                }
             }
         }
         CUDA_CHECK(err);
@@ -563,6 +609,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
             if (b.ptr == nullptr) {
                 b.ptr = ptr;
                 b.size = size;
+                b.last_use = ++usage_counter;
                 return;
             }
         }
@@ -608,7 +655,8 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
         }
     }
 
-    void * alloc(size_t size, size_t * actual_size) override {
+    void * alloc(size_t size, size_t * actual_size, float lookahead = 1.05f) override {
+        GGML_UNUSED(lookahead);
         // round up the allocation size to the alignment to ensure that all allocations are aligned for all data types
         const size_t alignment = 128;
         size = alignment * ((size + alignment - 1) / alignment);
@@ -2009,6 +2057,50 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
     if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
+        return;
+    }
+    // TQ weight types: fused dp4a path (decode) or runtime q8_0 conversion + cuBLAS (prefill).
+    // Note: upstream removed the fork's `!split` guard, so TQ weights on multi-GPU split layouts
+    // are routed to the fused kernel like any other batch (the split layout is not specially handled).
+    //
+    // The fused TQ kernels index src1/dst as flat contiguous buffers (no nb[] stride handling in
+    // mmvq-tq.cu), so permuted/viewed activations (e.g. DeepSeek-V4 MLA projections) must take the
+    // stride-aware cuBLAS fallback below, which dequantizes TQ via ggml_get_to_fp16_cuda.
+    const bool tq_fast_path_ok = ggml_is_contiguous(src1) && ggml_is_contiguous(dst);
+
+    // GGML_TYPE_TQ3_1S: the fused warp-scalar kernel (mul_mat_tq3_1s_multi /
+    // tq_prerotate_activation in mmvq-tq.cu) is disabled here pending a fix.
+    // Root-caused via eval-callback node-diffing on DeepSeek-V4-Flash (real
+    // TQ3_1S attn/ffn weights, CUDA vs CPU-oracle): output for some MUL_MAT
+    // nodes (e.g. blk.N.attn_q_a, a 4096->1024 low-rank bottleneck) diverges
+    // ~2%/layer, compounding over 61 layers into incoherent generation on
+    // CUDA (coherent on CPU/Metal). The math of the fused kernel (per-block
+    // WHT rotation + centroid dot product) was verified bit-for-bit
+    // equivalent to the (known-correct) dequantize_tq3_1s inverse-WHT used
+    // by the cuBLAS fallback, and switching the pre-rotated activation
+    // buffer from half to float (removing one candidate precision loss)
+    // made no measurable difference — so this is very likely a reduction-
+    // order/cancellation sensitivity in the kernel's per-lane accumulation
+    // for real (non-synthetic) weight/activation distributions rather than
+    // a simple indexing bug: test-backend-ops MUL_MAT cases at the exact
+    // failing shape (tq3_1s, m=1024, n=8, k=4096) pass with random data.
+    // Disabling *only* TQ3_1S here (confirmed via a direct A/B on the CUDA0
+    // repro: forcing all TQ mul_mats through cuBLAS restores coherent
+    // output) routes it to the verified-correct dequant+cuBLAS path below.
+    // TQ4_1S (dp4a and the AMD scalar variant) is untouched — no model on
+    // hand uses it and there's no evidence it shares this bug, so the fast
+    // path stays enabled for that type to avoid regressing existing users.
+    const bool tq3_1s_fused_disabled = (src0->type == GGML_TYPE_TQ3_1S);
+
+    if (is_tq_weight && tq_fast_path_ok && !tq3_1s_fused_disabled && ne11 <= MMVQ_MAX_BATCH_SIZE) {
+        // Fused TQ weight mul_mat with pre-rotated activations via warp shuffle WHT
+        // Handles ne[1]=1 (decode) and ne[1]≤8 (multi-token / speculative decoding)
+        ggml_cuda_mul_mat_tq(ctx, src0, src1, dst);
+        return;
+    }
+    if (is_tq_weight && tq_fast_path_ok && src0->type == GGML_TYPE_TQ4_1S) {
+        // Large prefill: runtime TQ4_1S -> q8_0 scratch conversion + cuBLAS
+        ggml_cuda_mul_mat_tq4_1s_cublas(ctx, src0, src1, dst);
         return;
     }
     ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
@@ -4193,7 +4285,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 #ifndef NDEBUG
-                assert(node->buffer->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device));
+                // On integrated GPUs (APUs, e.g. RDNA3.5) the scheduler may place a
+                // node's output on the host-visible buffer, which the compute path
+                // handles. Allow that here, mirroring the src-tensor check below.
+                assert(node->buffer->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) ||
+                       (integrated && ggml_backend_buft_is_cuda_host(node->buffer->buft)));
                 for (int j = 0; j < GGML_MAX_SRC; j++) {
                     if (node->src[j] != nullptr) {
                         assert(node->src[j]->buffer);
@@ -5375,6 +5471,7 @@ static bool ggml_backend_cuda_device_offload_op(ggml_backend_dev_t dev, const gg
 
 static ggml_backend_event_t ggml_backend_cuda_device_event_new(ggml_backend_dev_t dev) {
 #ifdef GGML_CUDA_NO_PEER_COPY
+    GGML_UNUSED(dev);
     return nullptr;
 #else
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *)dev->context;

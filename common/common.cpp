@@ -1314,23 +1314,12 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
                 params.sampling.logit_bias_eog.begin(), params.sampling.logit_bias_eog.end());
     }
 
-    //if (params.sampling.penalty_last_n == -1) {
-    //    LOG_TRC("%s: setting penalty_last_n to ctx_size = %d\n", __func__, llama_n_ctx(lctx));
-    //    params.sampling.penalty_last_n = llama_n_ctx(lctx);
-    //}
-
-    //if (params.sampling.dry_penalty_last_n == -1) {
-    //    LOG_TRC("%s: setting dry_penalty_last_n to ctx_size = %d\n", __func__, llama_n_ctx(lctx));
-    //    params.sampling.dry_penalty_last_n = llama_n_ctx(lctx);
-    //}
-
     // init the backend samplers as part of the context creation
     pimpl->samplers.resize(cparams.n_seq_max);
     pimpl->samplers_seq_config.resize(cparams.n_seq_max);
 
-    const int32_t n_ctx = cparams.n_ctx > 0 ? (int32_t) cparams.n_ctx : llama_model_n_ctx_train(model);
     for (int i = 0; i < (int) cparams.n_seq_max; ++i) {
-        pimpl->samplers[i].reset(common_sampler_init(model, params.sampling, n_ctx));
+        pimpl->samplers[i].reset(common_sampler_init(model, params.sampling));
         pimpl->samplers_seq_config[i] = { i, common_sampler_get(pimpl->samplers[i].get()) };
     }
 
@@ -1628,7 +1617,12 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.n_moe_gpu_expert_slot_num = params.n_moe_gpu_expert_slot_num;
     mparams.moe_expert_placement = params.moe_expert_placement.empty() ? nullptr : params.moe_expert_placement.c_str();
     mparams.moe_gpu_expert_ratio = params.moe_gpu_expert_ratio;
-    mparams.moe_freq_report_path = params.moe_freq_report_path.empty() ? nullptr : params.moe_freq_report_path.c_str();
+    // Pass 1 (out) / Pass 2 (in) report paths; the deprecated --moe-freq-report-path acts as both
+    const std::string & moe_report_in  = !params.moe_freq_report_in.empty()  ? params.moe_freq_report_in  : params.moe_freq_report_path;
+    const std::string & moe_report_out = !params.moe_freq_report_out.empty() ? params.moe_freq_report_out : params.moe_freq_report_path;
+    mparams.moe_freq_report_in  = moe_report_in.empty()  ? nullptr : moe_report_in.c_str();
+    mparams.moe_freq_report_out = moe_report_out.empty() ? nullptr : moe_report_out.c_str();
+    mparams.moe_freq_report_path = nullptr; // deprecated field kept for ABI compatibility, no longer used
     mparams.main_gpu        = params.main_gpu;
     mparams.split_mode      = params.split_mode;
     mparams.load_mode       = params.load_mode;

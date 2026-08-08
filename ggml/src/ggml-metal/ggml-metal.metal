@@ -566,34 +566,34 @@ static void turbo_rotate_inverse(thread float * x, constant float * s1, constant
 constant float turbo_centroids_2bit[4] = { -0.133462f, -0.039994f, 0.039994f, 0.133462f };
 // 3-bit centroids for d=128
 constant float turbo_centroids_3bit[8] = {
-    -0.190685f, -0.117832f, -0.065717f, -0.021460f,
-     0.021460f,  0.065717f,  0.117832f,  0.190685f
+    -0.190207f, -0.118786f, -0.066822f, -0.021663f,
+     0.021663f,  0.066822f,  0.118786f,  0.190207f
 };
 // Midpoints for 2-bit nearest centroid lookup
 constant float turbo_mid_2bit[3] = { -0.086728f, 0.0f, 0.086728f };
 // Midpoints for 3-bit
-constant float turbo_mid_3bit[7] = { -0.154259f, -0.091775f, -0.043589f, 0.0f, 0.043589f, 0.091775f, 0.154259f };
+constant float turbo_mid_3bit[7] = { -0.154496f, -0.092804f, -0.044243f, 0.0f, 0.044243f, 0.092804f, 0.154496f };
 
 // 4-bit PolarQuant centroids (16 levels) — optimal for N(0, 1/sqrt(128))
 constant float turbo_centroids_4bit[16] = {
-    -0.173926f, -0.117195f, -0.089527f, -0.068756f,
-    -0.051262f, -0.035597f, -0.020989f, -0.006938f,
-     0.006938f,  0.020989f,  0.035597f,  0.051262f,
-     0.068756f,  0.089527f,  0.117195f,  0.173926f
+    -0.241529f, -0.182877f, -0.143016f, -0.111036f,
+    -0.083292f, -0.058050f, -0.034299f, -0.011349f,
+     0.011349f,  0.034299f,  0.058050f,  0.083292f,
+     0.111036f,  0.143016f,  0.182877f,  0.241529f
 };
 constant float turbo_mid_4bit[15] = {
-    -0.145560f, -0.103361f, -0.079142f, -0.060009f,
-    -0.043430f, -0.028293f, -0.013963f,  0.000000f,
-     0.013963f,  0.028293f,  0.043430f,  0.060009f,
-     0.079142f,  0.103361f,  0.145560f
+    -0.212203f, -0.162947f, -0.127026f, -0.097164f,
+    -0.070671f, -0.046174f, -0.022824f,  0.000000f,
+     0.022824f,  0.046174f,  0.070671f,  0.097164f,
+     0.127026f,  0.162947f,  0.212203f
 };
 
 // Half-precision 4-bit centroid LUT for vec path
 constant half turbo_centroids_4bit_h[16] = {
-    -0.173926h, -0.117195h, -0.089527h, -0.068756h,
-    -0.051262h, -0.035597h, -0.020989h, -0.006938h,
-     0.006938h,  0.020989h,  0.035597h,  0.051262h,
-     0.068756h,  0.089527h,  0.117195h,  0.173926h
+    -0.241529h, -0.182877h, -0.143016h, -0.111036h,
+    -0.083292h, -0.058050h, -0.034299h, -0.011349h,
+     0.011349h,  0.034299h,  0.058050h,  0.083292h,
+     0.111036h,  0.143016h,  0.182877h,  0.241529h
 };
 
 // 8-entry magnitude LUT for 4-bit (positive half, ascending)
@@ -604,8 +604,8 @@ constant half turbo_centroids_4bit_h[16] = {
 // since centroids are symmetric ascending, just use: mag[idx & 7] for idx>=8,
 // mag[7 - (idx & 7)] for idx<8. Simpler: mag[idx >= 8 ? idx & 7 : 7 - (idx & 7)]
 constant half turbo_mag_4bit_h[8] = {
-    0.006938h, 0.020989h, 0.035597h, 0.051262h,
-    0.068756h, 0.089527h, 0.117195h, 0.173926h
+    0.011349h, 0.034299h, 0.058050h, 0.083292h,
+    0.111036h, 0.143016h, 0.182877h, 0.241529h
 };
 
 // Half-precision 2-bit centroid LUT for vec path
@@ -832,22 +832,22 @@ void dequantize_turbo3_0(device const block_turbo3_0 * xb, short il, thread type
 // spill on Metal, making it slower. Constant half LUT + float norm broadcast remains the
 // fastest approach on Apple Silicon. On CUDA, register LUT works better (see @spiritbuun).
 constant half turbo_centroids_3bit_h[8] = {
-    -0.190685h, -0.117832h, -0.065717h, -0.021460h,
-     0.021460h,  0.065717h,  0.117832h,  0.190685h
+    -0.190207h, -0.118786h, -0.066822h, -0.021663h,
+     0.021663h,  0.066822h,  0.118786h,  0.190207h
 };
 
 // 4-entry magnitude LUT (positive values only, ascending order)
 // Used with ALU sign application to halve constant cache divergence
 constant half turbo_mag_3bit_h[4] = {
-    0.021460h, 0.065717h, 0.117832h, 0.190685h
+    0.021663h, 0.066822h, 0.118786h, 0.190207h
 };
 
 // 2-entry PAIR LUT: each entry is a half2 containing two adjacent magnitudes.
 // Only 2 possible constant addresses per lookup (vs 4 for mag LUT, 8 for full).
 // bit1 selects the pair, bit0 selects within the pair via ternary.
 constant half2 turbo_mag_pairs_h[2] = {
-    half2(0.021460h, 0.065717h),   // pair 0: mag indices 0,1
-    half2(0.117832h, 0.190685h),   // pair 1: mag indices 2,3
+    half2(0.021663h, 0.066822h),   // pair 0: mag indices 0,1
+    half2(0.118786h, 0.190207h),   // pair 1: mag indices 2,3
 };
 
 // Vec: 4 elements per call (il ∈ {0..7}), returns type4
@@ -13249,8 +13249,8 @@ kernel void kernel_lightning_indexer(
     const int i_kv_0   = tgpig.x*NK;            // first key of this threadgroup
     const int i_kv     = i_kv_0 + sgitg*NKPSG;  // first key of this simdgroup
 
-    threadgroup half4x4   sk4x4[NK*DK16];
-    threadgroup half    * sk = (threadgroup half *) sk4x4;
+    threadgroup half sk[NK * DK16 * 16];
+    threadgroup half4x4 * sk4x4 = (threadgroup half4x4 *) sk;
 
     for (short i = tiitg; i < NK*DK16; i += NTG) {
         const short ik  = i/DK16;

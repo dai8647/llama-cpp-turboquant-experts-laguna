@@ -10,6 +10,8 @@ A fork of [TheTom/llama-cpp-turboquant](https://github.com/TheTom/llama-cpp-turb
 - **Laguna architecture support** — port of upstream PR #25165 (merged 2026-07-22)
 - **Frequency-based expert placement** — GPU placement based on expert selection frequency
 - **DeepSeek V4 (`deepseek4`) support** — merged from upstream master (2026-08-03)
+- **Generic MTP speculative decoding** — architecture-agnostic `draft-mtp` engine with `graph_mtp` in 12+ model families (DeepSeek V2/3/4, Qwen3.5/3.6, Step3.5, GLM-DSA, MiMo2, Cohere2, HY-V3, ...)
+- **Ling-3.0-flash (`bailing-hybrid`) support** — hybrid KDA + gated-MLA MoE (127.5B-A5.1B), including its MTP head (`--mtp`)
 
 Upstream sync status: **fully caught up with `ggml-org/llama.cpp` master as of
 2026-08-03** (merge commit `c461b278`). See `TURBOQUANT_UPSTREAM_MERGE.md` and
@@ -27,6 +29,8 @@ Upstream sync status: **fully caught up with `ggml-org/llama.cpp` master as of
 - **Laguna architecture support** — upstream PR #25165 (merged 2026-07-22) の移植
 - **Frequency-based expert placement** — Expert選択頻度に基づくGPU配置
 - **DeepSeek V4 (`deepseek4`) 対応** — 上流 master からマージ (2026-08-03)
+- **汎用 MTP 投機デコード** — アーキ非依存の `draft-mtp` エンジン。`graph_mtp` を持つ 12+ モデルファミリー (DeepSeek V2/3/4, Qwen3.5/3.6, Step3.5, GLM-DSA, MiMo2, Cohere2, HY-V3 など) で使用可
+- **Ling-3.0-flash (`bailing-hybrid`) 対応** — KDA + gated MLA ハイブリッド MoE (127.5B-A5.1B)。MTP ヘッドも `--mtp` で使用可
 
 上流追従状況: **2026-08-03 時点で `ggml-org/llama.cpp` master に完全追従**
 (マージコミット `c461b278`)。詳細は `TURBOQUANT_UPSTREAM_MERGE.md` および
@@ -73,8 +77,8 @@ llama-cli -ngl 999 --moe-gpu-expert-slot-num 999 -m model.gguf
 
 # 頻度ベースの部分配置 (例: 上位50%だけGPU)
 # frequencyモードは2-pass方式 (詳細は「4. Frequency-Based Expert Placement」参照):
-#   Pass 1: --moe-freq-report-out stats.json で統計収集 (track_access有効化)
-#   Pass 2: --moe-expert-placement frequency --moe-freq-report-in stats.json で配置適用
+#   Pass 1: --moe-freq-report-path stats.json で統計収集 (track_access有効化)
+#   Pass 2: --moe-expert-placement frequency --moe-freq-report-path stats.json で配置適用 (frequencyモードで自動読み込み)
 # または --moe-gpu-expert-slot-num を省略 = 自動全slot有効化
 ```
 
@@ -186,6 +190,12 @@ llama-server -hf heath0xFF/DeepSeek-V4-Flash-0731-REAP-GGUF:Q4_K_M \
 Markov head を持つサイドカーを `--dflash` で取得) で有効化され、DFlash と
 同じ検証 (hidden size / レイヤ範囲 / 最終層スロット) を受けます。
 
+> MTP は DeepSeek 専用ではなく、**汎用エンジン**です。`graph_mtp` を実装した
+> 12+ モデルファミリー (deepseek4 / deepseek2 / deepseek32 / step35 / qwen35 /
+> qwen35moe / qwen3next / cohere2moe / glm-dsa / mimo2 / hy-v3 / bailing-hybrid)
+> すべてで `--mtp` が有効で、ドライバにアーキ依存の分岐はありません
+> (レイヤ数・hidden size・チェーンヘッド位置はモデルのメタデータから自動取得)。
+
 #### REAP について
 
 **REAP** (Router-weighted Expert Activation Pruning、Cerebras) はモデル**作成時**の
@@ -212,12 +222,180 @@ To use it as a speculative-draft, enable `--spec-type draft-dspark` (or fetch
 the Markov-head sidecar with `--dflash`); it receives the same validation as
 DFlash (hidden size, layer bounds, final-layer slot).
 
+> MTP is **not** DeepSeek-specific: it is a generic engine. Any model family
+> with `graph_mtp` (deepseek4 / deepseek2 / deepseek32 / step35 / qwen35 /
+> qwen35moe / qwen3next / cohere2moe / glm-dsa / mimo2 / hy-v3 /
+> bailing-hybrid) enables `--mtp`, and the driver has zero architecture-
+> specific branches (layer count, hidden size and chain-head positions are read
+> from the model metadata).
+
 #### About REAP
 
 **REAP** (Router-weighted Expert Activation Pruning, Cerebras) is a MoE pruning
 method applied at model **creation** time; it is not a runtime feature. The K160
 GGUF files simply contain 160 routed experts (pruned from 256) and run natively
 as the `deepseek4` architecture with no special flags.
+
+#### K216 GGUF チューニング (16GB VRAM 構成 / K216 GGUF tuning)
+
+`heath0xFF/DeepSeek-V4-Flash-0731-REAP-K216-GGUF` は 256 エキスパート中
+**216 個を保持**した REAP 版です (top-6 ルーティング、43 層、BF16 換算 ~108GB)。
+公開 GGUF は `UD-IQ3_XXS` の 1 種のみで、3 shard 合計 **82.94 GiB**:
+
+```
+DeepSeek-V4-Flash-0731-REAP-K216-UD-IQ3_XXS-00001-of-00003.gguf  (entry point)
+DeepSeek-V4-Flash-0731-REAP-K216-UD-IQ3_XXS-00002-of-00003.gguf
+DeepSeek-V4-Flash-0731-REAP-K216-UD-IQ3_XXS-00003-of-00003.gguf
+```
+
+> 検証済みの注意: K216 GGUF には `nextn.*` / `mtp.*` テンソルが**含まれません**
+> (K160 版は含むが、K216 は unsloth 量子化ベースのため)。したがって `--mtp`
+> は使えません。投機デコードを使う場合は DSpark サイドカーを指定してください。
+
+##### 診断: なぜ遅いのか (16GB VRAM の場合)
+
+83GB のモデルは 16GB VRAM に載らないため、実質 CPU 推論 (DDR4 帯域律速)
+になります。Ryzen 5500 級 (DDR4 デュアルチャネル ~45GB/s) で 5.5 tps は
+この構成のほぼ理論上限です。対策は「GPU を効かせる」ことです。
+
+##### 手順 1: 高頻度エキスパートを GPU に配置 (2-pass / 最大効果)
+
+```bash
+# Pass 1: 普段の使い方に近いプロンプトで使用頻度を計測 (1回だけ)
+./llama-cli -m DeepSeek-V4-Flash-0731-REAP-K216-UD-IQ3_XXS-00001-of-00003.gguf \
+  --moe-freq-report-path stats.json -p "<代表的なプロンプト>" -n 256
+
+# Pass 2: 高頻度エキスパートだけ GPU 配置して起動
+./llama-server -m DeepSeek-V4-Flash-0731-REAP-K216-UD-IQ3_XXS-00001-of-00003.gguf \
+  -c 32768 -ngl 99 \
+  --moe-expert-placement frequency \
+  --moe-freq-report-path stats.json \
+  --moe-gpu-expert-ratio 0.18 \
+  -t 6
+```
+
+- `--moe-gpu-expert-ratio`: 16GB VRAM なら **0.15-0.25 から調整** (~18% 目安)
+- `--moe-freq-report-path` は Pass 1 (書き出し) / Pass 2 (読み込み) を兼ねる単一フラグです
+- 7800 XT の帯域 (624 GB/s) は DDR4 の約 14 倍。トークン生成の大半を占める
+  エキスパート演算が GPU に載れば **2-4 倍の向上**が見込めます
+
+##### 手順 2: TurboQuant KV cache で VRAM の空きを増やす
+
+```bash
+-ctk turbo4 -ctv turbo4
+```
+
+##### 手順 3: DSpark サイドカー投機デコード
+
+K216 GGUF 自体に nextn がないため、`ggml-org/DeepSeek-V4-Flash-0731-GGUF`
+の DSpark サイドカー (`dspark-DeepSeek-V4-Flash-0731-BF16.gguf`) を指定します。
+DSpark ヘッドは REAP で枝刈りされない層 (MTP + Markov head) のみなので
+互換です。起動時に hidden size / レイヤ範囲 / 語彙を検証し、不一致なら
+明確なエラーが出ます。
+
+```bash
+./llama-server -m DeepSeek-V4-Flash-0731-REAP-K216-UD-IQ3_XXS-00001-of-00003.gguf \
+  --spec-type draft-dspark \
+  --spec-draft-hf ggml-org/DeepSeek-V4-Flash-0731-GGUF \
+  --spec-draft-model dspark-DeepSeek-V4-Flash-0731-BF16.gguf \
+  --spec-draft-n-max 3
+```
+
+- K=3 が最速という実測結果に合わせ `--spec-draft-n-max 3` (デフォルト)
+- うまく嵌れば **1.3-1.8 倍**
+
+##### 手順 4: スレッド数とビルド
+
+- 帯域律速では SMT は効きません。`-t 6` (物理コア数) を明示
+- 7800 XT は `gfx1100`。ビルド時 `-DAMDGPU_TARGETS=gfx1100` で HIP ビルドが
+  必要 (デフォルトターゲットだとカーネルが無効化され全層 CPU に落ちる)
+
+##### 期待値 (Ryzen 5500 + 7800 XT 16GB の場合)
+
+| 設定 / Setup | 予想 Generation t/s |
+|---|---:|
+| 現状 / current | 5.5 |
+| + 高頻度 expert GPU 配置 / frequency placement | 10-18 |
+| + DSpark 投機 / speculative decoding | 15-25 |
+| + TurboQuant KV | +数% (長文ほど効く) |
+
+#### K216 GGUF tuning (16 GB VRAM setup) / EN
+
+`heath0xFF/DeepSeek-V4-Flash-0731-REAP-K216-GGUF` retains **216 of 256 routed
+experts** (top-6 routing, 43 layers, ~108 GB BF16 equivalent). The only public
+GGUF is `UD-IQ3_XXS`, **82.94 GiB across 3 shards** (first shard is the entry
+point).
+
+> Verified caveat: the K216 GGUF does **not** contain `nextn.*` / `mtp.*`
+> tensors (unlike the K160 builds, it derives from the unsloth quantization).
+> So `--mtp` cannot be used; use the DSpark sidecar for speculative decoding.
+
+##### Diagnosis: why it is slow (16 GB VRAM)
+
+An 83 GB model cannot fit in 16 GB VRAM, so inference runs effectively on CPU
+(DDR4 bandwidth-bound). ~5.5 tps on a Ryzen 5500-class DDR4 box is close to the
+theoretical ceiling. The fix is to make the GPU do real work.
+
+##### Step 1: place high-frequency experts on GPU (2-pass, biggest win)
+
+```bash
+# Pass 1: measure usage with a prompt close to your real workload (once)
+./llama-cli -m DeepSeek-V4-Flash-0731-REAP-K216-UD-IQ3_XXS-00001-of-00003.gguf \
+  --moe-freq-report-path stats.json -p "<representative prompt>" -n 256
+
+# Pass 2: start with only high-frequency experts on GPU
+./llama-server -m DeepSeek-V4-Flash-0731-REAP-K216-UD-IQ3_XXS-00001-of-00003.gguf \
+  -c 32768 -ngl 99 \
+  --moe-expert-placement frequency \
+  --moe-freq-report-path stats.json \
+  --moe-gpu-expert-ratio 0.18 \
+  -t 6
+```
+
+- `--moe-gpu-expert-ratio`: tune **0.15-0.25** for 16 GB VRAM (~18% works well)
+- `--moe-freq-report-path` is a single flag used for both Pass 1 (write) and Pass 2 (read)
+- RX 7800 XT bandwidth (624 GB/s) is ~14x DDR4. Offloading the hot experts can
+  give **2-4x** on generation
+
+##### Step 2: free VRAM with TurboQuant KV
+
+```bash
+-ctk turbo4 -ctv turbo4
+```
+
+##### Step 3: DSpark sidecar speculative decoding
+
+Since the K216 GGUF has no nextn tensors, point at the DSpark sidecar from
+`ggml-org/DeepSeek-V4-Flash-0731-GGUF` (`dspark-DeepSeek-V4-Flash-0731-BF16.gguf`).
+The DSpark head covers only non-pruned layers (MTP + Markov head), so it is
+compatible. The fork validates hidden size / layer bounds / vocab at startup
+and errors out clearly on mismatch.
+
+```bash
+./llama-server -m DeepSeek-V4-Flash-0731-REAP-K216-UD-IQ3_XXS-00001-of-00003.gguf \
+  --spec-type draft-dspark \
+  --spec-draft-hf ggml-org/DeepSeek-V4-Flash-0731-GGUF \
+  --spec-draft-model dspark-DeepSeek-V4-Flash-0731-BF16.gguf \
+  --spec-draft-n-max 3
+```
+
+- K=3 measured fastest, so `--spec-draft-n-max 3` (the fork default)
+- Expect **1.3-1.8x** when it lands
+
+##### Step 4: threads and build
+
+- SMT does not help a bandwidth-bound loop: pass `-t 6` (physical cores)
+- RX 7800 XT needs a HIP build with `-DAMDGPU_TARGETS=gfx1100`; a generic build
+  falls back all layers to CPU
+
+##### Expected results (Ryzen 5500 + 7800 XT 16 GB)
+
+| Setup | Expected gen t/s |
+|---|---:|
+| current | 5.5 |
+| + frequency placement | 10-18 |
+| + DSpark speculative | 15-25 |
+| + TurboQuant KV | a few % (more at long context) |
 
 ### 4. Frequency-Based Expert Placement
 
@@ -230,21 +408,78 @@ Expert選択頻度を記録し、高頻度ExpertをGPUに優先配置。
 
 | フラグ / Flag | 用途 / Purpose |
 |---|---|
-| `--moe-freq-report-out PATH` | Pass 1: 頻度統計をJSONに書き出す (track_access有効化) |
-| `--moe-freq-report-in PATH` | Pass 2: 頻度JSONを読み込み、上位expertをGPU配置 |
-| `--moe-freq-report-path PATH` | [DEPRECATED] 両方を兼ねる旧フラグ |
+| `--moe-freq-report-path PATH` | 単一フラグで両方を兼ねる: Pass 1 は統計をJSONに書き出し (track_access有効化)、Pass 2 は `--moe-expert-placement frequency` と併用で自動読み込み |
 | `--moe-expert-placement frequency` | 頻度ベース配置モード |
 | `--moe-gpu-expert-ratio 0.6` | GPU配置割合 (0.0-1.0) |
 
 使用例 / Example:
 ```bash
-# Pass 1: 統計収集 (full-slotでもOK、track_accessだけ有効)
-./llama-cli -m model.gguf --moe-freq-report-out stats.json -p "..." -n 256
+# Pass 1: 統計収集 (--moe-freq-report-path で書き出し)
+./llama-cli -m model.gguf --moe-freq-report-path stats.json -p "..." -n 256
 
-# Pass 2: 高頻度expertだけGPU配置
+# Pass 2: 高頻度expertだけGPU配置 (frequencyモードが同じPATHを自動読み込み)
 ./llama-cli -m model.gguf --moe-expert-placement frequency \
-    --moe-freq-report-in stats.json --moe-gpu-expert-ratio 0.6 -p "..." -n 256
+    --moe-freq-report-path stats.json --moe-gpu-expert-ratio 0.6 -p "..." -n 256
 ```
+
+### 5. Ling-3.0-flash (`bailing-hybrid`)
+
+inclusionAI [Ling-3.0-flash](https://huggingface.co/inclusionAI/Ling-3.0-flash)
+(MIT, 127.5B total / 5.1B active) をネイティブサポート。`model_type`
+`bailing_hybrid` は **KDA (Kimi Delta Attention / 線形アテンション) 35 層 +
+gated MLA 7 層 + 512 エキスパート MoE (top-8)** のハイブリッド構成で、KDA 層は
+KV cache を持たないためコンテキストの VRAM コストが非常に軽い
+(約 8.2 KB/token、全-MLA モデルの約 1/9)。
+
+- 実装: `src/models/bailing-hybrid.cpp`。KDA ブロックは kimi-linear、MLA は
+  既存 ggml カーネルを再利用 (ggml コアは無変更)。MoE router は bailingmoe2 と
+  同一の noaux_tc grouped top-k + sigmoid
+- **MTP 対応**: layer 42 の `BailingMoeV3MTPLayer` (enorm/hnorm + eh_proj +
+  gated MLA + MoE + shared head) を `graph_mtp` として実装済み。`--mtp` で
+  投機デコードに使用可。MTP ヘッドの重み (blk.42 の全 21 テンソル) は GGUF に
+  含まれ、`--mtp` 指定時のみロードされます (通常推論ではスキップ)
+- GGUF: `prometheusAIR/Ling-3.0-flash-GGUF` (Q4_K_M / Q5_K_M / Q5_K_XL /
+  Q5_K_XXL / Q8_0) が公開済み。256K コンテキスト対応
+
+```bash
+# MTP 投機デコード付き
+llama-server -hf prometheusAIR/Ling-3.0-flash-GGUF:Q4_K_M \
+  --mtp -c 32768 -ngl 99
+```
+
+注意: `sakamakismile/Ling-3.0-flash-W4A4-NVFP4` は safetensors + vLLM フォーク
+専用 (NVFP4 W4A4 / compressed-tensors) のため、llama.cpp では直接ロードできません。
+llama.cpp で使う場合は上記の GGUF、または bf16 ベースを本フォークの
+`convert_hf_to_gguf.py` (conversion/bailing_hybrid.py) で変換したものを使います。
+
+#### Ling-3.0-flash (`bailing-hybrid`) / EN
+
+Native support for inclusionAI [Ling-3.0-flash](https://huggingface.co/inclusionAI/Ling-3.0-flash)
+(MIT, 127.5B total / 5.1B active). The `bailing_hybrid` model_type is a hybrid of
+**35 KDA (Kimi Delta Attention / linear attention) layers + 7 gated MLA layers +
+512-expert MoE (top-8)**. KDA layers carry no KV cache, so context memory is very
+cheap (~8.2 KB/token, roughly 1/9th of an all-MLA model).
+
+- Implementation: `src/models/bailing-hybrid.cpp`. The KDA block reuses
+  kimi-linear, MLA reuses existing ggml kernels (no ggml core changes); the MoE
+  router is the same noaux_tc grouped top-k + sigmoid as bailingmoe2
+- **MTP**: layer 42's `BailingMoeV3MTPLayer` (enorm/hnorm + eh_proj + gated MLA
+  + MoE + shared head) is implemented as `graph_mtp` and usable with `--mtp`.
+  The MTP head weights (all 21 blk.42 tensors) are in the GGUF and loaded only
+  when `--mtp` is requested (skipped otherwise)
+- GGUF: published at `prometheusAIR/Ling-3.0-flash-GGUF` (Q4_K_M / Q5_K_M /
+  Q5_K_XL / Q5_K_XXL / Q8_0), verified at 256K context
+
+```bash
+# with MTP speculative decoding
+llama-server -hf prometheusAIR/Ling-3.0-flash-GGUF:Q4_K_M \
+  --mtp -c 32768 -ngl 99
+```
+
+Note: `sakamakismile/Ling-3.0-flash-W4A4-NVFP4` is a safetensors + vLLM-fork-only
+repo (NVFP4 W4A4 / compressed-tensors) and cannot be loaded by llama.cpp directly.
+Use the GGUFs above, or convert the bf16 base with this fork's
+`convert_hf_to_gguf.py` (conversion/bailing_hybrid.py).
 
 ## ビルド / Build
 

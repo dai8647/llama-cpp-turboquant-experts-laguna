@@ -235,14 +235,14 @@ struct common_params_sampling {
     float   temp               = 0.80f;  // <= 0.0 to sample greedily, 0.0 to not output probabilities
     float   dynatemp_range     = 0.00f;  // 0.0 = disabled
     float   dynatemp_exponent  = 1.00f;  // controls how entropy maps to temperature in dynamic temperature sampler
-    int32_t penalty_last_n     = 64;     // last n tokens to penalize (0 = disable penalty, -1 = context size)
+    int32_t penalty_last_n     = 64;     // last n tokens to penalize (0 = disable penalty)
     float   penalty_repeat     = 1.00f;  // 1.0 = disabled
     float   penalty_freq       = 0.00f;  // 0.0 = disabled
     float   penalty_present    = 0.00f;  // 0.0 = disabled
     float   dry_multiplier     = 0.0f;   // 0.0 = disabled;      DRY repetition penalty for tokens extending repetition:
     float   dry_base           = 1.75f;  // 0.0 = disabled;      multiplier * base ^ (length of sequence before token - allowed length)
     int32_t dry_allowed_length = 2;      // tokens extending repetitions beyond this receive penalty
-    int32_t dry_penalty_last_n = -1;     // how many tokens to scan for repetitions (0 = disable penalty, -1 = context size)
+    int32_t dry_penalty_last_n = 64;     // how many tokens to scan for repetitions (0 = disable penalty)
     float   adaptive_target    = -1.0f;  // select tokens near this probability (valid range 0.0 to 1.0; negative = disabled)
     float   adaptive_decay     = 0.90f;  // EMA decay for adaptation; history ≈ 1/(1-decay) tokens (0.0 - 0.99)
     int32_t mirostat           = 0;      // 0 = disabled, 1 = mirostat, 2 = mirostat 2.0
@@ -392,14 +392,6 @@ struct common_params_speculative {
     }
 };
 
-struct common_params_vocoder {
-    struct common_params_model model;
-
-    std::string speaker_file; // speaker file path
-
-    bool use_guide_tokens = false; // enable guide tokens to improve TTS accuracy
-};
-
 struct common_params_diffusion {
     int32_t steps         = 128;
     bool    visual_mode   = false;
@@ -473,7 +465,9 @@ struct common_params {
     int32_t n_moe_gpu_expert_slot_num = -1; // number of GPU-resident MoE expert slots, -1 disables expert-slot mode
     std::string moe_expert_placement = "all-gpu"; // placement strategy: all-gpu, frequency, cpu-moe, map
     float   moe_gpu_expert_ratio   = 1.0f;       // ratio of experts to place on GPU (0.0-1.0) for frequency mode
-    std::string moe_freq_report_path;              // path to write frequency stats JSON (empty = no collection)
+    std::string moe_freq_report_out;               // Pass 1: path to write frequency stats JSON (empty = no collection)
+    std::string moe_freq_report_in;                // Pass 2: path to read frequency stats JSON from (empty = no application)
+    std::string moe_freq_report_path;              // [DEPRECATED] legacy flag: acts as both out and in (backwards compatibility)
     std::string moe_expert_map_path;               // path to expert_map.json (for future map mode)
     int32_t main_gpu           = 0;     // the GPU that is used for scratch and small tensors
     float   tensor_split[128]  = {0};   // how split tensors should be distributed across GPUs
@@ -502,7 +496,6 @@ struct common_params {
 
     struct common_params_sampling    sampling;
     struct common_params_speculative speculative;
-    struct common_params_vocoder     vocoder;
     struct common_params_diffusion   diffusion;
 
     struct common_params_model model;
@@ -746,6 +739,10 @@ struct common_params {
     llama_progress_callback load_progress_callback = NULL;
     void *                  load_progress_callback_user_data = NULL;
     bool no_alloc = false; // Don't allocate model buffers
+
+    // TTS params
+    std::string tts_lang = "";
+    std::string tts_speaker_file = "";
 
     bool is_gen_docs = false; // whether we are running inside llama-gen-docs
 };
