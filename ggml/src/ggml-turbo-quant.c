@@ -40,8 +40,8 @@ static const float CENTROIDS_2BIT[4] = { -0.133462f, -0.039994f, 0.039994f, 0.13
 
 /* 3-bit: Lloyd-Max for N(0, 1/128), pre-computed */
 static const float CENTROIDS_3BIT[8] = {
-    -0.190685f, -0.117832f, -0.065717f, -0.021460f,
-     0.021460f,  0.065717f,  0.117832f,  0.190685f
+    -0.190207f, -0.118786f, -0.066822f, -0.021663f,
+     0.021663f,  0.066822f,  0.118786f,  0.190207f
 };
 
 /* ---------- rotation matrix (lazy init) ---------- */
@@ -169,13 +169,13 @@ static int nearest_centroid_2bit(float val) {
 
 static int nearest_centroid_3bit(float val) {
     /* 8 centroids, find nearest via midpoints */
-    if (val < -0.154259f) return 0;
-    if (val < -0.091775f) return 1;
-    if (val < -0.043589f) return 2;
+    if (val < -0.154496f) return 0;
+    if (val < -0.092804f) return 1;
+    if (val < -0.044243f) return 2;
     if (val <  0.000000f) return 3;
-    if (val <  0.043589f) return 4;
-    if (val <  0.091775f) return 5;
-    if (val <  0.154259f) return 6;
+    if (val <  0.044243f) return 4;
+    if (val <  0.092804f) return 5;
+    if (val <  0.154496f) return 6;
     return 7;
 }
 

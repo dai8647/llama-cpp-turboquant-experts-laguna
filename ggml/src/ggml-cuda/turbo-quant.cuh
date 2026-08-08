@@ -31,15 +31,15 @@ static __constant__ float TURBO_MID_2BIT[3] = {
 // ---- 3-bit centroids (Lloyd-Max for N(0, 1/128)) ----
 
 static __constant__ float TURBO_CENTROIDS_3BIT[8] = {
-    -0.190685f, -0.117832f, -0.065717f, -0.021460f,
-     0.021460f,  0.065717f,  0.117832f,  0.190685f
+    -0.190207f, -0.118786f, -0.066822f, -0.021663f,
+     0.021663f,  0.066822f,  0.118786f,  0.190207f
 };
 
 // ---- Midpoints for nearest centroid lookup ----
 
 static __constant__ float TURBO_MID_3BIT[7] = {
-    -0.154259f, -0.091775f, -0.043589f, 0.0f,
-     0.043589f,  0.091775f,  0.154259f
+    -0.154496f, -0.092804f, -0.044243f, 0.0f,
+     0.044243f,  0.092804f,  0.154496f
 };
 
 // ---- WHT sign arrays (seed=42) ----
