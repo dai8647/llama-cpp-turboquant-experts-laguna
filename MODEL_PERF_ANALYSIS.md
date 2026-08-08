@@ -58,3 +58,13 @@ common_params_fit_impl: cannot meet free memory target of 1024 MiB
   - `common_params_fit_impl: cannot meet` が出ていないこと
   - 生成テキストが意味をなしていること
 - 巨大モデル (60GB+) を RAM 96GB で動かす際は SWAP 逼迫に注意 (ページファイル確認)
+
+## ビルド障害記録 (2026-08-09)
+- 事象: origin/main (127 commits) を merge-upstream-local へマージ後の再ビルドで
+  `lld-link: error: undefined symbol: turbo3_cpu_wht_group_size`
+- 原因: ops.cpp が cross-DLL で共有するグローバルを plain `extern` 宣言していた。Windows
+  shared build (MSVC/lld) では ggml-base.dll 側の定義を見つけられず未解決になる。
+  定義側 (ggml-turbo-quant.c) は GGML_API = dllexport 済み。
+- 対処: ops.cpp の宣言を `GGML_API int turbo3_cpu_wht_group_size;` に変更
+  -> GGML_API は Windows shared ビルドで __declspec(dllimport) に展開され解決される
+- 結果: フルビルド成功 (llama-cli.exe / llama-server.exe 更新)
