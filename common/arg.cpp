@@ -2737,8 +2737,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"--moe-freq-report-out"}, "PATH",
+        "Pass 1: collect MoE expert access statistics and write them to this JSON file after inference (enables access tracking)",
+        [](common_params & params, const std::string & value) {
+            params.moe_freq_report_out = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-freq-report-in"}, "PATH",
+        "Pass 2: read MoE expert frequency statistics from this JSON file and place top experts on GPU (use with --moe-expert-placement frequency)",
+        [](common_params & params, const std::string & value) {
+            params.moe_freq_report_in = value;
+        }
+    ));
+    add_opt(common_arg(
         {"--moe-freq-report-path"}, "PATH",
-        "write MoE expert frequency stats JSON to this path after inference",
+        "[DEPRECATED] equivalent to setting both --moe-freq-report-out and --moe-freq-report-in",
         [](common_params & params, const std::string & value) {
             params.moe_freq_report_path = value;
         }

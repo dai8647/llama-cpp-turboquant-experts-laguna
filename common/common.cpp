@@ -1617,7 +1617,12 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.n_moe_gpu_expert_slot_num = params.n_moe_gpu_expert_slot_num;
     mparams.moe_expert_placement = params.moe_expert_placement.empty() ? nullptr : params.moe_expert_placement.c_str();
     mparams.moe_gpu_expert_ratio = params.moe_gpu_expert_ratio;
-    mparams.moe_freq_report_path = params.moe_freq_report_path.empty() ? nullptr : params.moe_freq_report_path.c_str();
+    // Pass 1 (out) / Pass 2 (in) report paths; the deprecated --moe-freq-report-path acts as both
+    const std::string & moe_report_in  = !params.moe_freq_report_in.empty()  ? params.moe_freq_report_in  : params.moe_freq_report_path;
+    const std::string & moe_report_out = !params.moe_freq_report_out.empty() ? params.moe_freq_report_out : params.moe_freq_report_path;
+    mparams.moe_freq_report_in  = moe_report_in.empty()  ? nullptr : moe_report_in.c_str();
+    mparams.moe_freq_report_out = moe_report_out.empty() ? nullptr : moe_report_out.c_str();
+    mparams.moe_freq_report_path = nullptr; // deprecated field kept for ABI compatibility, no longer used
     mparams.main_gpu        = params.main_gpu;
     mparams.split_mode      = params.split_mode;
     mparams.load_mode       = params.load_mode;
