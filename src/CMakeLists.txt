@@ -24,7 +24,6 @@ add_library(llama
             llama-io.cpp
             llama-kv-cache.cpp
             llama-moe-stats.cpp
-            llama-moe-placement.cpp
             llama-kv-cache-iswa.cpp
             llama-kv-cache-dsa.cpp
             llama-kv-cache-msa.cpp
