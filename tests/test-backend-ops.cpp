@@ -2463,7 +2463,7 @@ struct test_set_rows : public test_case {
             err_estimate /= 0.25f*float(ne[0] * r * ne[2]*nr23[0] * ne[3]*nr23[1]);
             return err_estimate;
         }
-        if (type == GGML_TYPE_TQ4_1S) {
+        if (type_dst == GGML_TYPE_TQ4_1S) {
             // Reduction order matters; TQ4_1S has 32-element WHT inside the
             // dot product which amplifies fp reduction differences slightly.
             return 0.01;
@@ -9063,6 +9063,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // m == 1, with n on both sides of MMVF_MAX_BATCH_SIZE (8): mmvf below, operand swap above
     for (int64_t n : {1, 7, 8, 9, 16, 128, 512}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 1, n, 2048, {1, 1}, {1, 1}));
+    }
+
     // TQ4_1S: Gemma-4 E2B dimensions. The fused mul_mat_vec kernel has a
     // shared-memory WHT on the activation and dequantizes centroid*scale per
     // thread; bugs in the butterfly or reduction only surface at production sizes.
@@ -9809,6 +9811,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, }) {
                     test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 8, {4, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
                 }
+            }
+        }
+    }
+
     // TURBO_WHT tests
     for (int dir : {0, 1}) {
         for (int64_t hd : {128, 256, 512}) {
