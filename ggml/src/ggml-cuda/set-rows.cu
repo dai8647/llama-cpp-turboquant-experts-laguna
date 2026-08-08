@@ -1093,7 +1093,6 @@ static __global__ void k_set_rows_turbo4(
     // ---- Step 8: Write corrected norm and zero rnorm (one thread) ----
     if (j == 0) {
         blk->norm  = __float2half(corrected_norm);
-        blk->rnorm = __float2half(0.0f);
     }
 
     GGML_UNUSED(ne10);
