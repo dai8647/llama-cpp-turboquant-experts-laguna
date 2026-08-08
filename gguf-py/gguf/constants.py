@@ -557,6 +557,7 @@ class MODEL_ARCH(IntEnum):
     TALKIE           = auto()
     MELLUM           = auto()
     NANBEIGE         = auto()
+    LONGCAT          = auto()
 
 
 class VISION_PROJECTOR_TYPE(IntEnum):
@@ -575,6 +576,8 @@ class VISION_PROJECTOR_TYPE(IntEnum):
 
 class MODEL_TENSOR(IntEnum):
     TOKEN_EMBD           = auto()
+    NGRAM_EMBD           = auto()
+    NGRAM_PROJ           = auto()
     TOKEN_EMBD_NORM      = auto()
     MASKED_EMBD_CENTROIDS= auto()
     MASKED_EMBD_ORDERING = auto()
@@ -1169,6 +1172,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.TALKIE:           "talkie",
     MODEL_ARCH.MELLUM:           "mellum",
     MODEL_ARCH.NANBEIGE:         "nanbeige",
+    MODEL_ARCH.LONGCAT:          "longcat-flash-ngram",
 }
 
 VISION_PROJECTOR_TYPE_NAMES: dict[VISION_PROJECTOR_TYPE, str] = {
@@ -1185,6 +1189,8 @@ VISION_PROJECTOR_TYPE_NAMES: dict[VISION_PROJECTOR_TYPE, str] = {
 
 TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.TOKEN_EMBD:                "token_embd",
+    MODEL_TENSOR.NGRAM_EMBD:                "ngram_embd",
+    MODEL_TENSOR.NGRAM_PROJ:                "ngram_proj",
     MODEL_TENSOR.TOKEN_EMBD_NORM:           "token_embd_norm",
     MODEL_TENSOR.TOKEN_TYPES:               "token_types",
     MODEL_TENSOR.MASKED_EMBD_CENTROIDS:     "masked_embd_centroids",

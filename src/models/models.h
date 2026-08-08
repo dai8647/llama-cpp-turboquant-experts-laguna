@@ -1092,6 +1092,30 @@ struct llama_model_deepseek2 : public llama_model_base {
 };
 
 
+// LongCat-Flash with N-gram enhanced embeddings ("longcat-flash-ngram").
+// Based on llama_model_deepseek2 (clean MLA + MoE + shared experts + exp_probs + MTP trunk).
+// LongCat interleaves dense and MoE FFN blocks per-layer (detected from tensor
+// presence rather than leading_dense_block_count) and adds an N-gram input
+// embedding module (ngram_embd.X / ngram_proj.X).
+struct llama_model_longcat : public llama_model_deepseek2 {
+    llama_model_longcat(const struct llama_model_params & params) : llama_model_deepseek2(params) {}
+
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+
+    struct graph : public llm_graph_context {
+        graph(const llama_model & model, const llm_graph_params & params);
+    };
+
+    struct graph_mtp : public llama_model_deepseek2::graph_mtp {
+        graph_mtp(const llama_model & model, const llm_graph_params & params)
+            : llama_model_deepseek2::graph_mtp(model, params) {}
+    };
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
+
 struct llama_model_deepseek32 : public llama_model_base {
     llama_model_deepseek32(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;

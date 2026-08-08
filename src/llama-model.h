@@ -1016,6 +1016,11 @@ struct llama_model {
     struct ggml_tensor * tok_norm   = nullptr;
     struct ggml_tensor * tok_norm_b = nullptr;
 
+    // longcat-flash-ngram: NgramEmbedding module
+    // embedders/post_projs count = emb_split_num * (emb_neighbor_num - 1) = 4*3 = 12
+    struct ggml_tensor * ngram_embd[12] = {};
+    struct ggml_tensor * ngram_proj[12] = {};
+
     struct ggml_tensor * output_norm     = nullptr;
     struct ggml_tensor * output_norm_b   = nullptr;
     struct ggml_tensor * output          = nullptr;
