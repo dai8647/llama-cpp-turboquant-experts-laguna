@@ -378,6 +378,29 @@ function gg_sum_ctest_with_model_release {
     gg_printf '%s\n' "$(cat $OUT/${ci}-ctest.log)"
     gg_printf '```\n'
 }
+function gg_run_moe_freq_placement {
+    cd ${SRC}
+    # Optional MoE integration test: needs an MoE model + built llama-cli.
+    # Skip (success) when the model is not present on the node.
+    local model="$MNT/models/DeepSeek-V2-Lite.Q4_K_M.gguf"
+    if [[ ! -s $model ]]; then
+        echo "MoE model not found ($model); skipping test_moe_frequency_placement.py"
+        return 0
+    fi
+    cd build-ci-release
+    set -e
+    (LLAMA_CLI="$SRC/build-ci-release/bin/llama-cli" MODEL="$model" time python3 "$SRC/tests/test_moe_frequency_placement.py") 2>&1 | tee -a $OUT/${ci}-moe-freq.log
+    set +e
+    cd ..
+}
+function gg_sum_moe_freq_placement {
+    gg_printf '### %s\n\n' "${ci}"
+    gg_printf 'Runs test_moe_frequency_placement.py (MoE frequency 2-pass workflow)\n'
+    gg_printf '- status: %s\n' "$(cat $OUT/${ci}.exit)"
+    gg_printf '```\n'
+    gg_printf '%s\n' "$(cat $OUT/${ci}-moe-freq.log)"
+    gg_printf '```\n'
+}
 
 # qwen3_0_6b
 
@@ -759,6 +782,7 @@ if [ -z ${GG_BUILD_LOW_PERF} ]; then
 
     test $ret -eq 0 && gg_run ctest_with_model_debug
     test $ret -eq 0 && gg_run ctest_with_model_release
+    test $ret -eq 0 && gg_run moe_freq_placement
 fi
 
 cat $OUT/README.md

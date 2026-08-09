@@ -5,6 +5,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+extern void quantize_row_turbo2_0_ref(const float * x, void * y, long long k);
+extern void dequantize_row_turbo2_0(const void * x, float * y, long long k);
 extern void quantize_row_turbo3_0_ref(const float * x, void * y, long long k);
 extern void dequantize_row_turbo3_0(const void * x, float * y, long long k);
 extern void quantize_row_turbo4_0_ref(const float * x, void * y, long long k);
@@ -13,6 +15,26 @@ extern void turbo_cpu_fwht_inverse(float * x, int group_size);
 
 /* Must match GGML_TQ_DOT_CHUNK in ggml/src/ggml-cpu/ggml-cpu.c. */
 #define TQ_DOT_CHUNK 256
+
+/* MSE thresholds for the round-trip checks below.
+ *
+ * TurboQuant is PolarQuant in the WHT domain with 2/3/4 bits per element
+ * (ggml/src/ggml-turbo-quant.c). The absolute MSE therefore scales with the
+ * square of the input amplitude: sin*10 / cos*5 inputs have ~100x / ~25x the
+ * MSE of the unit-amplitude basis vector. Measured on this harness with the
+ * current kernels:
+ *   turbo2 sin*10  MSE=5.158   turbo2 basis  MSE~0
+ *   turbo3 sin*10  MSE=1.345   turbo3 basis  MSE~0
+ *   turbo4 cos*5   MSE=0.286
+ * The thresholds below are ~4x the measured error, so they only trip on a
+ * real regression (wrong norm, wrong centroids, WHT mismatch) or a several-
+ * fold fidelity regression, not on platform FP noise. They are far looser
+ * than the paper's reconstruction error would imply, on purpose: this test
+ * guards the round-trip plumbing, not the compression quality.
+ */
+static const double TURBO2_MSE_THRESHOLD = 20.0;  /* 2-bit: worst fidelity   */
+static const double TURBO3_MSE_THRESHOLD =  5.0;  /* 3-bit: mid fidelity     */
+static const double TURBO4_MSE_THRESHOLD =  1.0;  /* 4-bit: best fidelity    */
 
 /* Block-boundary invariant behind the chunked TurboQuant vec_dot kernels.
  *
@@ -80,15 +102,27 @@ static int check_chunked_dequant(enum ggml_type type, const char * name, int64_t
     return bad >= 0 ? 1 : 0;
 }
 
+/* MSE threshold check. Explicit comparison instead of assert() because tests
+ * are built with NDEBUG in Release and assert() would compile out. */
+static int check_mse(const char * name, double mse, double threshold) {
+    if (mse > threshold) {
+        printf("  %s: FAIL: MSE=%.8f exceeds threshold %.8f\n", name, mse, threshold);
+        return 1;
+    }
+    printf("  %s: PASS: MSE=%.8f <= threshold %.8f\n", name, mse, threshold);
+    return 0;
+}
+
 int main(void) {
     const int d = 128;
     char buf[256];
     float input[128], output[128];
-    float mse, cosv, ni, no;
+    double mse, cosv, ni, no;
+    int failures = 0;
 
     printf("=== TurboQuant C Round-Trip Test ===\n\n");
 
-    /* Test 1: basis vector
+    /* Test 1: turbo3 basis vector
      *
      * dequantize_row_turbo3_0 leaves output in the WHT-rotated domain (Q is
      * also rotated by the graph, so <Q_rot, K_rot> yields correct attention
@@ -104,9 +138,12 @@ int main(void) {
     printf("  Out: [%.6f, %.6f, %.6f, %.6f]\n",  (double)(output[0]), (double)(output[1]), (double)(output[2]), (double)(output[3]));
     mse = cosv = ni = no = 0;
     for (int i = 0; i < d; i++) { mse += (input[i]-output[i])*(input[i]-output[i]); cosv += input[i]*output[i]; ni += input[i]*input[i]; no += output[i]*output[i]; }
-    printf("  MSE=%.8f Cosine=%.6f OutNorm=%.6f\n\n",  (double)(mse/d), (double)(ni > 0 && no > 0 ? cosv/sqrtf(ni)/sqrtf(no) : 0), (double)(sqrtf(no)));
+    mse /= d;
+    printf("  MSE=%.8f Cosine=%.6f OutNorm=%.6f\n",  mse, (double)(ni > 0 && no > 0 ? cosv/sqrtf(ni)/sqrtf(no) : 0), (double)(sqrtf(no)));
+    failures += check_mse("turbo3 basis", mse, TURBO3_MSE_THRESHOLD);
+    printf("\n");
 
-    /* Test 2: large-norm vector */
+    /* Test 2: turbo3 large-norm vector */
     for (int i = 0; i < d; i++) input[i] = sinf(i*0.1f+0.5f) * 10.0f;
     quantize_row_turbo3_0_ref(input, buf, d);
     dequantize_row_turbo3_0(buf, output, d);
@@ -116,9 +153,46 @@ int main(void) {
     printf("  Out: [%.4f, %.4f, %.4f, %.4f]\n",  (double)(output[0]), (double)(output[1]), (double)(output[2]), (double)(output[3]));
     mse = cosv = ni = no = 0;
     for (int i = 0; i < d; i++) { mse += (input[i]-output[i])*(input[i]-output[i]); cosv += input[i]*output[i]; ni += input[i]*input[i]; no += output[i]*output[i]; }
-    printf("  MSE=%.8f Cosine=%.6f InNorm=%.2f OutNorm=%.2f\n\n",  (double)(mse/d), (double)(cosv/sqrtf(ni)/sqrtf(no)), (double)(sqrtf(ni)), (double)(sqrtf(no)));
+    mse /= d;
+    printf("  MSE=%.8f Cosine=%.6f InNorm=%.2f OutNorm=%.2f\n",  mse, (double)(cosv/sqrtf(ni)/sqrtf(no)), (double)(sqrtf(ni)), (double)(sqrtf(no)));
+    failures += check_mse("turbo3 sin*10", mse, TURBO3_MSE_THRESHOLD);
+    printf("\n");
 
-    /* Test 3: turbo4
+    /* Test 3: turbo2 (2-bit, worst fidelity) basis + sinusoidal
+     *
+     * Same WHT convention as turbo3/turbo4 (see comment in
+     * dequantize_row_turbo2_0 @ ggml-turbo-quant.c): apply the inverse WHT
+     * before comparing. */
+    memset(input, 0, sizeof(input));
+    input[0] = 1.0f;
+    quantize_row_turbo2_0_ref(input, buf, d);
+    dequantize_row_turbo2_0(buf, output, d);
+    turbo_cpu_fwht_inverse(output, d);
+    printf("Test 3 (turbo2): e0 = [1, 0, ...]\n");
+    printf("  In:  [%.6f, %.6f, %.6f, %.6f]\n",  (double)(input[0]), (double)(input[1]), (double)(input[2]), (double)(input[3]));
+    printf("  Out: [%.6f, %.6f, %.6f, %.6f]\n",  (double)(output[0]), (double)(output[1]), (double)(output[2]), (double)(output[3]));
+    mse = cosv = ni = no = 0;
+    for (int i = 0; i < d; i++) { mse += (input[i]-output[i])*(input[i]-output[i]); cosv += input[i]*output[i]; ni += input[i]*input[i]; no += output[i]*output[i]; }
+    mse /= d;
+    printf("  MSE=%.8f Cosine=%.6f OutNorm=%.6f\n",  mse, (double)(ni > 0 && no > 0 ? cosv/sqrtf(ni)/sqrtf(no) : 0), (double)(sqrtf(no)));
+    failures += check_mse("turbo2 basis", mse, TURBO2_MSE_THRESHOLD);
+    printf("\n");
+
+    for (int i = 0; i < d; i++) input[i] = sinf(i*0.1f+0.5f) * 10.0f;
+    quantize_row_turbo2_0_ref(input, buf, d);
+    dequantize_row_turbo2_0(buf, output, d);
+    turbo_cpu_fwht_inverse(output, d);
+    printf("Test 3b (turbo2): sin*10\n");
+    printf("  In:  [%.4f, %.4f, %.4f, %.4f]\n",  (double)(input[0]), (double)(input[1]), (double)(input[2]), (double)(input[3]));
+    printf("  Out: [%.4f, %.4f, %.4f, %.4f]\n",  (double)(output[0]), (double)(output[1]), (double)(output[2]), (double)(output[3]));
+    mse = cosv = ni = no = 0;
+    for (int i = 0; i < d; i++) { mse += (input[i]-output[i])*(input[i]-output[i]); cosv += input[i]*output[i]; ni += input[i]*input[i]; no += output[i]*output[i]; }
+    mse /= d;
+    printf("  MSE=%.8f Cosine=%.6f InNorm=%.2f OutNorm=%.2f\n",  mse, (double)(cosv/sqrtf(ni)/sqrtf(no)), (double)(sqrtf(ni)), (double)(sqrtf(no)));
+    failures += check_mse("turbo2 sin*10", mse, TURBO2_MSE_THRESHOLD);
+    printf("\n");
+
+    /* Test 4: turbo4
      *
      * Same convention as turbo3: dequant leaves output in the rotated domain
      * (see comment in dequantize_row_turbo4_0 @ ggml-turbo-quant.c). Apply
@@ -127,15 +201,18 @@ int main(void) {
     quantize_row_turbo4_0_ref(input, buf, d);
     dequantize_row_turbo4_0(buf, output, d);
     turbo_cpu_fwht_inverse(output, d);
-    printf("Test 3 (turbo4): cos*5\n");
+    printf("Test 4 (turbo4): cos*5\n");
     printf("  In:  [%.4f, %.4f, %.4f, %.4f]\n",  (double)(input[0]), (double)(input[1]), (double)(input[2]), (double)(input[3]));
     printf("  Out: [%.4f, %.4f, %.4f, %.4f]\n",  (double)(output[0]), (double)(output[1]), (double)(output[2]), (double)(output[3]));
     mse = cosv = ni = no = 0;
     for (int i = 0; i < d; i++) { mse += (input[i]-output[i])*(input[i]-output[i]); cosv += input[i]*output[i]; ni += input[i]*input[i]; no += output[i]*output[i]; }
-    printf("  MSE=%.8f Cosine=%.6f\n\n",  (double)(mse/d), (double)(cosv/sqrtf(ni)/sqrtf(no)));
+    mse /= d;
+    printf("  MSE=%.8f Cosine=%.6f\n",  mse, (double)(cosv/sqrtf(ni)/sqrtf(no)));
+    failures += check_mse("turbo4 cos*5", mse, TURBO4_MSE_THRESHOLD);
+    printf("\n");
 
-    /* Test 4: chunk-boundary invariant for every type with a chunked vec_dot */
-    printf("Test 4: chunked dequant == whole-row dequant\n");
+    /* Test 5: chunk-boundary invariant for every type with a chunked vec_dot */
+    printf("Test 5: chunked dequant == whole-row dequant\n");
     {
         const enum ggml_type types[] = {
             GGML_TYPE_TQ3_1S, GGML_TYPE_TQ4_1S,
@@ -145,17 +222,17 @@ int main(void) {
         /* straddle TQ_DOT_CHUNK from both sides, plus a realistic row */
         const int64_t lens[] = { 128, 256, 384, 512, 4096 };
 
-        int failures = 0;
         for (size_t t = 0; t < sizeof(types) / sizeof(types[0]); t++) {
             for (size_t i = 0; i < sizeof(lens) / sizeof(lens[0]); i++) {
                 failures += check_chunked_dequant(types[t], names[t], lens[i]);
             }
         }
         printf("\n");
-        if (failures) {
-            printf("=== FAILED: %d chunk-boundary mismatches ===\n", failures);
-            return 1;
-        }
+    }
+
+    if (failures) {
+        printf("=== FAILED: %d check(s) failed ===\n", failures);
+        return 1;
     }
 
     printf("=== Done ===\n");

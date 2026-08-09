@@ -10,6 +10,7 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <numeric>
@@ -755,8 +756,19 @@ struct llama_moe_gpu_expert_cache {
     llama_moe_freq_report generate_access_report(const std::string& fingerprint, int32_t n_active_experts) const {
         llama_moe_freq_report report;
         report.model_fingerprint = fingerprint;
+        report.n_layers = 0;
         report.n_experts = 0;
         report.n_active_experts = n_active_experts;
+
+        if (access_counts.empty()) {
+            // No expert access was recorded. Do not fabricate a 1x1 all-zero
+            // grid (the old behaviour): a zero-record report has empty stats,
+            // so the load side refuses it exactly like it refuses a fingerprint
+            // mismatch -- an accidental empty report can never be applied.
+            fprintf(stderr, "[moe-stats] warning: no MoE access records collected - "
+                    "writing zero-record frequency report (load side will refuse it)\n");
+            return report;
+        }
 
         // find max layer and expert IDs
         int32_t max_layer = 0, max_expert = 0;
