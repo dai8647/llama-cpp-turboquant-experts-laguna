@@ -25,8 +25,10 @@ Usage:
     python3 scripts/mixed_quant.py --print-plan model-f16.gguf /dev/null
 
 Type selection is limited to what this fork's gguf-py can produce: Q4_0,
-Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, BF16, TQ1_0, TQ2_0 (other K-quants and
-IQ1/2/3/4 are dequantize-only in quants.py).
+Q4_1, Q5_0, Q5_1, Q8_0, Q2_K..Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS,
+IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, BF16, TQ1_0, TQ2_0. The IQ
+quantizers are unweighted (no imatrix) ports, so for --imatrix parity use
+llama-quantize instead.
 
 Requires this fork's gguf-py (auto-added to sys.path) and numpy.
 Tensors whose last dim is not a multiple of the target block size fall back to
@@ -66,8 +68,10 @@ ROUTER_RE = re.compile(r"(^|\.)blk\.\d+\.ffn_gate_inp\.weight$")
 SHARED_RE = re.compile(r"(^|\.)blk\.\d+\.ffn_(gate|up|down)_shexp\.weight$")
 
 # Types this fork's gguf-py can actually PRODUCE (quantize implemented).
-# K-quants other than Q2_K and IQ1/2/3/4 are dequantize-only in quants.py,
-# so they are not selectable here.
+# K-quants (Q2_K..Q6_K) and the IQ family (IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS,
+# IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS) are bit-exact ports of the C
+# reference in ggml-quants.c. The IQ ports take no imatrix weights, so the
+# output can differ from llama-quantize with --imatrix.
 _QUANTIZABLE = {
     GGMLQuantizationType.F32,
     GGMLQuantizationType.F16,
@@ -78,6 +82,19 @@ _QUANTIZABLE = {
     GGMLQuantizationType.Q5_1,
     GGMLQuantizationType.Q8_0,
     GGMLQuantizationType.Q2_K,
+    GGMLQuantizationType.Q3_K,
+    GGMLQuantizationType.Q4_K,
+    GGMLQuantizationType.Q5_K,
+    GGMLQuantizationType.Q6_K,
+    GGMLQuantizationType.IQ1_S,
+    GGMLQuantizationType.IQ1_M,
+    GGMLQuantizationType.IQ2_XXS,
+    GGMLQuantizationType.IQ2_XS,
+    GGMLQuantizationType.IQ2_S,
+    GGMLQuantizationType.IQ3_XXS,
+    GGMLQuantizationType.IQ3_S,
+    GGMLQuantizationType.IQ4_NL,
+    GGMLQuantizationType.IQ4_XS,
     GGMLQuantizationType.TQ1_0,
     GGMLQuantizationType.TQ2_0,
 }
