@@ -72,11 +72,11 @@ python3 scripts/mixed_quant.py --base-type F16 model-f16.gguf model-tq2-f16base.
 - 入力は F16/BF16 GGUF 推奨（既に Q4 等の低精度だと再量子化の劣化が蓄積する）
 - マルチシャード GGUF は未対応（先に `gguf-split` で単一ファイル化）
 - 変換はテンソル単位で逐次処理するので RAM は小さくて済む
-- 選択できる型は gguf-py で量子化実装があるものに限定（Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q2_K/BF16/TQ1_0/TQ2_0）。
-  Q2_K は 2026-08 に quantize 実装を追加（C++ の quantize_row_q2_K_ref の移植）。
-  Q3_K..Q6_K や IQ2_XXS はこのフォークの gguf-py では decode-only のため、Python 経由では
-  エキスパート 2bit に使えません（使いたい場合は quants.py に quantize を追加するか、
-  全体一括なら C++ の llama-quantize + imatrix が利用可能）
+- 選択できる型は gguf-py で量子化実装があるものに限定（Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q2_K..Q6_K/
+  IQ1_S/IQ1_M/IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S/IQ4_NL/IQ4_XS/BF16/TQ1_0/TQ2_0）。
+  K 系と IQ 系は 2026-08 に quantize 実装を追加（C++ の ggml-quants.c 参照実装の移植で、
+  K 系の出力は C 参照とバイト単位で一致）。IQ 系は imatrix 非対応の unweighted 版なので、
+  --imatrix と完全一致させたい場合は C++ の llama-quantize を使う
 
 ## 4. 手順 B: DSpark の実測（基準と比較）
 
@@ -101,7 +101,10 @@ llama-server -m model-tq2.gguf -c 216000 -ngl 99 --cpu-moe --dflash --temp 0
 
 同じ F16 ソースから複数種類を作り、perplexity と実速度を比較します。
 Python 経由で選択できるエキスパート型は TQ2_0 (2.06bpw) / TQ1_0 (1.7bpw 級) /
-Q2_K (2.625bpw) / Q4_0 などです（IQ2_XXS は gguf-py が decode-only）。
+Q2_K (2.625bpw) / Q3_K (3.44bpw) / Q4_K (4.5bpw) / Q5_K (5.5bpw) /
+Q6_K (6.56bpw) / IQ2_XXS (2.06bpw) / IQ2_XS (2.31bpw) / IQ2_S (3.06bpw) /
+IQ3_XXS (3.44bpw) / IQ3_S (4.44bpw) / IQ4_XS (4.25bpw) / Q4_0 などです
+（IQ 系は imatrix なしの unweighted 量子化）。
 
 ```bash
 # 候補の GGUF を作る
@@ -109,6 +112,7 @@ python3 scripts/mixed_quant.py --expert-type TQ2_0 model-f16.gguf m-tq2.gguf
 python3 scripts/mixed_quant.py --expert-type TQ1_0 model-f16.gguf m-tq1.gguf
 python3 scripts/mixed_quant.py --expert-type Q2_K model-f16.gguf m-q2k.gguf
 python3 scripts/mixed_quant.py --expert-type Q4_0  model-f16.gguf m-q4.gguf
+python3 scripts/mixed_quant.py --expert-type IQ2_XXS model-f16.gguf m-iq2xxs.gguf
 
 # 品質（小さいほど良い、F16 の PPL が基準）
 ./build/bin/llama-perplexity -m m-tq2.gguf -f wiki.test.raw -c 4096 -n 2048
@@ -121,11 +125,12 @@ MODEL=m-tq2.gguf ./scripts/bench_dspark.sh
 
 期待値:
 
-- 品質: Q4_0 > Q2_K > TQ2_0 > TQ1_0（順位はモデル依存、PPL/KLD で確認）
+- 品質: Q4_0 / Q4_K > Q3_K > Q2_K > TQ2_0 > TQ1_0（順位はモデル依存、PPL/KLD で確認）
 - 速度: TQ2_0 / TQ1_0 はこのフォーク専用のデコードカーネルがあるため Q4_0 より速い
-- Q2_K は品質優先・TQ2_0 は速度優先の 2bit 選択肢
-- IQ2_XXS を試したい場合は gguf-py/gguf/quants.py への量子化実装追加が必要
-  （当分は TQ2_0 で代用するのが現実的）
+- K 系（Q2_K..Q6_K）は品質を重視しつつ C の llama-quantize と同一出力が欲しい場合の選択肢
+  （エキスパート 2bit なら Q2_K、4bit なら Q4_K が典型）
+- IQ 系（IQ2_XXS など）は 2026-08 に quantize 実装を追加済み。imatrix なしの
+  unweighted 版なので、--imatrix 前提の品質を求めるなら C++ の llama-quantize を使う
 
 ## 6. その他の効くスイッチ
 
