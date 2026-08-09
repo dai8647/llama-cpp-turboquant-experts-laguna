@@ -72,8 +72,9 @@ python3 scripts/mixed_quant.py --base-type F16 model-f16.gguf model-tq2-f16base.
 - 入力は F16/BF16 GGUF 推奨（既に Q4 等の低精度だと再量子化の劣化が蓄積する）
 - マルチシャード GGUF は未対応（先に `gguf-split` で単一ファイル化）
 - 変換はテンソル単位で逐次処理するので RAM は小さくて済む
-- 選択できる型は gguf-py で量子化実装があるものに限定（Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/BF16/TQ1_0/TQ2_0）。
-  Q2_K や IQ2_XXS はこのフォークの gguf-py では decode-only のため、Python 経由では
+- 選択できる型は gguf-py で量子化実装があるものに限定（Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q2_K/BF16/TQ1_0/TQ2_0）。
+  Q2_K は 2026-08 に quantize 実装を追加（C++ の quantize_row_q2_K_ref の移植）。
+  Q3_K..Q6_K や IQ2_XXS はこのフォークの gguf-py では decode-only のため、Python 経由では
   エキスパート 2bit に使えません（使いたい場合は quants.py に quantize を追加するか、
   全体一括なら C++ の llama-quantize + imatrix が利用可能）
 
@@ -100,12 +101,13 @@ llama-server -m model-tq2.gguf -c 216000 -ngl 99 --cpu-moe --dflash --temp 0
 
 同じ F16 ソースから複数種類を作り、perplexity と実速度を比較します。
 Python 経由で選択できるエキスパート型は TQ2_0 (2.06bpw) / TQ1_0 (1.7bpw 級) /
-Q4_0 などに限られます（Q2_K・IQ2_XXS は gguf-py が decode-only）。
+Q2_K (2.625bpw) / Q4_0 などです（IQ2_XXS は gguf-py が decode-only）。
 
 ```bash
 # 候補の GGUF を作る
 python3 scripts/mixed_quant.py --expert-type TQ2_0 model-f16.gguf m-tq2.gguf
 python3 scripts/mixed_quant.py --expert-type TQ1_0 model-f16.gguf m-tq1.gguf
+python3 scripts/mixed_quant.py --expert-type Q2_K model-f16.gguf m-q2k.gguf
 python3 scripts/mixed_quant.py --expert-type Q4_0  model-f16.gguf m-q4.gguf
 
 # 品質（小さいほど良い、F16 の PPL が基準）
@@ -119,10 +121,10 @@ MODEL=m-tq2.gguf ./scripts/bench_dspark.sh
 
 期待値:
 
-- 品質: Q4_0 > TQ2_0 > TQ1_0（順位はモデル依存、PPL/KLD で確認）
+- 品質: Q4_0 > Q2_K > TQ2_0 > TQ1_0（順位はモデル依存、PPL/KLD で確認）
 - 速度: TQ2_0 / TQ1_0 はこのフォーク専用のデコードカーネルがあるため Q4_0 より速い
-- 「品質と速度のバランス」は TQ2_0 が落とし所になりやすい
-- IQ2_XXS / Q2_K を試したい場合は gguf-py/gguf/quants.py への量子化実装追加が必要
+- Q2_K は品質優先・TQ2_0 は速度優先の 2bit 選択肢
+- IQ2_XXS を試したい場合は gguf-py/gguf/quants.py への量子化実装追加が必要
   （当分は TQ2_0 で代用するのが現実的）
 
 ## 6. その他の効くスイッチ

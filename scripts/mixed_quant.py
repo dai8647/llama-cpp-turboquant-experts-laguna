@@ -25,8 +25,8 @@ Usage:
     python3 scripts/mixed_quant.py --print-plan model-f16.gguf /dev/null
 
 Type selection is limited to what this fork's gguf-py can produce: Q4_0,
-Q4_1, Q5_0, Q5_1, Q8_0, BF16, TQ1_0, TQ2_0 (K-quants and IQ1/2/3/4 are
-dequantize-only in quants.py).
+Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, BF16, TQ1_0, TQ2_0 (other K-quants and
+IQ1/2/3/4 are dequantize-only in quants.py).
 
 Requires this fork's gguf-py (auto-added to sys.path) and numpy.
 Tensors whose last dim is not a multiple of the target block size fall back to
@@ -66,8 +66,8 @@ ROUTER_RE = re.compile(r"(^|\.)blk\.\d+\.ffn_gate_inp\.weight$")
 SHARED_RE = re.compile(r"(^|\.)blk\.\d+\.ffn_(gate|up|down)_shexp\.weight$")
 
 # Types this fork's gguf-py can actually PRODUCE (quantize implemented).
-# K-quants (Q2_K..Q6_K) and IQ1/2/3/4 are dequantize-only in quants.py, so
-# they are not selectable here.
+# K-quants other than Q2_K and IQ1/2/3/4 are dequantize-only in quants.py,
+# so they are not selectable here.
 _QUANTIZABLE = {
     GGMLQuantizationType.F32,
     GGMLQuantizationType.F16,
@@ -77,6 +77,7 @@ _QUANTIZABLE = {
     GGMLQuantizationType.Q5_0,
     GGMLQuantizationType.Q5_1,
     GGMLQuantizationType.Q8_0,
+    GGMLQuantizationType.Q2_K,
     GGMLQuantizationType.TQ1_0,
     GGMLQuantizationType.TQ2_0,
 }
@@ -145,7 +146,7 @@ def main() -> None:
     parser.add_argument("input", type=str, help="input GGUF (F16/BF16 source recommended)")
     parser.add_argument("output", type=str, help="output GGUF path")
     parser.add_argument("--expert-type", type=_valid_type, default=GGMLQuantizationType.TQ2_0,
-                        help="routed expert type (default TQ2_0; TQ1_0 is the other 2-bit-class option)")
+                        help="routed expert type (default TQ2_0; TQ1_0 and Q2_K are the other 2-bit-class options)")
     parser.add_argument("--base-type", type=_valid_type, default=GGMLQuantizationType.Q8_0,
                         help="type for everything else (default Q8_0; use F16 for max quality)")
     parser.add_argument("--router-type", type=_valid_type, default=GGMLQuantizationType.F16,
