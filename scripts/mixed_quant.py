@@ -26,9 +26,9 @@ Usage:
 
 Type selection is limited to what this fork's gguf-py can produce: Q4_0,
 Q4_1, Q5_0, Q5_1, Q8_0, Q2_K..Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS,
-IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, BF16, TQ1_0, TQ2_0. The IQ
-quantizers are unweighted (no imatrix) ports, so for --imatrix parity use
-llama-quantize instead.
+IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, BF16, TQ1_0, TQ2_0, TQ3_1S,
+TQ4_1S. The IQ quantizers are unweighted (no imatrix) ports, so for
+--imatrix parity use llama-quantize instead.
 
 Requires this fork's gguf-py (auto-added to sys.path) and numpy.
 Tensors whose last dim is not a multiple of the target block size fall back to
@@ -70,8 +70,9 @@ SHARED_RE = re.compile(r"(^|\.)blk\.\d+\.ffn_(gate|up|down)_shexp\.weight$")
 # Types this fork's gguf-py can actually PRODUCE (quantize implemented).
 # K-quants (Q2_K..Q6_K) and the IQ family (IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS,
 # IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS) are bit-exact ports of the C
-# reference in ggml-quants.c. The IQ ports take no imatrix weights, so the
-# output can differ from llama-quantize with --imatrix.
+# reference in ggml-quants.c. TQ1_0/TQ2_0/TQ3_1S/TQ4_1S are bit-exact
+# ports of the C reference in ggml-turbo-quant.c. The IQ ports take no
+# imatrix weights, so the output can differ from llama-quantize with --imatrix.
 _QUANTIZABLE = {
     GGMLQuantizationType.F32,
     GGMLQuantizationType.F16,
@@ -97,6 +98,8 @@ _QUANTIZABLE = {
     GGMLQuantizationType.IQ4_XS,
     GGMLQuantizationType.TQ1_0,
     GGMLQuantizationType.TQ2_0,
+    GGMLQuantizationType.TQ3_1S,
+    GGMLQuantizationType.TQ4_1S,
 }
 
 
@@ -163,7 +166,7 @@ def main() -> None:
     parser.add_argument("input", type=str, help="input GGUF (F16/BF16 source recommended)")
     parser.add_argument("output", type=str, help="output GGUF path")
     parser.add_argument("--expert-type", type=_valid_type, default=GGMLQuantizationType.TQ2_0,
-                        help="routed expert type (default TQ2_0; TQ1_0 and Q2_K are the other 2-bit-class options)")
+                        help="routed expert type (default TQ2_0; TQ1_0, TQ3_1S and Q2_K are the other low-bit options)")
     parser.add_argument("--base-type", type=_valid_type, default=GGMLQuantizationType.Q8_0,
                         help="type for everything else (default Q8_0; use F16 for max quality)")
     parser.add_argument("--router-type", type=_valid_type, default=GGMLQuantizationType.F16,

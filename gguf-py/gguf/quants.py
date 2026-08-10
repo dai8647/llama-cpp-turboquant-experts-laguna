@@ -1137,6 +1137,192 @@ class TQ2_0(__Quant, qtype=GGMLQuantizationType.TQ2_0):
         return (d * qs.astype(np.float32))
 
 
+class TQ3_1S(__Quant, qtype=GGMLQuantizationType.TQ3_1S):
+    # port of quantize_row_tq3_1s_ref / dequantize_row_tq3_1s in ggml-turbo-quant.c
+    # Lloyd-Max centroids for N(0,1); thresholds are the midpoints between them
+    CENTROIDS = np.array([
+        -1.996684, -1.291398, -0.740341, -0.247508,
+         0.230106,  0.725222,  1.277503,  1.988943,
+    ], dtype=np.float32)
+    THRESHOLDS = np.array([-1.644041, -1.015870, -0.493925, -0.008701, 0.477664, 1.001363, 1.633223], dtype=np.float32)
+    # WHT sign pattern, shared with TQ4_1S
+    SIGNS = np.array([
+        +1.0, -1.0, +1.0, -1.0, +1.0, +1.0, -1.0, +1.0,
+        -1.0, -1.0, +1.0, -1.0, +1.0, +1.0, -1.0, +1.0,
+        -1.0, -1.0, +1.0, -1.0, +1.0, -1.0, -1.0, +1.0,
+        -1.0, +1.0, +1.0, -1.0, +1.0, -1.0, -1.0, +1.0,
+    ], dtype=np.float32)
+    INV_SQRT32 = np.float32(0.17677669529663688)
+    SCALES = np.array([0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.35, 1.5], dtype=np.float32)
+
+    @classmethod
+    def _rht_forward(cls, buf: np.ndarray) -> None:
+        # sign flips -> WHT butterfly -> normalize
+        buf *= cls.SIGNS
+        for step in (1, 2, 4, 8, 16):
+            v = buf.reshape(buf.shape[0], -1, 2, step)
+            a = v[..., 0, :].copy()
+            b = v[..., 1, :]
+            v[..., 0, :] = a + b
+            v[..., 1, :] = a - b
+        buf *= cls.INV_SQRT32
+
+    @classmethod
+    def _rht_inverse(cls, buf: np.ndarray) -> None:
+        # WHT butterfly -> normalize + unsign
+        for step in (1, 2, 4, 8, 16):
+            v = buf.reshape(buf.shape[0], -1, 2, step)
+            a = v[..., 0, :].copy()
+            b = v[..., 1, :]
+            v[..., 0, :] = a + b
+            v[..., 1, :] = a - b
+        buf *= cls.INV_SQRT32 * cls.SIGNS
+
+    @staticmethod
+    def _choose_index(val: np.ndarray, centroids: np.ndarray, thresholds: np.ndarray) -> np.ndarray:
+        # nearest centroid, strict-< scan like the C reference
+        return np.searchsorted(thresholds, val, side="right").astype(np.uint8)
+
+    @classmethod
+    def _find_scales(cls, buf: np.ndarray, centroids: np.ndarray, thresholds: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        # per-half RMS, then 9-point scale search + 6 Lloyd-Max refinement iterations
+        sq0 = np.cumsum(buf[:, :16] * buf[:, :16], axis=-1, dtype=np.float32)[:, -1]
+        sq1 = np.cumsum(buf[:, 16:] * buf[:, 16:], axis=-1, dtype=np.float32)[:, -1]
+        rms0 = np.sqrt(sq0 / np.float32(16))
+        rms1 = np.sqrt(sq1 / np.float32(16))
+
+        d0 = rms0[:, None] * cls.SCALES
+        d1 = rms1[:, None] * cls.SCALES
+        with np.errstate(divide="ignore", invalid="ignore"):
+            inv0 = np.where(d0 > np.float32(1e-10), np.float32(1) / d0, np.float32(0))
+            inv1 = np.where(d1 > np.float32(1e-10), np.float32(1) / d1, np.float32(0))
+
+        c0 = centroids[cls._choose_index(buf[:, :16, None] * inv0[:, None, :], centroids, thresholds)]
+        c1 = centroids[cls._choose_index(buf[:, 16:, None] * inv1[:, None, :], centroids, thresholds)]
+        diff = np.concatenate([buf[:, :16, None] - c0 * d0[:, None, :],
+                               buf[:, 16:, None] - c1 * d1[:, None, :]], axis=1)
+        err = np.cumsum(diff * diff, axis=1, dtype=np.float32)[:, -1, :]
+        best = np.argmin(err, axis=-1)
+        best_d0 = np.take_along_axis(d0, best[:, None], axis=-1)[:, 0]
+        best_d1 = np.take_along_axis(d1, best[:, None], axis=-1)[:, 0]
+
+        for _ in range(6):
+            with np.errstate(divide="ignore", invalid="ignore"):
+                inv0 = np.where(best_d0 > np.float32(1e-10), np.float32(1) / best_d0, np.float32(0))
+                inv1 = np.where(best_d1 > np.float32(1e-10), np.float32(1) / best_d1, np.float32(0))
+            c0 = centroids[cls._choose_index(buf[:, :16] * inv0[:, None], centroids, thresholds)]
+            c1 = centroids[cls._choose_index(buf[:, 16:] * inv1[:, None], centroids, thresholds)]
+            num0 = np.cumsum(buf[:, :16] * c0, axis=-1, dtype=np.float32)[:, -1]
+            den0 = np.cumsum(c0 * c0, axis=-1, dtype=np.float32)[:, -1]
+            num1 = np.cumsum(buf[:, 16:] * c1, axis=-1, dtype=np.float32)[:, -1]
+            den1 = np.cumsum(c1 * c1, axis=-1, dtype=np.float32)[:, -1]
+            with np.errstate(divide="ignore", invalid="ignore"):
+                best_d0 = np.where(den0 > np.float32(1e-10), num0 / den0, best_d0)
+                best_d1 = np.where(den1 > np.float32(1e-10), num1 / den1, best_d1)
+
+        return best_d0, best_d1
+
+    @classmethod
+    def quantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        n_blocks = blocks.shape[0]
+        buf = blocks.astype(np.float32, copy=True)
+        cls._rht_forward(buf)
+        best_d0, best_d1 = cls._find_scales(buf, cls.CENTROIDS, cls.THRESHOLDS)
+
+        with np.errstate(divide="ignore", invalid="ignore"):
+            inv0 = np.where(best_d0 > np.float32(1e-10), np.float32(1) / best_d0, np.float32(0))
+            inv1 = np.where(best_d1 > np.float32(1e-10), np.float32(1) / best_d1, np.float32(0))
+        inv = np.concatenate([np.repeat(inv0[:, None], 16, axis=1), np.repeat(inv1[:, None], 16, axis=1)], axis=-1)
+        idx = cls._choose_index(buf * inv, cls.CENTROIDS, cls.THRESHOLDS)
+
+        d = np.stack([best_d0, best_d1], axis=-1).astype(np.float16).view(np.uint8)
+
+        # pack 3-bit indices, 4 groups of 8 indices into 3 bytes each
+        i = idx.reshape(n_blocks, 4, 8).astype(np.uint16)
+        qp0 = (i[..., 0] & 7) | ((i[..., 1] & 7) << 3) | ((i[..., 2] & 3) << 6)
+        qp1 = ((i[..., 2] >> 2) & 1) | ((i[..., 3] & 7) << 1) | ((i[..., 4] & 7) << 4) | ((i[..., 5] & 1) << 7)
+        qp2 = ((i[..., 5] >> 1) & 3) | ((i[..., 6] & 7) << 2) | ((i[..., 7] & 7) << 5)
+        qs = np.stack([qp0, qp1, qp2], axis=-1).astype(np.uint8).reshape(n_blocks, 12)
+
+        return np.concatenate([d, qs], axis=-1)
+
+    @classmethod
+    def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        n_blocks = blocks.shape[0]
+
+        d, qs = np.hsplit(blocks, [4])
+        d = d.view(np.float16).astype(np.float32)
+        d0 = d[:, 0:1]
+        d1 = d[:, 1:2]
+
+        # unpack 3-bit indices (uint16 to mirror C integer promotion)
+        u = qs.reshape(n_blocks, 4, 3).astype(np.uint16)
+        idx = np.empty((n_blocks, 4, 8), dtype=np.uint8)
+        idx[..., 0] = u[..., 0] & 7
+        idx[..., 1] = (u[..., 0] >> 3) & 7
+        idx[..., 2] = ((u[..., 0] >> 6) | (u[..., 1] << 2)) & 7
+        idx[..., 3] = (u[..., 1] >> 1) & 7
+        idx[..., 4] = (u[..., 1] >> 4) & 7
+        idx[..., 5] = ((u[..., 1] >> 7) | (u[..., 2] << 1)) & 7
+        idx[..., 6] = (u[..., 2] >> 2) & 7
+        idx[..., 7] = (u[..., 2] >> 5) & 7
+
+        inv = np.concatenate([np.repeat(d0, 16, axis=1), np.repeat(d1, 16, axis=1)], axis=-1)
+        buf = cls.CENTROIDS[idx.reshape(n_blocks, 32)] * inv
+        cls._rht_inverse(buf)
+        return buf
+
+
+class TQ4_1S(__Quant, qtype=GGMLQuantizationType.TQ4_1S):
+    # port of quantize_row_tq4_1s_ref / dequantize_row_tq4_1s in ggml-turbo-quant.c
+    CENTROIDS = np.array([
+        -2.732590, -2.069017, -1.618046, -1.256231,
+        -0.942340, -0.656759, -0.388048, -0.128395,
+         0.128395,  0.388048,  0.656759,  0.942340,
+         1.256231,  1.618046,  2.069017,  2.732590,
+    ], dtype=np.float32)
+    THRESHOLDS = np.array([-2.400804, -1.843532, -1.437139, -1.099286, -0.799550, -0.522404, -0.258222, 0.0,
+                            0.258222,  0.522404,  0.799550,  1.099286,  1.437139,  1.843532,  2.400804], dtype=np.float32)
+
+    @classmethod
+    def quantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        n_blocks = blocks.shape[0]
+        buf = blocks.astype(np.float32, copy=True)
+        TQ3_1S._rht_forward(buf)
+        best_d0, best_d1 = TQ3_1S._find_scales(buf, cls.CENTROIDS, cls.THRESHOLDS)
+
+        with np.errstate(divide="ignore", invalid="ignore"):
+            inv0 = np.where(best_d0 > np.float32(1e-10), np.float32(1) / best_d0, np.float32(0))
+            inv1 = np.where(best_d1 > np.float32(1e-10), np.float32(1) / best_d1, np.float32(0))
+        inv = np.concatenate([np.repeat(inv0[:, None], 16, axis=1), np.repeat(inv1[:, None], 16, axis=1)], axis=-1)
+        idx = TQ3_1S._choose_index(buf * inv, cls.CENTROIDS, cls.THRESHOLDS)
+
+        d = np.stack([best_d0, best_d1], axis=-1).astype(np.float16).view(np.uint8)
+
+        # nibble-pack 4-bit indices
+        i = idx.reshape(n_blocks, 16, 2)
+        qs = (i[..., 0] | (i[..., 1] << np.uint8(4))).reshape(n_blocks, 16)
+
+        return np.concatenate([d, qs], axis=-1)
+
+    @classmethod
+    def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        n_blocks = blocks.shape[0]
+
+        d, qs = np.hsplit(blocks, [4])
+        d = d.view(np.float16).astype(np.float32)
+        d0 = d[:, 0:1]
+        d1 = d[:, 1:2]
+
+        qs = qs.reshape(n_blocks, 16, 1) >> np.array([0, 4], dtype=np.uint8).reshape(1, 1, 2)
+        idx = (qs & np.uint8(0x0F)).reshape(n_blocks, 32)
+
+        inv = np.concatenate([np.repeat(d0, 16, axis=1), np.repeat(d1, 16, axis=1)], axis=-1)
+        buf = cls.CENTROIDS[idx] * inv
+        TQ3_1S._rht_inverse(buf)
+        return buf
+
+
 class MXFP4(__Quant, qtype=GGMLQuantizationType.MXFP4):
     # e2m1 values (doubled)
     # ref: https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf
