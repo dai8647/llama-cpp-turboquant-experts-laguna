@@ -24,8 +24,16 @@
  * -Wmissing-prototypes under upstream CI's -Werror policy). */
 GGML_API void turbo_cpu_fwht_inverse(float * x, int group_size);
 
-/* Global: WHT group size for CPU quantize path (set by CPU SET_ROWS handler) */
-GGML_API int turbo3_cpu_wht_group_size = 0;
+/* Pure function: WHT group size for a row of k elements. The group size used to
+ * be a process global set by the CPU SET_ROWS handler; that leaked the first
+ * cache's value into every later quantize call (draft caches). Deriving it from
+ * k alone is deterministic and matches the SET_ROWS value (128 with
+ * zero-padding, see llama-kv-cache.cpp). */
+static int turbo_wht_group_size(int64_t k) {
+    int group_size = (k % 128 == 0) ? 128 : 64;
+    if (k % group_size != 0) group_size = (group_size == 128) ? 64 : 128;
+    return group_size;
+}
 
 /* ---------- constants ---------- */
 
@@ -276,14 +284,8 @@ GGML_API void turbo_cpu_fwht_inverse(float * x, int group_size) {
 void quantize_row_turbo3_0_ref(const float * GGML_RESTRICT x, block_turbo3_0 * GGML_RESTRICT y, int64_t k) {
     assert(k % QK_TURBO3 == 0);
 
-    // Read WHT group size from global (set by CPU SET_ROWS handler before each call).
-    // Fallback: 128 if row is 128-aligned, else 64.
-    extern int turbo3_cpu_wht_group_size;
-    int group_size = turbo3_cpu_wht_group_size;
-    if (group_size != 64 && group_size != 128) {
-        group_size = (k % 128 == 0) ? 128 : 64;
-    }
-    if (k % group_size != 0) group_size = (group_size == 128) ? 64 : 128;
+    // WHT group size derived from k; no process-global state
+    int group_size = turbo_wht_group_size(k);
     assert(k % group_size == 0);
 
     const int n_groups = k / group_size;
@@ -373,12 +375,7 @@ size_t quantize_turbo3_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT d
 void quantize_row_turbo2_0_ref(const float * GGML_RESTRICT x, block_turbo2_0 * GGML_RESTRICT y, int64_t k) {
     assert(k % QK_TURBO2 == 0);
 
-    extern int turbo3_cpu_wht_group_size;
-    int group_size = turbo3_cpu_wht_group_size;
-    if (group_size != 64 && group_size != 128) {
-        group_size = (k % 128 == 0) ? 128 : 64;
-    }
-    if (k % group_size != 0) group_size = (group_size == 128) ? 64 : 128;
+    int group_size = turbo_wht_group_size(k);
     assert(k % group_size == 0);
 
     const int n_groups = k / group_size;

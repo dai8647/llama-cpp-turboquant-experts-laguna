@@ -869,6 +869,20 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
+// TQ3_1S fused mul_mat kernel: disabled on CUDA - it diverges ~2%/layer on
+// real DeepSeek-V4-Flash weights (eval-callback node-diffing vs CPU oracle).
+// On ROCm (gfx1100) the same kernel is bit-correct and ~33% faster than the
+// dequant+cuBLAS fallback (PPL identical), so HIP builds keep it enabled.
+// TQ3_FUSE_OFF=1 forces the dequant+cuBLAS fallback on any backend.
+static bool tq3_1s_fuse_enabled() {
+#if defined(GGML_USE_HIP)
+    static const bool fuse_off = getenv("TQ3_FUSE_OFF") != nullptr;
+    return !fuse_off;
+#else
+    return false;
+#endif
+}
+
 // TQ4_1S load-time q8_0 conversion: ON by default for best prefill speed.
 // Native TQ4_1S decode is faster (+29-33%) but prefill is 2× slower because
 // cuBLAS dequant-to-f16 requires per-element inverse WHT.
@@ -2068,33 +2082,14 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // stride-aware cuBLAS fallback below, which dequantizes TQ via ggml_get_to_fp16_cuda.
     const bool tq_fast_path_ok = ggml_is_contiguous(src1) && ggml_is_contiguous(dst);
 
-    // GGML_TYPE_TQ3_1S: the fused warp-scalar kernel (mul_mat_tq3_1s_multi /
-    // tq_prerotate_activation in mmvq-tq.cu) is disabled here pending a fix.
-    // Root-caused via eval-callback node-diffing on DeepSeek-V4-Flash (real
-    // TQ3_1S attn/ffn weights, CUDA vs CPU-oracle): output for some MUL_MAT
-    // nodes (e.g. blk.N.attn_q_a, a 4096->1024 low-rank bottleneck) diverges
-    // ~2%/layer, compounding over 61 layers into incoherent generation on
-    // CUDA (coherent on CPU/Metal). The math of the fused kernel (per-block
-    // WHT rotation + centroid dot product) was verified bit-for-bit
-    // equivalent to the (known-correct) dequantize_tq3_1s inverse-WHT used
-    // by the cuBLAS fallback, and switching the pre-rotated activation
-    // buffer from half to float (removing one candidate precision loss)
-    // made no measurable difference — so this is very likely a reduction-
-    // order/cancellation sensitivity in the kernel's per-lane accumulation
-    // for real (non-synthetic) weight/activation distributions rather than
-    // a simple indexing bug: test-backend-ops MUL_MAT cases at the exact
-    // failing shape (tq3_1s, m=1024, n=8, k=4096) pass with random data.
-    // Disabling *only* TQ3_1S here (confirmed via a direct A/B on the CUDA0
-    // repro: forcing all TQ mul_mats through cuBLAS restores coherent
-    // output) routes it to the verified-correct dequant+cuBLAS path below.
-    // TQ4_1S (dp4a and the AMD scalar variant) is untouched — no model on
-    // hand uses it and there's no evidence it shares this bug, so the fast
-    // path stays enabled for that type to avoid regressing existing users.
-    const bool tq3_1s_fused_disabled = (src0->type == GGML_TYPE_TQ3_1S);
+    // GGML_TYPE_TQ3_1S fused kernel: disabled on CUDA (diverges on real DSv4
+    // weights), enabled on ROCm where it is verified bit-correct and ~33%
+    // faster. See tq3_1s_fuse_enabled for details and the escape hatch.
+    const bool tq3_1s_fused_disabled = (src0->type == GGML_TYPE_TQ3_1S) && !tq3_1s_fuse_enabled();
 
     if (is_tq_weight && tq_fast_path_ok && !tq3_1s_fused_disabled && ne11 <= MMVQ_MAX_BATCH_SIZE) {
         // Fused TQ weight mul_mat with pre-rotated activations via warp shuffle WHT
-        // Handles ne[1]=1 (decode) and ne[1]≤8 (multi-token / speculative decoding)
+        // Handles ne[1]=1 (decode) and ne[1]<=8 (multi-token / speculative decoding)
         ggml_cuda_mul_mat_tq(ctx, src0, src1, dst);
         return;
     }
