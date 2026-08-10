@@ -5,6 +5,17 @@
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
 
+// #25618: keep speculative-sized (multi-token verify) batches on the same FA
+// kernel family as single-token decode so greedy spec verify stays lossless.
+// Set GGML_CUDA_FA_SPEC_INVARIANT=0 to restore the old per-batch selection.
+static bool fa_spec_invariant_enabled() {
+    static const bool enabled = []() {
+        const char * env = getenv("GGML_CUDA_FA_SPEC_INVARIANT");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -612,7 +623,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         if (can_use_vector_kernel && Q->ne[1] * gqa_ratio_eff <= 2) {
             return BEST_FATTN_KERNEL_VEC;
         }
-        if (Q->ne[1] * gqa_ratio_eff <= 16) {
+        // spec-sized batches (nq <= 8, e.g. 1 + n_draft) must stay on the TILE
+        // kernel that single-token decode uses; otherwise MMA vs TILE round
+        // differently on quantized weights and greedy verify diverges (#25618)
+        if (Q->ne[1] * gqa_ratio_eff <= 16 || (fa_spec_invariant_enabled() && Q->ne[1] <= 8)) {
             return BEST_FATTN_KERNEL_TILE; // On Volta tensor cores are only faster for sufficiently large matrices.
         }
         return BEST_FATTN_KERNEL_MMA_F16;
