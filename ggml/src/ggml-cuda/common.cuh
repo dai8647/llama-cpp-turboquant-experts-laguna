@@ -111,6 +111,14 @@
 #    define GGML_CUDA_USE_CUB
 #endif  // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11070
 
+// hipcub provides the CUB API on ROCm/HIP, keeping top_k/argsort on the GPU
+// for long score columns instead of falling back to CPU (llama.cpp #26399)
+#if defined(GGML_USE_HIP) && defined(__has_include)
+#    if __has_include(<hipcub/hipcub.hpp>)
+#        define GGML_CUDA_USE_HIPCUB
+#    endif  // __has_include(<hipcub/hipcub.hpp>)
+#endif      // defined(GGML_USE_HIP) && defined(__has_include)
+
 // PDL host-side support (cudaLaunchKernelEx) requires CUDART >= 11.8.
 // However, this has been bugged in CTK < 12.3 for MSVC builds, see
 // https://github.com/ggml-org/llama.cpp/pull/22522#discussion_r3302393293
