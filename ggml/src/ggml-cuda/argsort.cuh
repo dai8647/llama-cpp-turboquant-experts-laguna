@@ -12,6 +12,17 @@ void argsort_f32_i32_cuda_cub(ggml_cuda_pool & pool,
                               ggml_sort_order  order,
                               cudaStream_t     stream);
 #endif  // GGML_CUDA_USE_CUB
+
+#ifdef GGML_CUDA_USE_HIPCUB
+int argsort_f32_i32_cuda_hipcub_chunk_nrows(const size_t nb01, const int64_t nrows);
+void argsort_f32_i32_cuda_hipcub(ggml_cuda_pool & pool,
+                                 const float *    x,
+                                 int *            dst,
+                                 const int        ncols,
+                                 const int        nrows,
+                                 ggml_sort_order  order,
+                                 cudaStream_t     stream);
+#endif  // GGML_CUDA_USE_HIPCUB
 void argsort_f32_i32_cuda_bitonic(const float *   x,
                                   int *           dst,
                                   const int       ncols,
