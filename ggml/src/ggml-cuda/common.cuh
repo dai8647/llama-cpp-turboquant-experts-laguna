@@ -112,7 +112,8 @@
 #endif  // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11070
 
 // hipcub provides the CUB API on ROCm/HIP, keeping top_k/argsort on the GPU
-// for long score columns instead of falling back to CPU (llama.cpp #26399)
+// instead of falling back to CPU (llama.cpp #26399) or crashing on the bitonic
+// kernel's shared-memory limit (llama.cpp #24177)
 #if defined(GGML_USE_HIP) && defined(__has_include)
 #    if __has_include(<hipcub/hipcub.hpp>)
 #        define GGML_CUDA_USE_HIPCUB
