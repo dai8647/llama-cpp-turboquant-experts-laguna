@@ -41,7 +41,7 @@ static void top_k_cub(ggml_cuda_pool & pool,
                          ncols, k, env));
 }
 
-#elif defined(GGML_CUDA_USE_CUB) || defined(GGML_CUDA_USE_HIPCUB)  // CUB_TOP_K_AVAILABLE
+#elif defined(GGML_CUDA_USE_CUB)  // CUB_TOP_K_AVAILABLE
 
 static int next_power_of_2(int x) {
     int n = 1;
@@ -101,12 +101,9 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         dst_d  += k     * iter_nrows;
     }
 #elif defined(GGML_CUDA_USE_HIPCUB)  // CUB_TOP_K_AVAILABLE
-    // Fall back to argsort + copy
-    const int    ncols_pad      = next_power_of_2(ncols);
-    const size_t shared_mem     = ncols_pad * sizeof(int);
-    const size_t max_shared_mem = ggml_cuda_info().devices[ggml_cuda_get_device()].smpb;
-    const bool   use_bitonic    = shared_mem <= max_shared_mem && ncols <= 1024;
-    const int    chunk_nrows    = argsort_f32_i32_cuda_hipcub_chunk_nrows(src0->nb[1], nrows);
+    // Fall back to argsort + copy; always use hipcub on HIP, the bitonic kernel
+    // needs more shared memory than AMD GPUs provide (llama.cpp #24177)
+    const int chunk_nrows = argsort_f32_i32_cuda_hipcub_chunk_nrows(src0->nb[1], nrows);
 
     ggml_cuda_pool_alloc<int> temp_dst_alloc(pool, ncols * chunk_nrows);
     int *                     tmp_dst = temp_dst_alloc.get();
@@ -114,11 +111,7 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     for (int64_t i = 0; i < nrows; i += chunk_nrows) {
         int iter_nrows = std::min((int64_t) chunk_nrows, nrows - i);
 
-        if (use_bitonic) {
-            argsort_f32_i32_cuda_bitonic(src0_d, tmp_dst, ncols, iter_nrows, GGML_SORT_ORDER_DESC, stream);
-        } else {
-            argsort_f32_i32_cuda_hipcub(pool, src0_d, tmp_dst, ncols, iter_nrows, GGML_SORT_ORDER_DESC, stream);
-        }
+        argsort_f32_i32_cuda_hipcub(pool, src0_d, tmp_dst, ncols, iter_nrows, GGML_SORT_ORDER_DESC, stream);
         CUDA_CHECK(cudaMemcpy2DAsync(dst_d, k * sizeof(int), tmp_dst, ncols * sizeof(int), k * sizeof(int), iter_nrows,
                                      cudaMemcpyDeviceToDevice, stream));
 

@@ -704,8 +704,20 @@ static std::vector<llama_kv_cache_dsv4_context::comp_plan> dsv4_build_comp_plans
     std::vector<llama_kv_cache_dsv4_context::comp_plan> plans;
     plans.reserve(ubatches.size());
 
+    // The first ubatch touching a seq consumes its pending rollback restore.
+    // Otherwise the restore is re-applied in every ubatch the seq spans, which
+    // reverts ring rows written by earlier ubatches and poisons the compressed
+    // caches (#26741).
+    std::vector<uint32_t> rs(rs_idx);
     for (const llama_ubatch & ubatch : ubatches) {
-        plans.push_back(dsv4_build_comp_plan(ubatch, ratio, overlap, state_size, kv_size, n_stream, n_rs_seq, rs_idx));
+        plans.push_back(dsv4_build_comp_plan(ubatch, ratio, overlap, state_size, kv_size, n_stream, n_rs_seq, rs));
+
+        for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
+            const llama_seq_id seq_id = ubatch.seq_id_unq[s];
+            if (seq_id >= 0 && (size_t) seq_id < rs.size()) {
+                rs[seq_id] = 0;
+            }
+        }
     }
 
     return plans;
@@ -1433,6 +1445,11 @@ bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
             return false;
         }
 
+        // pending rollback is single-use: stacked partial removals don't compose
+        if (rs_idx[seq_id] != 0) {
+            return false;
+        }
+
         const bool res = kv_raw->seq_rm(seq_id, p0, p1);
         if (res) {
             rs_idx[seq_id] = (uint32_t) rollback;
@@ -1594,9 +1611,9 @@ void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     kv_raw->state_read(io, seq_id, flags);
 
     if (!partial_only) {
-        kv_csa->clear(true);
-        kv_hca->clear(true);
-        kv_lid->clear(true);
+        // seq-scoped: restoring one seq must not wipe the compressed caches
+        // of the other sequences (llama.cpp #26777)
+        clear_compressed(seq_id, true);
 
         dsv4_state_read_k_cache(io, kv_csa.get(), seq_id, flags);
         dsv4_state_read_k_cache(io, kv_hca.get(), seq_id, flags);

@@ -669,6 +669,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_lid_top_k(
             indexer_weights->nb[1], indexer_weights->nb[2]/n_stream, indexer_weights->nb[3]/n_stream, 0);
 
     ggml_tensor * indexer_score = nullptr;
+    bool indexer_reduced = false; // true when the unfused chunked path already returned top-k indices
     if (cparams.fused_lid) {
         indexer_score = ggml_lightning_indexer(ctx0, indexer_q, indexer_k, indexer_weights, inp_lid.kq_mask);
         cb(indexer_score, "lid_score_masked", il);
@@ -676,27 +677,89 @@ ggml_tensor * llama_model_deepseek4::graph::build_lid_top_k(
     } else {
         indexer_q = ggml_permute(ctx0, indexer_q, 0, 2, 1, 3);
         cb(indexer_q, "lid_q", il);
-        indexer_k = ggml_permute(ctx0, indexer_k, 0, 2, 1, 3);
-        cb(indexer_k, "lid_k", il);
 
-        ggml_tensor * indexer_kq = ggml_mul_mat(ctx0, indexer_k, indexer_q);
-        cb(indexer_kq, "lid_kq", il);
+        const int64_t n_lid = inp_lid.kq_mask->ne[0];
 
-        indexer_kq = ggml_cont(ctx0, ggml_permute(ctx0, indexer_kq, 2, 1, 0, 3));
-        cb(indexer_kq, "lid_kq", il);
+        // Backends without the fused op (Vulkan, SYCL) materialise the full
+        // [n_kv x n_head x n_tokens] score matrix, which is ctx-proportional
+        // (4 GiB/layer at 131072 ctx, llama.cpp #25468). For large n_lid, score
+        // in row windows with per-window top-k + exact merge to bound memory:
+        // the global top-k is always inside the union of the per-window top-k.
+        constexpr int64_t LID_SCORE_CHUNK = 8192;
 
-        indexer_score = ggml_relu(ctx0, indexer_kq);
-        indexer_score = ggml_mul(ctx0, indexer_score, indexer_weights);
-        indexer_score = ggml_sum_rows(ctx0, indexer_score);
-        indexer_score = ggml_cont(ctx0, ggml_permute(ctx0, indexer_score, 2, 1, 0, 3));
-        cb(indexer_score, "lid_score", il);
+        if (n_lid <= 2*LID_SCORE_CHUNK) {
+            ggml_tensor * indexer_k_p = ggml_permute(ctx0, indexer_k, 0, 2, 1, 3);
+            cb(indexer_k_p, "lid_k", il);
 
-        indexer_score = ggml_add(ctx0, indexer_score, inp_lid.kq_mask);
-        cb(indexer_score, "lid_score_masked", il);
+            ggml_tensor * indexer_kq = ggml_mul_mat(ctx0, indexer_k_p, indexer_q);
+            cb(indexer_kq, "lid_kq", il);
+
+            indexer_kq = ggml_cont(ctx0, ggml_permute(ctx0, indexer_kq, 2, 1, 0, 3));
+            cb(indexer_kq, "lid_kq", il);
+
+            indexer_score = ggml_relu(ctx0, indexer_kq);
+            indexer_score = ggml_mul(ctx0, indexer_score, indexer_weights);
+            indexer_score = ggml_sum_rows(ctx0, indexer_score);
+            indexer_score = ggml_cont(ctx0, ggml_permute(ctx0, indexer_score, 2, 1, 0, 3));
+            cb(indexer_score, "lid_score", il);
+
+            indexer_score = ggml_add(ctx0, indexer_score, inp_lid.kq_mask);
+            cb(indexer_score, "lid_score_masked", il);
+        } else {
+            const uint32_t n_top_k = n_lid < (int64_t) hparams.indexer_top_k ? (uint32_t) n_lid : hparams.indexer_top_k;
+
+            ggml_tensor * row_ids = ggml_reshape_4d(ctx0, ggml_arange(ctx0, 0.0f, (float) n_lid, 1.0f), n_lid, 1, 1, 1);
+            cb(row_ids, "lid_row_ids", il);
+
+            ggml_tensor * scores_cat = nullptr;
+            ggml_tensor * ids_cat    = nullptr;
+
+            for (int64_t off = 0; off < n_lid; off += LID_SCORE_CHUNK) {
+                const int64_t n_chunk_rows = n_lid - off < LID_SCORE_CHUNK ? n_lid - off : LID_SCORE_CHUNK;
+
+                ggml_tensor * k_chunk = ggml_view_4d(ctx0, indexer_k,
+                        indexer_k->ne[0], indexer_k->ne[1], n_chunk_rows, indexer_k->ne[3],
+                        indexer_k->nb[1], indexer_k->nb[2], indexer_k->nb[3], off*indexer_k->nb[2]);
+                ggml_tensor * m_chunk = ggml_view_4d(ctx0, inp_lid.kq_mask,
+                        n_chunk_rows, inp_lid.kq_mask->ne[1], inp_lid.kq_mask->ne[2], inp_lid.kq_mask->ne[3],
+                        inp_lid.kq_mask->nb[1], inp_lid.kq_mask->nb[2], inp_lid.kq_mask->nb[3], off*inp_lid.kq_mask->nb[1]);
+
+                ggml_tensor * s = ggml_mul_mat(ctx0, ggml_permute(ctx0, k_chunk, 0, 2, 1, 3), indexer_q);
+                s = ggml_cont(ctx0, ggml_permute(ctx0, s, 2, 1, 0, 3));
+                s = ggml_relu(ctx0, s);
+                s = ggml_mul(ctx0, s, indexer_weights);
+                s = ggml_sum_rows(ctx0, s);
+                s = ggml_cont(ctx0, ggml_permute(ctx0, s, 2, 1, 0, 3));
+                s = ggml_add(ctx0, s, m_chunk);
+                cb(s, "lid_score_masked", il);
+
+                const uint32_t k_chunk_k = n_chunk_rows < (int64_t) n_top_k ? (uint32_t) n_chunk_rows : n_top_k;
+                ggml_tensor * topk_local = ggml_top_k(ctx0, s, k_chunk_k);
+                cb(topk_local, "lid_top_k_local", il);
+
+                ggml_tensor * ids_chunk = ggml_get_rows(ctx0,
+                        ggml_view_4d(ctx0, row_ids, n_chunk_rows, 1, 1, 1,
+                            row_ids->nb[1], row_ids->nb[2], row_ids->nb[3], off*row_ids->nb[1]),
+                        topk_local);
+                ggml_tensor * scores_chunk = ggml_get_rows(ctx0, s, topk_local);
+
+                scores_cat = scores_cat ? ggml_concat(ctx0, scores_cat, scores_chunk, 0) : scores_chunk;
+                ids_cat    = ids_cat    ? ggml_concat(ctx0, ids_cat,    ids_chunk,    0) : ids_chunk;
+            }
+
+            ggml_tensor * rank = ggml_top_k(ctx0, scores_cat, n_top_k);
+            cb(rank, "lid_rank", il);
+
+            indexer_score = ggml_cont(ctx0, ggml_cast(ctx0, ggml_get_rows(ctx0, ids_cat, rank), GGML_TYPE_I32));
+            indexer_reduced = true;
+        }
     }
 
-    const uint32_t n_top_k = indexer_score->ne[0] < hparams.indexer_top_k ? indexer_score->ne[0] : hparams.indexer_top_k;
-    ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, indexer_score, n_top_k));
+    ggml_tensor * top_k = indexer_score;
+    if (!indexer_reduced) {
+        const uint32_t n_top_k = indexer_score->ne[0] < hparams.indexer_top_k ? indexer_score->ne[0] : hparams.indexer_top_k;
+        top_k = ggml_cont(ctx0, ggml_top_k(ctx0, indexer_score, n_top_k));
+    }
     cb(top_k, "lid_top_k", il);
 
     return top_k;
