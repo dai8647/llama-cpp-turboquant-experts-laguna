@@ -11973,6 +11973,11 @@ kernel void kernel_mul_mm(
     const int ra = tgpig.y * NRA;
     const int rb = tgpig.x * NRB;
 
+    // fully out-of-range tiles must not read src1 or write past dst
+    if (ra >= M || rb >= N) {
+        return;
+    }
+
     // Threadgroup memory for dequantized A tile only
     threadgroup SA * sa = (threadgroup SA *)(shmem);
 
