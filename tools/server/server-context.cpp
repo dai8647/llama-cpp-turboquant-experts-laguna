@@ -991,7 +991,29 @@ private:
 
     int64_t t_last_load_progress_ms = 0;
 
+    // Pass 1 of the MoE frequency workflow: write the access statistics report
+    // before the llama_context is freed. Called on normal shutdown and when the
+    // server enters the sleeping state (idle unload). No-op unless an output
+    // path was requested via --moe-freq-report-out (or the deprecated
+    // --moe-freq-report-path alias).
+    void save_moe_freq_report_if_requested() {
+        if (ctx_tgt == nullptr || model_tgt == nullptr) {
+            return;
+        }
+        const std::string & out = !params_base.moe_freq_report_out.empty()
+            ? params_base.moe_freq_report_out
+            : params_base.moe_freq_report_path;
+        if (out.empty()) {
+            return;
+        }
+        SRV_INF("%s: writing MoE frequency report to %s\n", __func__, out.c_str());
+        if (!llama_save_moe_freq_report(ctx_tgt, out.c_str())) {
+            SRV_WRN("%s: failed to write MoE frequency report to %s (see stderr for details)\n", __func__, out.c_str());
+        }
+    }
+
     void destroy() {
+        save_moe_freq_report_if_requested();
         spec.reset();
         spec_init.reset();
 
