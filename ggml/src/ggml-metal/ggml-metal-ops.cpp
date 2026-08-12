@@ -2553,8 +2553,11 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
             ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
 
             const size_t smem = pipeline_mm.smem;
+            const int nr0 = pipeline_mm.nr0;
+            const int nr1 = pipeline_mm.nr1;
+            const int nsg = pipeline_mm.nsg;
             ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
-            ggml_metal_encoder_dispatch_threadgroups(enc, ((ne11 + 31)/32), ((ne01 + 63)/64), ne12*ne13, 128, 1, 1);
+            ggml_metal_encoder_dispatch_threadgroups(enc, ((ne11 + nr1 - 1)/nr1), ((ne01 + nr0 - 1)/nr0), ne12*ne13, 32, nsg, 1);
 
             // Memory barrier between matmul and unrotate
             ggml_metal_op_concurrency_reset(ctx);

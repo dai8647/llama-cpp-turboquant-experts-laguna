@@ -308,6 +308,13 @@ K150 には MTP ヘッドがなく、DSpark ドラフターも
 
 のため、投機デコードは使えません。帯域律速下では逆効果です。
 
+##### 手順 4: スレッド数とビルド
+
+- 帯域律速では SMT は効きません。`-t 6` (物理コア数) を明示
+- 7800 XT は `gfx1101` (Navi 32)。ビルド時 `-DAMDGPU_TARGETS=gfx1101` で HIP ビルドが
+  必要 (デフォルトターゲットだとカーネルが無効化され全層 CPU に落ちる。
+  gfx1100 は 7900 XTX 用なので間違えない)
+
 ##### 期待値 (Ryzen 5500 + 7800 XT 16GB の場合)
 
 | 設定 / Setup | Generation t/s (実測) |
@@ -371,6 +378,12 @@ Measured on Ryzen 5500 + RX 7800 XT 16GB, Q3_K_M:
 
 K150 has no MTP head, and DSpark drafters cannot help either (see the caveat
 above). Under bandwidth-bound conditions they only make things slower.
+
+##### Step 4: threads and build
+
+- SMT does not help a bandwidth-bound loop: pass `-t 6` (physical cores)
+- RX 7800 XT (Navi 32) needs a HIP build with `-DAMDGPU_TARGETS=gfx1101`; a generic
+  build falls back all layers to CPU (gfx1100 is for the 7900 XTX)
 
 ##### Expected results (Ryzen 5500 + 7800 XT 16 GB)
 
@@ -477,7 +490,7 @@ Use the GGUFs above, or convert the bf16 base with this fork's
 set PATH=C:\Program Files\AMD\ROCm\7.1\bin;%PATH%
 set ROCM_PATH=C:\Program Files\AMD\ROCm\7.1
 
-cmake -S . -B build-hip -G Ninja -DGPU_TARGETS=gfx1100 -DGGML_HIP=ON -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake -S . -B build-hip -G Ninja -DGPU_TARGETS=gfx1101 -DGGML_HIP=ON -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cmake --build build-hip --config RelWithDebInfo -j
 ```
 
@@ -486,7 +499,7 @@ cmake --build build-hip --config RelWithDebInfo -j
 ```bash
 HIPCXX="$(hipconfig -l)/clang" HIP_PATH="$(hipconfig -R)" \
   cmake -B build-rocm -DGGML_HIP=ON -DCMAKE_BUILD_TYPE=Release \
-        -DAMDGPU_TARGETS="gfx942"   # お使いの GPU に合わせる (e.g. gfx1100)
+        -DAMDGPU_TARGETS="gfx942"   # お使いの GPU に合わせる (7800 XT は gfx1101 / 7900 XTX は gfx1100)
 cmake --build build-rocm -j$(nproc) --target llama-server
 ```
 
