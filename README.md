@@ -236,6 +236,37 @@ method applied at model **creation** time; it is not a runtime feature. The K160
 GGUF files simply contain 160 routed experts (pruned from 256) and run natively
 as the `deepseek4` architecture with no special flags.
 
+#### MXFP4 対応 / MXFP4 support
+
+MXFP4 (OCP マイクロスケーリング FP4) は本フォークでエンドツーエンドに動作します。
+`GGML_TYPE_MXFP4` は CPU (AVX2 ベクトル化 `ggml_vec_dot_mxfp4_q8_0` + 全アーキ
+quants) と CUDA/HIP (MMQ)、Metal、Vulkan に実装済みで、ビルドフラグ追加は不要です。
+ネイティブ FP4 高速パスは Blackwell (sm_100+) 専用で、7800 XT (gfx1101) では
+汎用 MMQ パス (dequant -> Q8_1) で動作します。
+
+```bash
+# 同じコマンドで MXFP4 GGUF を指定するだけ。KV は TurboQuant のまま
+llama-server -m DeepSeek-V4-Flash-0731-reap-150b-MXFP4_MOE.gguf \
+  -c 32768 -ngl 99 -t 6 --moe-expert-placement frequency \
+  --moe-freq-report-in stats.json --moe-gpu-expert-ratio 0.12 \
+  -ctk turbo4 -ctv turbo4
+```
+
+注意: 150B の MXFP4_MOE は約 85GB あり、Q2_K (62GB) より 37% 多く読むため、
+帯域律速の CPU MoE では Q2_K より遅くなります (品質は V4 ネイティブ形式で最良)。
+96GB RAM 構成では RAM 残量に注意し、`--moe-gpu-expert-ratio` は 0.10-0.12 を目安に。
+
+MXFP4 (OCP microscaling FP4) works end-to-end in this fork. `GGML_TYPE_MXFP4`
+is implemented for CPU (AVX2-vectorized `ggml_vec_dot_mxfp4_q8_0` plus the
+other arch quants), CUDA/HIP (MMQ), Metal and Vulkan; no extra build flags are
+needed. The native FP4 fast path is Blackwell-only (sm_100+); on RX 7800 XT
+(gfx1101) the generic MMQ path (dequant -> Q8_1) is used.
+
+Note: the 150B MXFP4_MOE file is about 85 GB, 37% larger than Q2_K (62 GB), so
+bandwidth-bound CPU MoE is slower than Q2_K (quality is best, being the native
+V4 format). On a 96 GB RAM box keep `--moe-gpu-expert-ratio` around 0.10-0.12
+to avoid running out of memory.
+
 #### K216 GGUF チューニング (16GB VRAM 構成 / K216 GGUF tuning)
 
 `heath0xFF/DeepSeek-V4-Flash-0731-REAP-K216-GGUF` は 256 エキスパート中
