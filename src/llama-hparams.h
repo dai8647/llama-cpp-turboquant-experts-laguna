@@ -57,6 +57,11 @@ struct llama_hparams {
     uint32_t n_expert_used = 0;
     uint32_t n_rel_attn_bkts = 0;
 
+    // longcat-flash-ngram: N-gram input embedding module
+    uint32_t ngram_neighbor_num  = 0; // emb_neighbor_num (n)
+    uint32_t ngram_split_num     = 0; // emb_split_num (k)
+    uint32_t ngram_vocab_ratio   = 0; // ngram_vocab_size_ratio
+
     // TODO: this needs to be reworked
     int32_t  n_layer_kv_from_start = -1; // if non-negative, the first n_layer_kv_from_start layers have KV cache
 

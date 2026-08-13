@@ -146,6 +146,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_TALKIE,           "talkie"           },
     { LLM_ARCH_MELLUM,           "mellum"           },
     { LLM_ARCH_NANBEIGE,         "nanbeige"         },
+    { LLM_ARCH_LONGCAT,          "longcat-flash-ngram" },
     { LLM_ARCH_QWEN3TTS,         "qwen3tts"         },
     { LLM_ARCH_UNKNOWN,          "(unknown)"        },
 };
@@ -206,6 +207,9 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_MOE_EVERY_N_LAYERS,                "%s.moe_every_n_layers"                },
     { LLM_KV_MOE_LATENT_SIZE,                   "%s.moe_latent_size"                   },
     { LLM_KV_NEXTN_PREDICT_LAYERS,              "%s.nextn_predict_layers"              },
+    { LLM_KV_NGRAM_NEIGHBOR_NUM,                "%s.ngram.neighbor_num"                },
+    { LLM_KV_NGRAM_SPLIT_NUM,                   "%s.ngram.split_num"                   },
+    { LLM_KV_NGRAM_VOCAB_SIZE_RATIO,            "%s.ngram.vocab_size_ratio"            },
     { LLM_KV_NUM_DEEPSTACK_LAYERS,              "%s.n_deepstack_layers"                },
     { LLM_KV_DEEPSTACK_MAPPING,                 "%s.deepstack_mapping"                 },
     { LLM_KV_HIDDEN_ACT,                        "%s.hidden_activation"                 },
@@ -625,6 +629,8 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_DSPARK_MARKOV_W1,                       "markov_w1" },
     { LLM_TENSOR_DSPARK_MARKOV_W2,                       "markov_w2" },
     { LLM_TENSOR_DSPARK_CONF_PROJ,                       "conf_proj" },
+    { LLM_TENSOR_NGRAM_EMBD,                             "ngram_embd.%d" },
+    { LLM_TENSOR_NGRAM_PROJ,                             "ngram_proj.%d" },
 };
 
 // declare information about the model weight tensors:
@@ -885,6 +891,8 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_DSPARK_MARKOV_W1,           {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_GET_ROWS}},
     {LLM_TENSOR_DSPARK_MARKOV_W2,           {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
     {LLM_TENSOR_DSPARK_CONF_PROJ,           {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_NGRAM_EMBD,                 {LLM_TENSOR_LAYER_REPEATING, GGML_OP_GET_ROWS}},
+    {LLM_TENSOR_NGRAM_PROJ,                 {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
 };
 
 LLM_KV::LLM_KV(llm_arch arch, const char * suffix) : arch(arch), suffix(suffix) {}

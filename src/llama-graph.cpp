@@ -1638,7 +1638,11 @@ ggml_tensor * llm_graph_context::build_moe_gpu_slot_ids(
     llm_moe_gpu_slot_remap_userdata * remap_ptr = remap.get();
     moe_gpu_slot_remap_userdata.push_back(std::move(remap));
 
-    ggml_tensor * slot_ids = ggml_map_custom1(ctx0, logical_experts, llm_moe_gpu_slot_remap, 1, remap_ptr);
+    // selected_experts can be a non-contiguous view; the remap callback operates
+    // on a flat host tensor, so materialize a contiguous copy first
+    ggml_tensor * contiguous_experts = ggml_cpy(ctx0, logical_experts,
+        ggml_new_tensor_2d(ctx0, logical_experts->type, logical_experts->ne[0], logical_experts->ne[1]));
+    ggml_tensor * slot_ids = ggml_map_custom1(ctx0, contiguous_experts, llm_moe_gpu_slot_remap, 1, remap_ptr);
     cb(slot_ids, "ffn_moe_gpu_slot_ids", il);
 
     return slot_ids;

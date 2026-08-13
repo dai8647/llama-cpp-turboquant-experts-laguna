@@ -630,6 +630,15 @@ struct llama_moe_gpu_expert_cache {
     int64_t n_miss = 0;
     int64_t n_evict = 0;
 
+    // guards all slot/bank state (expert_to_slot, slots_by_layer, banks_by_layer,
+    // compute_tensor_by_src, clock, hit/miss counters). the eval-time slot remap
+    // runs as one ggml_map_custom1 op per MoE layer on the CPU thread pool, so
+    // different layers can mutate the cache concurrently. unsynchronized
+    // unordered_map access corrupts the heap (observed crash inside the
+    // access_mutex lock during record_access). recursive: helpers re-enter.
+    // lock order is always cache_mutex -> access_mutex (one-way, no deadlock).
+    mutable std::recursive_mutex cache_mutex;
+
     // access tracking for frequency stats
     // mutable: written from compute_tensor() (graph build) and read at shutdown; the
     // mutex keeps concurrent graph builds on a shared model from corrupting the bucket array
@@ -646,6 +655,7 @@ struct llama_moe_gpu_expert_cache {
     }
 
     void init(int32_t n) {
+        std::lock_guard<std::recursive_mutex> lock(cache_mutex);
         n_slots = n > 0 ? n : 0;
         slots_by_layer.clear();
         banks_by_layer.clear();
@@ -660,6 +670,7 @@ struct llama_moe_gpu_expert_cache {
     }
 
     bool is_in_frequency_whitelist(int32_t layer_id, int32_t expert_id) const {
+        std::lock_guard<std::recursive_mutex> lock(cache_mutex);
         if (frequency_whitelist.empty()) {
             return true; // no whitelist = full-slot mode
         }
@@ -672,10 +683,12 @@ struct llama_moe_gpu_expert_cache {
     }
 
     void set_frequency_whitelist(const std::vector<std::pair<int32_t, int32_t>>& experts) {
+        std::lock_guard<std::recursive_mutex> lock(cache_mutex);
         frequency_whitelist = experts;
     }
 
     void clear() {
+        std::lock_guard<std::recursive_mutex> lock(cache_mutex);
         for (auto & layer_slots : slots_by_layer) {
             for (auto & slot : layer_slots.second) {
                 slot.clear_storage();
@@ -710,6 +723,7 @@ struct llama_moe_gpu_expert_cache {
 
     void register_compute_tensor(const ggml_tensor * src, ggml_tensor * compute) {
         if (src != nullptr && compute != nullptr) {
+            std::lock_guard<std::recursive_mutex> lock(cache_mutex);
             compute_tensor_by_src[src] = compute;
         }
     }
@@ -718,6 +732,7 @@ struct llama_moe_gpu_expert_cache {
         if (src == nullptr) {
             return nullptr;
         }
+        std::lock_guard<std::recursive_mutex> lock(cache_mutex);
         const auto it = compute_tensor_by_src.find(src);
         if (it == compute_tensor_by_src.end()) {
             return const_cast<ggml_tensor *>(src);
@@ -736,6 +751,7 @@ struct llama_moe_gpu_expert_cache {
     }
 
     bool uses_compute_tensor(const ggml_tensor * src) const {
+        std::lock_guard<std::recursive_mutex> lock(cache_mutex);
         return src != nullptr && compute_tensor_by_src.find(src) != compute_tensor_by_src.end();
     }
 
@@ -804,6 +820,7 @@ struct llama_moe_gpu_expert_cache {
     }
 
     std::vector<llama_moe_gpu_expert_slot> & slots_for_layer(int32_t layer_id) {
+        std::lock_guard<std::recursive_mutex> lock(cache_mutex);
         auto & layer_slots = slots_by_layer[layer_id];
         if ((int32_t) layer_slots.size() != n_slots) {
             layer_slots.resize(n_slots);
@@ -812,6 +829,7 @@ struct llama_moe_gpu_expert_cache {
     }
 
     const std::vector<llama_moe_gpu_expert_slot> * slots_for_layer(int32_t layer_id) const {
+        std::lock_guard<std::recursive_mutex> lock(cache_mutex);
         const auto it = slots_by_layer.find(layer_id);
         if (it == slots_by_layer.end()) {
             return nullptr;
@@ -820,10 +838,12 @@ struct llama_moe_gpu_expert_cache {
     }
 
     llama_moe_gpu_expert_bank & bank_for_layer(int32_t layer_id) {
+        std::lock_guard<std::recursive_mutex> lock(cache_mutex);
         return banks_by_layer[layer_id];
     }
 
     const llama_moe_gpu_expert_bank * bank_for_layer(int32_t layer_id) const {
+        std::lock_guard<std::recursive_mutex> lock(cache_mutex);
         const auto it = banks_by_layer.find(layer_id);
         if (it == banks_by_layer.end()) {
             return nullptr;
@@ -850,6 +870,7 @@ struct llama_moe_gpu_expert_cache {
     }
 
     int32_t find(int32_t layer_id, int32_t expert_id) const {
+        std::lock_guard<std::recursive_mutex> lock(cache_mutex);
         const auto it = expert_to_slot.find(key(layer_id, expert_id));
         if (it == expert_to_slot.end()) {
             return -1;
@@ -896,6 +917,7 @@ struct llama_moe_gpu_expert_cache {
     }
 
     void assign_slot(int32_t slot_id, int32_t layer_id, int32_t expert_id, int64_t step) {
+        std::lock_guard<std::recursive_mutex> lock(cache_mutex);
         if (slot_id < 0 || slot_id >= n_slots) {
             return;
         }
@@ -914,6 +936,7 @@ struct llama_moe_gpu_expert_cache {
     // undo a resident marking whose storage could not be materialized; keeps
     // expert_to_slot from ever pointing at an empty slot
     void release_slot(int32_t layer_id, int32_t slot_id) {
+        std::lock_guard<std::recursive_mutex> lock(cache_mutex);
         const auto it_layer = slots_by_layer.find(layer_id);
         if (it_layer == slots_by_layer.end() || slot_id < 0 || slot_id >= (int32_t) it_layer->second.size()) {
             return;
@@ -930,6 +953,7 @@ struct llama_moe_gpu_expert_cache {
     }
 
     int32_t get_or_assign_slot(int32_t layer_id, int32_t expert_id, int64_t step) {
+        std::lock_guard<std::recursive_mutex> lock(cache_mutex);
         clock = std::max(clock, step);
 
         const int32_t hit_slot = find(layer_id, expert_id);
@@ -958,6 +982,7 @@ struct llama_moe_gpu_expert_cache {
     }
 
     int32_t preload_or_assign_slot(int32_t layer_id, int32_t expert_id, int64_t step) {
+        std::lock_guard<std::recursive_mutex> lock(cache_mutex);
         clock = std::max(clock, step);
 
         const int32_t hit_slot = find(layer_id, expert_id);
@@ -984,6 +1009,7 @@ struct llama_moe_gpu_expert_cache {
             return expert_id;
         }
 
+        std::lock_guard<std::recursive_mutex> lock(cache_mutex);
         record_access(layer_id, expert_id);
 
         // collection mode (Pass 1 of the frequency workflow, slots < experts,
@@ -1055,6 +1081,11 @@ struct llama_model {
     struct ggml_tensor * pos_embd   = nullptr;
     struct ggml_tensor * tok_norm   = nullptr;
     struct ggml_tensor * tok_norm_b = nullptr;
+
+    // longcat-flash-ngram: NgramEmbedding module
+    // embedders/post_projs count = emb_split_num * (emb_neighbor_num - 1) = 4*3 = 12
+    struct ggml_tensor * ngram_embd[12] = {};
+    struct ggml_tensor * ngram_proj[12] = {};
 
     struct ggml_tensor * output_norm     = nullptr;
     struct ggml_tensor * output_norm_b   = nullptr;

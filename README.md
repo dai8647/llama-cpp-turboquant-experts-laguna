@@ -429,6 +429,21 @@ and errors out clearly on mismatch.
 | + DSpark speculative | 15-25 |
 | + TurboQuant KV | a few % (more at long context) |
 
+> **実測結果 (本セッション / 2026-08)**: DeepSeek-V4-Flash-0731-reap-150b-Q3_K_M (66GB GGUF) / Ryzen 5 5500 + RX 7800 XT 16GB / `--cpu-moe` + `-fa on` / 日本語プロンプト
+>
+> | 設定 | pred tps |
+> |---|---:|
+> | ベースライン (`--cpu-moe -fa -ctk q8_0 -ctv q8_0 -t 6`) | 5.52 |
+> | DSpark `n-max 3` | 7.04 |
+> | DSpark `n-max 5` | 9.43 |
+> | DSpark `n-max 5` + `--no-mmap` + `-t 6` | **10.36** |
+> | DSpark `n-max 5` + `--no-mmap` + `-t 6` + `-ctk turbo4 -ctv turbo4` | **11.66** |
+>
+> **最良構成 (best-effort)**: `-ctk turbo4 -ctv turbo4 --no-mmap --cpu-moe -fa on -c 8192 -np 1 -t 6 --spec-type draft-dspark --spec-draft-model <dspark-MXFP4.gguf> --spec-draft-n-max 5 --spec-draft-ngl 99`
+> 目標 10 tps は **達成**。詳細ログ: `BENCH_RESULTS.md` / `bench_results.jsonl`。
+> **注意**: `--no-mmap` は CPU 側 MoE 重みのアクセスを改善し、+1.5-2 tps の効果。
+> **残課題**: frequency 配置 (hot-expert GPU 配置) はフォークの HIP `map_custom1` 経路で `resource deadlock` が発生し現状使用不可。修正には再ビルドが必要。
+
 ### 4. Frequency-Based Expert Placement
 
 Expert選択頻度を記録し、高頻度ExpertをGPUに優先配置。
