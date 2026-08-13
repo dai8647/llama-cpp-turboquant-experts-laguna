@@ -836,6 +836,16 @@ static void llama_moe_gpu_expert_slot_preload(const llama_model & model) {
         return;
     }
 
+    // collection mode (Pass 1 of the frequency workflow: no whitelist, slots <
+    // experts): only record access at eval. use_moe_gpu_slot_cache is false in
+    // this mode, so the banks would never be used - skip the preload and avoid
+    // allocating ~n_slots * n_layers worth of VRAM at load time
+    if (cache.frequency_whitelist.empty() && cache.size() < max_layer_experts) {
+        LLAMA_LOG_INFO("%s: collection mode (slots=%d < experts=%d, no whitelist): skipping GPU expert bank preload\n",
+                __func__, cache.size(), max_layer_experts);
+        return;
+    }
+
     if (!cache.frequency_whitelist.empty()) {
         LLAMA_LOG_INFO("%s: frequency-based placement mode: %zu experts in whitelist\n",
                 __func__, cache.frequency_whitelist.size());
