@@ -10,12 +10,14 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <numeric>
 
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -629,7 +631,10 @@ struct llama_moe_gpu_expert_cache {
     int64_t n_evict = 0;
 
     // access tracking for frequency stats
-    std::unordered_map<uint64_t, int64_t> access_counts; // key(layer_id, expert_id) -> count
+    // mutable: written from compute_tensor() (graph build) and read at shutdown; the
+    // mutex keeps concurrent graph builds on a shared model from corrupting the bucket array
+    mutable std::unordered_map<uint64_t, int64_t> access_counts; // key(layer_id, expert_id) -> count
+    mutable std::mutex access_mutex;
     bool track_access = false;
 
     // frequency-based placement: preload experts in this list (frequency order)
@@ -740,8 +745,9 @@ struct llama_moe_gpu_expert_cache {
             }
 
             if (layer_id >= 0) {
-                uint64_t k = key(layer_id, expert_id);
-                const_cast<llama_moe_gpu_expert_cache*>(this)->access_counts[k]++;
+                const uint64_t k = key(layer_id, expert_id);
+                std::lock_guard<std::mutex> lock(access_mutex);
+                access_counts[k]++;
             }
         }
         return it->second;
@@ -755,12 +761,30 @@ struct llama_moe_gpu_expert_cache {
     llama_moe_freq_report generate_access_report(const std::string& fingerprint, int32_t n_active_experts) const {
         llama_moe_freq_report report;
         report.model_fingerprint = fingerprint;
+        report.n_layers = 0;
         report.n_experts = 0;
         report.n_active_experts = n_active_experts;
 
+        // snapshot under lock: access_counts can be written concurrently by graph builds
+        std::unordered_map<uint64_t, int64_t> counts;
+        {
+            std::lock_guard<std::mutex> lock(access_mutex);
+            counts = access_counts;
+        }
+
+        if (counts.empty()) {
+            // No expert access was recorded. Do not fabricate a 1x1 all-zero
+            // grid (the old behaviour): a zero-record report has empty stats,
+            // so the load side refuses it exactly like it refuses a fingerprint
+            // mismatch -- an accidental empty report can never be applied.
+            fprintf(stderr, "[moe-stats] warning: no MoE access records collected - "
+                    "writing zero-record frequency report (load side will refuse it)\n");
+            return report;
+        }
+
         // find max layer and expert IDs
         int32_t max_layer = 0, max_expert = 0;
-        for (const auto& [k, v] : access_counts) {
+        for (const auto& [k, v] : counts) {
             int32_t lid = int32_t(k >> 32);
             int32_t eid = int32_t(k & 0xFFFFFFFF);
             if (lid > max_layer) max_layer = lid;
@@ -779,8 +803,8 @@ struct llama_moe_gpu_expert_cache {
                 s.gen_selections = 0;
                 s.total_selections = 0;
                 s.estimated_weight_bytes = 0;
-                auto it = access_counts.find(key(l, e));
-                if (it != access_counts.end()) {
+                auto it = counts.find(key(l, e));
+                if (it != counts.end()) {
                     s.total_selections = it->second;
                     s.gen_selections = it->second;
                 }
@@ -905,6 +929,24 @@ struct llama_moe_gpu_expert_cache {
         expert_to_slot[key(layer_id, expert_id)] = slot_id;
     }
 
+    // undo a resident marking whose storage could not be materialized; keeps
+    // expert_to_slot from ever pointing at an empty slot
+    void release_slot(int32_t layer_id, int32_t slot_id) {
+        const auto it_layer = slots_by_layer.find(layer_id);
+        if (it_layer == slots_by_layer.end() || slot_id < 0 || slot_id >= (int32_t) it_layer->second.size()) {
+            return;
+        }
+        auto & s = it_layer->second[slot_id];
+        if (s.resident) {
+            expert_to_slot.erase(key(s.layer_id, s.expert_id));
+        }
+        s.clear_storage();
+        s.resident  = false;
+        s.bank_backed = false;
+        s.layer_id  = -1;
+        s.expert_id = -1;
+    }
+
     int32_t get_or_assign_slot(int32_t layer_id, int32_t expert_id, int64_t step) {
         clock = std::max(clock, step);
 
@@ -996,6 +1038,9 @@ struct llama_moe_gpu_expert_cache {
         }
 
         if (materialize_cb != nullptr && !materialize_cb(materialize_userdata, slot, layer_id, expert_id, n_experts)) {
+            // storage could not be allocated (e.g. VRAM exhausted); undo the
+            // resident marking so the expert falls back to its CPU tensor
+            release_slot(layer_id, slot);
             return expert_id;
         }
 

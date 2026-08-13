@@ -41,8 +41,8 @@ Upstream sync status: **fully caught up with `ggml-org/llama.cpp` master as of
 - AMD Radeon GPU (ROCm HIP) を持つローカルLLMユーザー / Users with AMD GPUs (ROCm HIP)
 - Laguna S 2.1 (118B) や Laguna XS 2.1 (33B) をローカルで動かしたい人
   / Users running Laguna S 2.1 (118B) / XS 2.1 (33B) locally
-- DeepSeek V4 (REAP 150b / K150) GGUF を ROCm で動かしたい人
-  / Users running DeepSeek V4 (REAP 150b) GGUF on ROCm
+- DeepSeek V4 (REAP) GGUF を ROCm で動かしたい人
+  / Users running DeepSeek V4 (REAP) GGUF on ROCm
 - MoEモデルでGPU expert配置を制御したい人 / Users tuning MoE expert placement
 - KV cache を量子化して VRAM を削減したい人 / Users shrinking KV cache via quantization
 
@@ -162,8 +162,7 @@ Note: this fork's default `--spec-draft-n-max` is already **3**
 ### 3. DeepSeek V4 (`deepseek4`)
 
 `deepseek4` アーキテクチャ対応 (上流 PR #24162 ほか、2026-08-03 マージ済み)。
-DeepSeek-V4-Flash-0731-REAP GGUF (e.g. `puwaer/DeepSeek-V4-Flash-0731-reap-150b-gguf`
-= K150 / 132 experts、`heath0xFF/DeepSeek-V4-Flash-0731-REAP-GGUF` = K160 / 216)
+DeepSeek-V4-Flash-0731-REAP GGUF (e.g. `heath0xFF/DeepSeek-V4-Flash-0731-REAP-GGUF`)
 を ROCm で実行可能。詳細は `DEEPSEEK4_MERGE_GUIDE.ja.md` を参照。
 
 ```bash
@@ -171,10 +170,6 @@ DeepSeek-V4-Flash-0731-REAP GGUF (e.g. `puwaer/DeepSeek-V4-Flash-0731-reap-150b-
 llama-server -hf heath0xFF/DeepSeek-V4-Flash-0731-REAP-GGUF:Q4_K_M \
   -c 32768 -ngl 99 --cpu-moe
 ```
-
-> K150 (`reap-150b`) は 16GB VRAM 構成での実測済みチューニングが
-> 「K150 (REAP 150b) GGUF チューニング」節にあり、最良 `--cpu-moe -ngl 99
-> -fa on -rea off -t 6 -tb 6` で **5.0 t/s** (Gen) を確認しています。
 
 #### MTP / DSpark 対応 (multi-token prediction)
 
@@ -204,8 +199,8 @@ Markov head を持つサイドカーを `--dflash` で取得) で有効化され
 #### REAP について
 
 **REAP** (Router-weighted Expert Activation Pruning、Cerebras) はモデル**作成時**の
-MoE 枝刈り手法であり、推論時に必要な機能ではありません。K150 GGUF は
-ルーテッドエキスパート 132 個 (256 個から削減) を含むだけで、`deepseek4`
+MoE 枝刈り手法であり、推論時に必要な機能ではありません。K160 GGUF は
+ルーテッドエキスパート 160 個 (256 個から削減) を含むだけで、`deepseek4`
 アーキテクチャとして特別なフラグなしでネイティブに実行できます。
 
 #### MTP / DSpark support
@@ -237,61 +232,83 @@ DFlash (hidden size, layer bounds, final-layer slot).
 #### About REAP
 
 **REAP** (Router-weighted Expert Activation Pruning, Cerebras) is a MoE pruning
-method applied at model **creation** time; it is not a runtime feature. The K150
-GGUF files simply contain 132 routed experts (pruned from 256) and run natively
+method applied at model **creation** time; it is not a runtime feature. The K160
+GGUF files simply contain 160 routed experts (pruned from 256) and run natively
 as the `deepseek4` architecture with no special flags.
 
-#### K150 (REAP 150b) GGUF チューニング (16GB VRAM 構成 / K150 (REAP 150b) GGUF tuning)
+#### MXFP4 対応 / MXFP4 support
 
-`puwaer/DeepSeek-V4-Flash-0731-reap-150b-gguf` は 256 エキスパート中
-**132 個を保持**した REAP 版です (top-6 ルーティング、43 層、BF16 換算 ~79GiB)。
-公開 GGUF: `Q3_K_M` 66.07 GiB / `IQ3_XXS` 62.40 GiB / `Q2_K` 58.11 GiB。
+MXFP4 (OCP マイクロスケーリング FP4) は本フォークでエンドツーエンドに動作します。
+`GGML_TYPE_MXFP4` は CPU (AVX2 ベクトル化 `ggml_vec_dot_mxfp4_q8_0` + 全アーキ
+quants) と CUDA/HIP (MMQ)、Metal、Vulkan に実装済みで、ビルドフラグ追加は不要です。
+ネイティブ FP4 高速パスは Blackwell (sm_100+) 専用で、7800 XT (gfx1101) では
+汎用 MMQ パス (dequant -> Q8_1) で動作します。
+
+```bash
+# 同じコマンドで MXFP4 GGUF を指定するだけ。KV は TurboQuant のまま
+llama-server -m DeepSeek-V4-Flash-0731-reap-150b-MXFP4_MOE.gguf \
+  -c 32768 -ngl 99 -t 6 --moe-expert-placement frequency \
+  --moe-freq-report-in stats.json --moe-gpu-expert-ratio 0.12 \
+  -ctk turbo4 -ctv turbo4
+```
+
+注意: 150B の MXFP4_MOE は約 85GB あり、Q2_K (62GB) より 37% 多く読むため、
+帯域律速の CPU MoE では Q2_K より遅くなります (品質は V4 ネイティブ形式で最良)。
+96GB RAM 構成では RAM 残量に注意し、`--moe-gpu-expert-ratio` は 0.10-0.12 を目安に。
+
+MXFP4 (OCP microscaling FP4) works end-to-end in this fork. `GGML_TYPE_MXFP4`
+is implemented for CPU (AVX2-vectorized `ggml_vec_dot_mxfp4_q8_0` plus the
+other arch quants), CUDA/HIP (MMQ), Metal and Vulkan; no extra build flags are
+needed. The native FP4 fast path is Blackwell-only (sm_100+); on RX 7800 XT
+(gfx1101) the generic MMQ path (dequant -> Q8_1) is used.
+
+Note: the 150B MXFP4_MOE file is about 85 GB, 37% larger than Q2_K (62 GB), so
+bandwidth-bound CPU MoE is slower than Q2_K (quality is best, being the native
+V4 format). On a 96 GB RAM box keep `--moe-gpu-expert-ratio` around 0.10-0.12
+to avoid running out of memory.
+
+#### K216 GGUF チューニング (16GB VRAM 構成 / K216 GGUF tuning)
+
+`heath0xFF/DeepSeek-V4-Flash-0731-REAP-K216-GGUF` は 256 エキスパート中
+**216 個を保持**した REAP 版です (top-6 ルーティング、43 層、BF16 換算 ~108GB)。
+公開 GGUF は `UD-IQ3_XXS` の 1 種のみで、3 shard 合計 **82.94 GiB**:
 
 ```
-DeepSeek-V4-Flash-0731-reap-150b-Q3_K_M.gguf
-DeepSeek-V4-Flash-0731-reap-150b-IQ3_XXS.gguf
-DeepSeek-V4-Flash-0731-reap-150b-Q2_K.gguf
+DeepSeek-V4-Flash-0731-REAP-K216-UD-IQ3_XXS-00001-of-00003.gguf  (entry point)
+DeepSeek-V4-Flash-0731-REAP-K216-UD-IQ3_XXS-00002-of-00003.gguf
+DeepSeek-V4-Flash-0731-REAP-K216-UD-IQ3_XXS-00003-of-00003.gguf
 ```
 
-> 検証済みの注意: REAP チェックポイントには `mtp.*` テンソルが**含まれません**
-> (base の 4705 tensor の MTP モジュールが削除済み)。したがって `--mtp` は
-> 使えません。DSpark ドラフター (`deepseek4-dspark` 等) もこのモデル向けの
-> サイドカーとしては利用できません。投機デコードは使えないものと考えてください。
+> 検証済みの注意: K216 GGUF には `nextn.*` / `mtp.*` テンソルが**含まれません**
+> (K160 版は含むが、K216 は unsloth 量子化ベースのため)。したがって `--mtp`
+> は使えません。投機デコードを使う場合は DSpark サイドカーを指定してください。
 
 ##### 診断: なぜ遅いのか (16GB VRAM の場合)
 
-66GB のモデルは 16GB VRAM に載らないため、実質 CPU 推論 (DDR4 帯域律速)
-になります。Ryzen 5500 級 (DDR4 デュアルチャネル ~45GB/s) で 5 tps は
-この構成のほぼ理論上限です。GPU は理屈上エキスパート演算を担えません
-(132 expert 全部を載せる VRAM がない)。正攻法は「GPU には attention / KV
-キャッシュ (FlashAttention) だけを担わせ、MoE 重みは CPU に残す」こと。
+83GB のモデルは 16GB VRAM に載らないため、実質 CPU 推論 (DDR4 帯域律速)
+になります。Ryzen 5500 級 (DDR4 デュアルチャネル ~45GB/s) で 5.5 tps は
+この構成のほぼ理論上限です。対策は「GPU を効かせる」ことです。
 
-##### 手順 1: `--cpu-moe` で MoE 重みを CPU 固定 + dense を全層 GPU offload
+##### 手順 1: 高頻度エキスパートを GPU に配置 (2-pass / 最大効果)
 
 ```bash
-./llama-cli -m DeepSeek-V4-Flash-0731-reap-150b-Q3_K_M.gguf \
-  --cpu-moe -ngl 99 -fa on -rea off -t 6 -tb 6
+# Pass 1: 普段の使い方に近いプロンプトで使用頻度を計測 (1回だけ)
+./llama-cli -m DeepSeek-V4-Flash-0731-REAP-K216-UD-IQ3_XXS-00001-of-00003.gguf \
+  --moe-freq-report-path stats.json -p "<代表的なプロンプト>" -n 256
+
+# Pass 2: 高頻度エキスパートだけ GPU 配置して起動
+./llama-server -m DeepSeek-V4-Flash-0731-REAP-K216-UD-IQ3_XXS-00001-of-00003.gguf \
+  -c 32768 -ngl 99 \
+  --moe-expert-placement frequency \
+  --moe-freq-report-path stats.json \
+  --moe-gpu-expert-ratio 0.18 \
+  -t 6
 ```
 
-- `--cpu-moe` (-cmoe): MoE 重みを強制的に CPU に置く。GPU カーネルでの
-  エキスパート演算 (mul_mat_id) が不安定な環境向けの公式ワークアラウンド
-- `-ngl 99`: dense 層 (attention) を全層 GPU へ。`--cpu-moe` と併用すると
-  エキスパートは CPU・attention は GPU に分かれる
-- `-fa on`: FlashAttention。この構成では KV キャッシュも GPU に載り、
-  attention 計算が高速化されます
-- `-rea off`: シンキング有効 (default) だと思考トークン分で実速度が下がる
-
-実測 (Ryzen 5500 + RX 7800 XT 16GB, Q3_K_M):
-
-| 構成 / Setup | Generation t/s @ -n 512 |
-|---|---:|
-| 素の `-ngl 10` (slot なし) | 3.7 |
-| + `--moe-gpu-expert-slot-num 32` | 4.9 |
-| + `--cpu-moe -ngl 99` | **5.0** |
-
-- 出力内容は全モードで検証済み (海 / 光合成など、空応答なし)
-- `-t 6` は物理コア数 (Ryzen 5 5500)。SMT は帯域律速下で有害
-- `-tb 6` (batch スレッド) も同値が最速
+- `--moe-gpu-expert-ratio`: 16GB VRAM なら **0.15-0.25 から調整** (~18% 目安)
+- `--moe-freq-report-path` は Pass 1 (書き出し) / Pass 2 (読み込み) を兼ねる単一フラグです
+- 7800 XT の帯域 (624 GB/s) は DDR4 の約 14 倍。トークン生成の大半を占める
+  エキスパート演算が GPU に載れば **2-4 倍の向上**が見込めます
 
 ##### 手順 2: TurboQuant KV cache で VRAM の空きを増やす
 
@@ -299,14 +316,24 @@ DeepSeek-V4-Flash-0731-reap-150b-Q2_K.gguf
 -ctk turbo4 -ctv turbo4
 ```
 
-##### 手順 3: 投機デコードは不可
+##### 手順 3: DSpark サイドカー投機デコード
 
-K150 には MTP ヘッドがなく、DSpark ドラフターも
+K216 GGUF 自体に nextn がないため、`ggml-org/DeepSeek-V4-Flash-0731-GGUF`
+の DSpark サイドカー (`dspark-DeepSeek-V4-Flash-0731-BF16.gguf`) を指定します。
+DSpark ヘッドは REAP で枝刈りされない層 (MTP + Markov head) のみなので
+互換です。起動時に hidden size / レイヤ範囲 / 語彙を検証し、不一致なら
+明確なエラーが出ます。
 
-- bleysg 版 (`deepseek4-dspark` アーキテクチャ) は llama.cpp が未対応でロード不可
-- ggml-org 版 MXFP4 (10.08GB) はロードできるが投機対象が噛み合わず 2.8-2.9 t/s に劣化
+```bash
+./llama-server -m DeepSeek-V4-Flash-0731-REAP-K216-UD-IQ3_XXS-00001-of-00003.gguf \
+  --spec-type draft-dspark \
+  --spec-draft-hf ggml-org/DeepSeek-V4-Flash-0731-GGUF \
+  --spec-draft-model dspark-DeepSeek-V4-Flash-0731-BF16.gguf \
+  --spec-draft-n-max 3
+```
 
-のため、投機デコードは使えません。帯域律速下では逆効果です。
+- K=3 が最速という実測結果に合わせ `--spec-draft-n-max 3` (デフォルト)
+- うまく嵌れば **1.3-1.8 倍**
 
 ##### 手順 4: スレッド数とビルド
 
@@ -317,56 +344,50 @@ K150 には MTP ヘッドがなく、DSpark ドラフターも
 
 ##### 期待値 (Ryzen 5500 + 7800 XT 16GB の場合)
 
-| 設定 / Setup | Generation t/s (実測) |
+| 設定 / Setup | 予想 Generation t/s |
 |---|---:|
-| `--cpu-moe -ngl 99 -fa on -rea off -t 6 -tb 6` | **5.0** |
-| TurboQuant KV 併用 | 同等 (長文ほど僅かに有利) |
+| 現状 / current | 5.5 |
+| + 高頻度 expert GPU 配置 / frequency placement | 10-18 |
+| + DSpark 投機 / speculative decoding | 15-25 |
+| + TurboQuant KV | +数% (長文ほど効く) |
 
-#### K150 (REAP 150b) GGUF tuning (16 GB VRAM setup) / EN
+#### K216 GGUF tuning (16 GB VRAM setup) / EN
 
-`puwaer/DeepSeek-V4-Flash-0731-reap-150b-gguf` retains **132 of 256 routed
-experts** (top-6 routing, 43 layers, ~79 GiB BF16 equivalent). Public GGUFs:
-`Q3_K_M` 66.07 GiB / `IQ3_XXS` 62.40 GiB / `Q2_K` 58.11 GiB.
+`heath0xFF/DeepSeek-V4-Flash-0731-REAP-K216-GGUF` retains **216 of 256 routed
+experts** (top-6 routing, 43 layers, ~108 GB BF16 equivalent). The only public
+GGUF is `UD-IQ3_XXS`, **82.94 GiB across 3 shards** (first shard is the entry
+point).
 
-> Verified caveat: the REAP checkpoint has **no `mtp.*` tensors** (the base
-> model's 4705-tensor MTP modules are pruned away). So `--mtp` is unavailable,
-> and no DSpark drafter works as a sidecar (bleysg `deepseek4-dspark` is not
-> loadable; the ggml-org MXFP4 drafter loads but degrades to 2.8-2.9 t/s).
-> Treat speculative decoding as unavailable.
+> Verified caveat: the K216 GGUF does **not** contain `nextn.*` / `mtp.*`
+> tensors (unlike the K160 builds, it derives from the unsloth quantization).
+> So `--mtp` cannot be used; use the DSpark sidecar for speculative decoding.
 
 ##### Diagnosis: why it is slow (16 GB VRAM)
 
-A 66 GB model cannot fit in 16 GB VRAM, so inference runs effectively on CPU
-(DDR4 bandwidth-bound). ~5.0 tps on a Ryzen 5500-class DDR4 box is close to the
-theoretical ceiling. There is no room for the routed experts on the GPU; the
-correct split is to keep MoE weights on CPU and let the GPU handle attention /
-KV cache only (FlashAttention).
+An 83 GB model cannot fit in 16 GB VRAM, so inference runs effectively on CPU
+(DDR4 bandwidth-bound). ~5.5 tps on a Ryzen 5500-class DDR4 box is close to the
+theoretical ceiling. The fix is to make the GPU do real work.
 
-##### Step 1: `--cpu-moe` keeps MoE on CPU + fully offload dense layers
+##### Step 1: place high-frequency experts on GPU (2-pass, biggest win)
 
 ```bash
-./llama-cli -m DeepSeek-V4-Flash-0731-reap-150b-Q3_K_M.gguf \
-  --cpu-moe -ngl 99 -fa on -rea off -t 6 -tb 6
+# Pass 1: measure usage with a prompt close to your real workload (once)
+./llama-cli -m DeepSeek-V4-Flash-0731-REAP-K216-UD-IQ3_XXS-00001-of-00003.gguf \
+  --moe-freq-report-path stats.json -p "<representative prompt>" -n 256
+
+# Pass 2: start with only high-frequency experts on GPU
+./llama-server -m DeepSeek-V4-Flash-0731-REAP-K216-UD-IQ3_XXS-00001-of-00003.gguf \
+  -c 32768 -ngl 99 \
+  --moe-expert-placement frequency \
+  --moe-freq-report-path stats.json \
+  --moe-gpu-expert-ratio 0.18 \
+  -t 6
 ```
 
-- `--cpu-moe` (-cmoe): forces all MoE weights on the CPU. Official workaround
-  for environments where GPU expert kernels (mul_mat_id) are unstable
-- `-ngl 99`: offloads the dense (attention) layers fully; combined with
-  `--cpu-moe` the experts stay on CPU while attention runs on GPU
-- `-fa on`: FlashAttention; in this setup the KV cache also lands on GPU
-- `-rea off`: thinking is enabled by default and lowers net speed
-
-Measured on Ryzen 5500 + RX 7800 XT 16GB, Q3_K_M:
-
-| Setup | Generation t/s @ -n 512 |
-|---|---:|
-| plain `-ngl 10` (no slot) | 3.7 |
-| + `--moe-gpu-expert-slot-num 32` | 4.9 |
-| + `--cpu-moe -ngl 99` | **5.0** |
-
-- Output verified in all modes (photosynthesis / sea, no empty responses)
-- `-t 6` = physical cores (Ryzen 5 5500). SMT hurts a bandwidth-bound loop
-- `-tb 6` (batch threads) measured fastest as well
+- `--moe-gpu-expert-ratio`: tune **0.15-0.25** for 16 GB VRAM (~18% works well)
+- `--moe-freq-report-path` is a single flag used for both Pass 1 (write) and Pass 2 (read)
+- RX 7800 XT bandwidth (624 GB/s) is ~14x DDR4. Offloading the hot experts can
+  give **2-4x** on generation
 
 ##### Step 2: free VRAM with TurboQuant KV
 
@@ -374,10 +395,24 @@ Measured on Ryzen 5500 + RX 7800 XT 16GB, Q3_K_M:
 -ctk turbo4 -ctv turbo4
 ```
 
-##### Step 3: speculative decoding is not available
+##### Step 3: DSpark sidecar speculative decoding
 
-K150 has no MTP head, and DSpark drafters cannot help either (see the caveat
-above). Under bandwidth-bound conditions they only make things slower.
+Since the K216 GGUF has no nextn tensors, point at the DSpark sidecar from
+`ggml-org/DeepSeek-V4-Flash-0731-GGUF` (`dspark-DeepSeek-V4-Flash-0731-BF16.gguf`).
+The DSpark head covers only non-pruned layers (MTP + Markov head), so it is
+compatible. The fork validates hidden size / layer bounds / vocab at startup
+and errors out clearly on mismatch.
+
+```bash
+./llama-server -m DeepSeek-V4-Flash-0731-REAP-K216-UD-IQ3_XXS-00001-of-00003.gguf \
+  --spec-type draft-dspark \
+  --spec-draft-hf ggml-org/DeepSeek-V4-Flash-0731-GGUF \
+  --spec-draft-model dspark-DeepSeek-V4-Flash-0731-BF16.gguf \
+  --spec-draft-n-max 3
+```
+
+- K=3 measured fastest, so `--spec-draft-n-max 3` (the fork default)
+- Expect **1.3-1.8x** when it lands
 
 ##### Step 4: threads and build
 
@@ -387,10 +422,12 @@ above). Under bandwidth-bound conditions they only make things slower.
 
 ##### Expected results (Ryzen 5500 + 7800 XT 16 GB)
 
-| Setup | Generation t/s (measured) |
+| Setup | Expected gen t/s |
 |---|---:|
-| `--cpu-moe -ngl 99 -fa on -rea off -t 6 -tb 6` | **5.0** |
-| + TurboQuant KV | same (marginally better at long context) |
+| current | 5.5 |
+| + frequency placement | 10-18 |
+| + DSpark speculative | 15-25 |
+| + TurboQuant KV | a few % (more at long context) |
 
 ### 4. Frequency-Based Expert Placement
 
@@ -476,6 +513,61 @@ repo (NVFP4 W4A4 / compressed-tensors) and cannot be loaded by llama.cpp directl
 Use the GGUFs above, or convert the bf16 base with this fork's
 `convert_hf_to_gguf.py` (conversion/bailing_hybrid.py).
 
+### 6. Muse Glimmer (`muse-glimmer`)
+
+Meta [Muse Glimmer 30B](https://huggingface.co/meta-models/Muse-Glimmer-30B-GGUF)
+(Apache 2.0、マルチモーダル・ローカルエージェント特化) をネイティブサポート。
+llama.cpp 上流の #26841 (本体) / #26879 (tool-call 検出修正) / #26900
+(dflash sliding_window_pattern 配列対応) を移植しました。
+
+- 実装: `src/models/muse-glimmer.cpp` + ビジョン用 `tools/mtmd/models/muse-glimmer.cpp`
+- アーキテクチャ: 52 層ハイブリッド注意 (39 層が 2048 トークンの SWA、残りは
+  フル注意) + GQA (KV ヘッド 2) + QK-norm + 注意出力ゲート + dense SwiGLU FFN +
+  logit tanh softcap。フォークの iswa KV cache を利用
+- **DFlash ドラフター対応**: `--spec-type draft-dflash` で投機デコード可
+  (公式 `dflash-kquant.gguf`、1.6 GiB)。公式 GGUF の
+  `attention.sliding_window_pattern` 配列も #26900 により正しく読めます
+- GGUF: `meta-models/Muse-Glimmer-30B-GGUF` の `Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf`
+  (16.7GB) は 16GB VRAM (7800 XT) にほぼ収まります
+
+```bash
+# 通常推論 (Q4_K_M は 16GB VRAM にほぼフルオフロード)
+llama-server -m Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf -c 32768 -ngl 99 -t 6
+
+# DFlash ドラフター投機デコード + ビジョン (mmproj)
+llama-server -m Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf \
+  -md dflash-kquant.gguf --spec-type draft-dflash --spec-draft-n-max 5 \
+  --mmproj mmproj-Muse-Glimmer-30B-Q4_K_M.gguf -c 32768 -ngl 99 -t 6
+```
+
+#### Muse Glimmer (`muse-glimmer`) / EN
+
+Native support for Meta [Muse Glimmer 30B](https://huggingface.co/meta-models/Muse-Glimmer-30B-GGUF)
+(Apache 2.0, multimodal, agentic local model). Ported from upstream llama.cpp
+#26841 (core) / #26879 (tool-call detection after EOM) / #26900 (dflash
+sliding_window_pattern array support).
+
+- Implementation: `src/models/muse-glimmer.cpp` + vision via
+  `tools/mtmd/models/muse-glimmer.cpp`
+- Architecture: 52-layer hybrid attention (39 SWA layers with 2048-token window,
+  rest full attention) + GQA (2 KV heads) + QK-norm + attention output gate +
+  dense SwiGLU FFN + logit tanh softcap. Reuses this fork's iswa KV cache
+- **DFlash drafter**: `--spec-type draft-dflash` enables speculative decoding
+  with the official `dflash-kquant.gguf` (1.6 GiB); the official GGUF's
+  `attention.sliding_window_pattern` array is handled correctly (#26900)
+- GGUF: `Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf` (16.7GB) from
+  `meta-models/Muse-Glimmer-30B-GGUF` fits ~entirely in 16GB VRAM (7800 XT)
+
+```bash
+# plain inference
+llama-server -m Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf -c 32768 -ngl 99 -t 6
+
+# DFlash drafter speculative decoding + vision
+llama-server -m Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf \
+  -md dflash-kquant.gguf --spec-type draft-dflash --spec-draft-n-max 5 \
+  --mmproj mmproj-Muse-Glimmer-30B-Q4_K_M.gguf -c 32768 -ngl 99 -t 6
+```
+
 ## ビルド / Build
 
 ### 前提条件 / Prerequisites
@@ -524,18 +616,6 @@ cmake --build build-rocm -j$(nproc) --target llama-server
 ^1 frequency numbers are pre-fix (v0.1). The bug where frequency mode silently
 fell through to slot-off has been fixed; post-fix numbers will differ - re-run
 `bench_frequency_placement.ps1` to get current values.
-
-### DeepSeek V4 Flash REAP 150b (K150, Q3_K_M) - Ryzen 5500 + RX 7800 XT 16GB
-
-| 構成 / Setup | Prompt t/s | Generation t/s |
-|--------|------------|----------------|
-| plain `-ngl 10` (no slot) | 3.8 | 3.7 |
-| + `--moe-gpu-expert-slot-num 32` | 2.9 | 4.9 |
-| `--cpu-moe -ngl 99 -fa on -rea off -t 6 -tb 6` | 3.9 | **5.0** |
-
-- 出力内容は全モードで検証済み (光合成/海の説明、空応答なし)
-- DSpark 投機デコードは不可 (MTP ヘッドなし)。ドラフター併用時は 2.8-2.9 t/s に劣化
-- `-rea off` 指定。thinking 有効時の実測は同値 (5.0) だが 思考トークン分で応答が増える
 
 - 全モードで出力一致 (temp=0, seed=42) / outputs match across modes
 - HIP/ROCm 7.1, AMD GPU

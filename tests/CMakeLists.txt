@@ -292,6 +292,8 @@ if (NOT GGML_BACKEND_DL)
     llama_build_and_test(test-quantize-perf.cpp)
     llama_build_and_test(test-rope.cpp)
     llama_build_and_test(test-col2im-1d.cpp)
+    # TurboQuant CPU round-trip / chunk-boundary test (fork-specific)
+    llama_build_and_test(test-turbo-quant.c)
 endif()
 
 # libmtmd
@@ -338,4 +340,24 @@ llama_build(test-export-graph-ops.cpp)
 if (TARGET gguf-model-data)
     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
+endif()
+
+# MoE frequency placement integration test (fork-specific).
+#
+# Needs a real MoE model and a built llama-cli, supplied via the LLAMA_CLI and
+# MODEL environment variables (inherited by ctest from the invoking shell, e.g.
+#   LLAMA_CLI=/path/to/llama-cli MODEL=/path/to/moe.gguf ctest -L moe
+# ). The script exits 77 ("skip") when they are missing; on CMake >= 3.25 that
+# is reported as a skipped test instead of a failure, so the default `ctest`
+# run is not polluted on machines without an MoE model. ci/run.sh also invokes
+# the script directly (gg_run_moe_freq_placement) when an MoE model is present.
+if (NOT WIN32)
+    llama_test_cmd(
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_moe_frequency_placement.py
+        NAME test-moe-frequency-placement
+        LABEL moe
+    )
+    if (CMAKE_VERSION VERSION_GREATER_EQUAL 3.25)
+        set_tests_properties(test-moe-frequency-placement PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
 endif()
