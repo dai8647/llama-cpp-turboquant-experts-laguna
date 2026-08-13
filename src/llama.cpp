@@ -861,7 +861,9 @@ static void llama_moe_gpu_expert_slot_preload(const llama_model & model) {
                 if (slot >= 0) {
                     slot = cache.preload_or_assign_slot(layer_id, wl_expert, step++);
                     LLAMA_LOG_INFO("%s: MoE GPU expert slot preload reuse: layer=%d expert=%d slot=%d\n", __func__, layer_id, wl_expert, slot);
-                    llama_moe_gpu_expert_slot_materialize(model_mut, slot, layer_id, wl_expert, info.n_experts);
+                    if (!llama_moe_gpu_expert_slot_materialize(model_mut, slot, layer_id, wl_expert, info.n_experts)) {
+                        cache.release_slot(layer_id, slot);
+                    }
                     ++n_preloaded;
                     continue;
                 }
@@ -877,7 +879,9 @@ static void llama_moe_gpu_expert_slot_preload(const llama_model & model) {
                 }
                 const int32_t assigned = cache.preload_or_assign_slot(layer_id, wl_expert, step++);
                 LLAMA_LOG_INFO("%s: MoE GPU expert slot preload: layer=%d expert=%d slot=%d\n", __func__, layer_id, wl_expert, assigned >= 0 ? assigned : slot);
-                llama_moe_gpu_expert_slot_materialize(model_mut, assigned >= 0 ? assigned : slot, layer_id, wl_expert, info.n_experts);
+                if (!llama_moe_gpu_expert_slot_materialize(model_mut, assigned >= 0 ? assigned : slot, layer_id, wl_expert, info.n_experts)) {
+                    cache.release_slot(layer_id, assigned >= 0 ? assigned : slot);
+                }
                 ++n_preloaded;
             }
         } else {
@@ -891,7 +895,9 @@ static void llama_moe_gpu_expert_slot_preload(const llama_model & model) {
                 if (slot >= 0) {
                     slot = cache.preload_or_assign_slot(layer_id, expert_id, step++);
                     LLAMA_LOG_INFO("%s: MoE GPU expert slot preload reuse: layer=%d expert=%d slot=%d\n", __func__, layer_id, expert_id, slot);
-                    llama_moe_gpu_expert_slot_materialize(model_mut, slot, layer_id, expert_id, info.n_experts);
+                    if (!llama_moe_gpu_expert_slot_materialize(model_mut, slot, layer_id, expert_id, info.n_experts)) {
+                        cache.release_slot(layer_id, slot);
+                    }
                     ++n_preloaded;
                     continue;
                 }
@@ -907,7 +913,9 @@ static void llama_moe_gpu_expert_slot_preload(const llama_model & model) {
                 }
                 const int32_t assigned = cache.preload_or_assign_slot(layer_id, expert_id, step++);
                 LLAMA_LOG_INFO("%s: MoE GPU expert slot preload: layer=%d expert=%d slot=%d\n", __func__, layer_id, expert_id, assigned >= 0 ? assigned : slot);
-                llama_moe_gpu_expert_slot_materialize(model_mut, assigned >= 0 ? assigned : slot, layer_id, expert_id, info.n_experts);
+                if (!llama_moe_gpu_expert_slot_materialize(model_mut, assigned >= 0 ? assigned : slot, layer_id, expert_id, info.n_experts)) {
+                    cache.release_slot(layer_id, assigned >= 0 ? assigned : slot);
+                }
                 ++n_preloaded;
             }
         }
