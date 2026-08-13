@@ -722,35 +722,17 @@ struct llama_moe_gpu_expert_cache {
         if (it == compute_tensor_by_src.end()) {
             return const_cast<ggml_tensor *>(src);
         }
-        // track access for frequency stats
-        if (track_access && src->name[0] != '\0') {
-            // parse tensor name: blk.{bid}.ffn_{type}_exps.weight
-            // or: model.layers.{bid}.mlp.experts.{eid}.{w}.weight
-            const char * name = src->name;
-            int32_t layer_id = -1;
-            int32_t expert_id = 0; // default: all experts (packed tensor)
-
-            const char * blk_pos = strstr(name, "blk.");
-            const char * layers_pos = strstr(name, "layers.");
-            const char * experts_pos = strstr(name, "experts.");
-
-            if (blk_pos) {
-                layer_id = atoi(blk_pos + 4);
-            } else if (layers_pos) {
-                layer_id = atoi(layers_pos + 7);
-            }
-
-            if (experts_pos) {
-                expert_id = atoi(experts_pos + 8);
-            }
-
-            if (layer_id >= 0) {
-                const uint64_t k = key(layer_id, expert_id);
-                std::lock_guard<std::mutex> lock(access_mutex);
-                access_counts[k]++;
-            }
-        }
         return it->second;
+    }
+
+    // record expert usage for the frequency report (Pass 1); called from the
+    // eval-time slot remap so counts reflect real router selections
+    void record_access(int32_t layer_id, int32_t expert_id) {
+        if (!track_access || layer_id < 0 || expert_id < 0) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(access_mutex);
+        access_counts[key(layer_id, expert_id)]++;
     }
 
     bool uses_compute_tensor(const ggml_tensor * src) const {
@@ -999,6 +981,14 @@ struct llama_moe_gpu_expert_cache {
 
     int32_t ensure_resident(int32_t layer_id, int32_t expert_id, int32_t n_experts) {
         if (!enabled() || expert_id < 0 || expert_id >= n_experts) {
+            return expert_id;
+        }
+
+        record_access(layer_id, expert_id);
+
+        // collection mode (Pass 1 of the frequency workflow, slots < experts,
+        // no whitelist): count access only, no slot assignment/materialization
+        if (frequency_whitelist.empty() && n_slots < n_experts) {
             return expert_id;
         }
 

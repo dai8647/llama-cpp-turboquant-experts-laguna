@@ -2149,6 +2149,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     ggml_tensor * selected_experts_compute = selected_experts;
 
+    // remap logical expert ids to slot ids whenever the slot cache is enabled;
+    // the eval-time remap callback also records access counts for the frequency
+    // report (Pass 1), which otherwise never fires when use_moe_gpu_slot_cache
+    // is false (collection mode: slots < experts, no whitelist)
+    if (moe_gpu_expert_cache != nullptr && moe_gpu_expert_cache->enabled()) {
+        selected_experts_compute = build_moe_gpu_slot_ids(selected_experts, n_expert, il);
+    }
+
     if (use_moe_gpu_slot_cache && moe_gpu_expert_cache != nullptr) {
         up_exps        = moe_gpu_expert_cache->compute_tensor(up_exps);
         gate_exps      = moe_gpu_expert_cache->compute_tensor(gate_exps);
