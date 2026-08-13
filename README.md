@@ -513,6 +513,61 @@ repo (NVFP4 W4A4 / compressed-tensors) and cannot be loaded by llama.cpp directl
 Use the GGUFs above, or convert the bf16 base with this fork's
 `convert_hf_to_gguf.py` (conversion/bailing_hybrid.py).
 
+### 6. Muse Glimmer (`muse-glimmer`)
+
+Meta [Muse Glimmer 30B](https://huggingface.co/meta-models/Muse-Glimmer-30B-GGUF)
+(Apache 2.0、マルチモーダル・ローカルエージェント特化) をネイティブサポート。
+llama.cpp 上流の #26841 (本体) / #26879 (tool-call 検出修正) / #26900
+(dflash sliding_window_pattern 配列対応) を移植しました。
+
+- 実装: `src/models/muse-glimmer.cpp` + ビジョン用 `tools/mtmd/models/muse-glimmer.cpp`
+- アーキテクチャ: 52 層ハイブリッド注意 (39 層が 2048 トークンの SWA、残りは
+  フル注意) + GQA (KV ヘッド 2) + QK-norm + 注意出力ゲート + dense SwiGLU FFN +
+  logit tanh softcap。フォークの iswa KV cache を利用
+- **DFlash ドラフター対応**: `--spec-type draft-dflash` で投機デコード可
+  (公式 `dflash-kquant.gguf`、1.6 GiB)。公式 GGUF の
+  `attention.sliding_window_pattern` 配列も #26900 により正しく読めます
+- GGUF: `meta-models/Muse-Glimmer-30B-GGUF` の `Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf`
+  (16.7GB) は 16GB VRAM (7800 XT) にほぼ収まります
+
+```bash
+# 通常推論 (Q4_K_M は 16GB VRAM にほぼフルオフロード)
+llama-server -m Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf -c 32768 -ngl 99 -t 6
+
+# DFlash ドラフター投機デコード + ビジョン (mmproj)
+llama-server -m Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf \
+  -md dflash-kquant.gguf --spec-type draft-dflash --spec-draft-n-max 5 \
+  --mmproj mmproj-Muse-Glimmer-30B-Q4_K_M.gguf -c 32768 -ngl 99 -t 6
+```
+
+#### Muse Glimmer (`muse-glimmer`) / EN
+
+Native support for Meta [Muse Glimmer 30B](https://huggingface.co/meta-models/Muse-Glimmer-30B-GGUF)
+(Apache 2.0, multimodal, agentic local model). Ported from upstream llama.cpp
+#26841 (core) / #26879 (tool-call detection after EOM) / #26900 (dflash
+sliding_window_pattern array support).
+
+- Implementation: `src/models/muse-glimmer.cpp` + vision via
+  `tools/mtmd/models/muse-glimmer.cpp`
+- Architecture: 52-layer hybrid attention (39 SWA layers with 2048-token window,
+  rest full attention) + GQA (2 KV heads) + QK-norm + attention output gate +
+  dense SwiGLU FFN + logit tanh softcap. Reuses this fork's iswa KV cache
+- **DFlash drafter**: `--spec-type draft-dflash` enables speculative decoding
+  with the official `dflash-kquant.gguf` (1.6 GiB); the official GGUF's
+  `attention.sliding_window_pattern` array is handled correctly (#26900)
+- GGUF: `Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf` (16.7GB) from
+  `meta-models/Muse-Glimmer-30B-GGUF` fits ~entirely in 16GB VRAM (7800 XT)
+
+```bash
+# plain inference
+llama-server -m Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf -c 32768 -ngl 99 -t 6
+
+# DFlash drafter speculative decoding + vision
+llama-server -m Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf \
+  -md dflash-kquant.gguf --spec-type draft-dflash --spec-draft-n-max 5 \
+  --mmproj mmproj-Muse-Glimmer-30B-Q4_K_M.gguf -c 32768 -ngl 99 -t 6
+```
+
 ## ビルド / Build
 
 ### 前提条件 / Prerequisites
