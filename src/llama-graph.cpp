@@ -230,39 +230,6 @@ bool llm_graph_input_out_ids::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
-void llm_graph_input_moe_gpu_slot_map::set_input(const llama_ubatch * ubatch) {
-    GGML_UNUSED(ubatch);
-
-    if (slot_map == nullptr) {
-        return;
-    }
-
-    std::vector<int32_t> data(n_expert * n_tokens);
-    for (int64_t it = 0; it < n_tokens; ++it) {
-        for (int64_t ie = 0; ie < n_expert; ++ie) {
-            int32_t slot_id = -1;
-            if (cache != nullptr && cache->enabled()) {
-                slot_id = cache->find(layer_id, (int32_t) ie);
-            }
-            data[it * n_expert + ie] = slot_id >= 0 ? slot_id : (int32_t) ie;
-        }
-    }
-
-    ggml_backend_tensor_set(slot_map, data.data(), 0, data.size() * ggml_element_size(slot_map));
-}
-
-bool llm_graph_input_moe_gpu_slot_map::can_reuse(const llm_graph_params & params) {
-    bool res = true;
-
-    res &= cache == params.moe_gpu_expert_cache;
-    res &= slot_map != nullptr;
-    res &= slot_map->ne[0] == 1;
-    res &= slot_map->ne[1] == n_expert;
-    res &= slot_map->ne[2] == params.ubatch.n_tokens;
-
-    return res;
-}
-
 static void llm_moe_gpu_slot_remap(
         ggml_tensor * dst,
         const ggml_tensor * a,

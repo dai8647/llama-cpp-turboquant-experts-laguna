@@ -1018,11 +1018,6 @@ struct llama_moe_gpu_expert_cache {
             return expert_id;
         }
 
-        // frequency placement: skip experts not in whitelist
-        if (!frequency_whitelist.empty() && !is_in_frequency_whitelist(layer_id, expert_id)) {
-            return expert_id;
-        }
-
         int32_t slot = find(layer_id, expert_id);
         if (slot >= 0) {
             ++n_hit;

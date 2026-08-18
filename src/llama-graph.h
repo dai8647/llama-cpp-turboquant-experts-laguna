@@ -238,27 +238,6 @@ public:
     const uint32_t n_outputs;
 };
 
-class llm_graph_input_moe_gpu_slot_map : public llm_graph_input_i {
-public:
-    llm_graph_input_moe_gpu_slot_map(
-            const llama_moe_gpu_expert_cache * cache,
-            int32_t layer_id,
-            int64_t n_expert,
-            int64_t n_tokens) : cache(cache), layer_id(layer_id), n_expert(n_expert), n_tokens(n_tokens) {}
-    virtual ~llm_graph_input_moe_gpu_slot_map() = default;
-
-    void set_input(const llama_ubatch * ubatch) override;
-
-    bool can_reuse(const llm_graph_params & params) override;
-
-    ggml_tensor * slot_map = nullptr; // I32 [1, n_expert, n_tokens]
-
-    const llama_moe_gpu_expert_cache * cache = nullptr;
-    const int32_t layer_id = -1;
-    const int64_t n_expert = 0;
-    const int64_t n_tokens = 0;
-};
-
 class llm_graph_input_mean : public llm_graph_input_i {
 public:
     llm_graph_input_mean(const llama_cparams & cparams) : cparams(cparams) {}
