@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cinttypes>
 #include <cstddef>
 #include <cstdint>
@@ -493,6 +494,14 @@ static bool llama_moe_gpu_expert_bank_copy_tensor(
         return false;
     }
 
+    // host-backed sources (model weights always are) can feed the H2D copy
+    // directly; the staging detour only exists for exotic non-host buffers
+    if (bank_tensor.src->buffer != nullptr && ggml_backend_buffer_is_host(bank_tensor.src->buffer)) {
+        const uint8_t * host_ptr = (const uint8_t *) bank_tensor.src->data + src_offset;
+        ggml_backend_tensor_set(bank_tensor.dev, host_ptr, dst_offset, nbytes);
+        return true;
+    }
+
     std::vector<uint8_t> data(nbytes);
     ggml_backend_tensor_get(bank_tensor.src, data.data(), src_offset, nbytes);
     ggml_backend_tensor_set(bank_tensor.dev, data.data(), dst_offset, nbytes);
@@ -655,6 +664,14 @@ static bool llama_moe_gpu_expert_slot_copy_tensor(
     return true;
 }
 
+static bool llama_moe_gpu_expert_slot_stats_enabled() {
+    static const bool enabled = [] {
+        const char * v = getenv("LLAMA_MOE_SLOT_STATS");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return enabled;
+}
+
 static bool llama_moe_gpu_expert_slot_materialize(
         llama_model & model,
         int32_t slot_id,
@@ -694,9 +711,26 @@ static bool llama_moe_gpu_expert_slot_materialize(
         }
 
         size_t copied_bytes = 0;
+        const bool stats  = llama_moe_gpu_expert_slot_stats_enabled();
+        const auto stats_t0 = stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         for (const auto & bank_tensor : bank.tensors) {
             if (llama_moe_gpu_expert_bank_copy_tensor(bank_tensor, expert_id, slot_id)) {
                 copied_bytes += bank_tensor.nbytes_per_expert;
+            }
+        }
+        if (stats) {
+            auto & cache = model.moe_gpu_expert_cache;
+            const int64_t copy_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - stats_t0).count();
+            std::lock_guard<std::recursive_mutex> lock(cache.cache_mutex);
+            ++cache.n_copy;
+            cache.copy_bytes += (int64_t) copied_bytes;
+            cache.copy_ns    += copy_ns;
+            if (cache.n_copy % 4096 == 0) {
+                LLAMA_LOG_INFO("%s: MoE GPU slot stats: copies=%lld hit=%lld miss=%lld evict=%lld copy=%.1f MiB avg=%.2f ms\n",
+                        __func__, (long long) cache.n_copy, (long long) cache.n_hit, (long long) cache.n_miss,
+                        (long long) cache.n_evict, cache.copy_bytes / 1048576.0,
+                        cache.copy_ns / 1e6 / (double) std::max<int64_t>(cache.n_copy, 1));
             }
         }
 
@@ -1053,6 +1087,8 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                     model->moe_gpu_expert_cache.clear();
                 } else {
                     model->moe_gpu_expert_cache.init(effective_slots);
+                    model->moe_gpu_expert_cache.materialize_cb       = llama_moe_gpu_expert_slot_materialize_cb;
+                    model->moe_gpu_expert_cache.materialize_userdata = model.get();
                     LLAMA_LOG_INFO("%s: initialized MoE GPU expert slot cache with %d slots (requested %d)\n", __func__, effective_slots, requested_slots);
 
                     // frequency-based placement: set whitelist from freq report

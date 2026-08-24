@@ -35,21 +35,18 @@ All references are to this repo as of commit f84c58d3a.
 
 ## 2. Findings
 
-### F1: materialize_cb is never wired (correctness hazard)
+### F1: materialize_cb was never wired (correctness hazard, FIXED in Phase 1a)
 
-`materialize_cb` (src/llama-model.h:625) is checked in `ensure_resident`
-(src/llama-model.h:1056) but no code assigns it. Consequences:
+`materialize_cb` (src/llama-model.h:625) was checked in `ensure_resident`
+but no code assigned it. On a runtime miss the slot got LRU-assigned and its
+id returned to the remap, but no weights were copied into the bank slice;
+downstream `mul_mat_id` read stale bytes - silent weight corruption.
 
-- On a runtime miss the slot gets LRU-assigned and its id returned to the
-  remap, but no weights are copied into the bank slice.
-- Downstream `mul_mat_id` then reads whatever occupies that slot (stale or
-  zero) - silent weight corruption.
-- Today this stays latent because (a) full-slot mode preloads everything and
-  never misses at runtime, and (b) frequency mode is typically used with
-  `n_slots >= |whitelist|`, so runtime misses cannot happen. Any config with
-  `slots < |whitelist|` (or future dynamic eviction) hits this path.
-
-Phase 1a must wire the callback before adding async behavior.
+Reachability history: originally latent (full-slot preloads all; frequency
+mode used with slots >= |whitelist|). Commit e684d233c removed the
+whitelist-skip in `ensure_resident`, so non-whitelisted router selections in
+frequency mode now take the miss path too, making the unfilled-slot return
+reachable in a common config. Fixed by wiring the callback at cache init.
 
 ### F2: miss cost is three copies deep and fully synchronous
 
@@ -142,3 +139,16 @@ synchronous copies are race-free.
    large-bank regime, DFlash interplay.
 5. Huihui DeepSeek-V4-Flash-0731 abliterated Q2 (86.7 GB): final target,
    mmap/NVMe tier stress.
+
+## 7. Implementation status
+
+Phase 1a (this change set, build pending machine idle):
+
+- materialize_cb wired at cache init (src/llama.cpp, cache init block)
+- direct host->VRAM copy in llama_moe_gpu_expert_bank_copy_tensor when the
+  source buffer is host-backed; staging fallback kept for other cases
+- telemetry: LLAMA_MOE_SLOT_STATS=1 enables n_copy / copy_bytes / copy_ns
+  counters with a log line every 4096 materializations
+
+Deferred to follow-up commits: batched per-layer misses inside the remap op,
+inter-step speculative prefetch (Phase 1b).

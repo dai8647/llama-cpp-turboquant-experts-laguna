@@ -630,6 +630,11 @@ struct llama_moe_gpu_expert_cache {
     int64_t n_miss = 0;
     int64_t n_evict = 0;
 
+    // materialization telemetry (LLAMA_MOE_SLOT_STATS=1), cache_mutex guarded
+    int64_t n_copy = 0;
+    int64_t copy_bytes = 0;
+    int64_t copy_ns = 0;
+
     // guards all slot/bank state (expert_to_slot, slots_by_layer, banks_by_layer,
     // compute_tensor_by_src, clock, hit/miss counters). the eval-time slot remap
     // runs as one ggml_map_custom1 op per MoE layer on the CPU thread pool, so
@@ -667,6 +672,9 @@ struct llama_moe_gpu_expert_cache {
         n_hit = 0;
         n_miss = 0;
         n_evict = 0;
+        n_copy = 0;
+        copy_bytes = 0;
+        copy_ns = 0;
     }
 
     bool is_in_frequency_whitelist(int32_t layer_id, int32_t expert_id) const {
@@ -707,6 +715,9 @@ struct llama_moe_gpu_expert_cache {
         n_hit = 0;
         n_miss = 0;
         n_evict = 0;
+        n_copy = 0;
+        copy_bytes = 0;
+        copy_ns = 0;
     }
 
     bool enabled() const {
