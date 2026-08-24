@@ -1124,7 +1124,7 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                 } else {
                     model->moe_gpu_expert_cache.init(effective_slots);
                     model->moe_gpu_expert_cache.materialize_cb       = llama_moe_gpu_expert_slot_materialize_cb;
-                    model->moe_gpu_expert_cache.materialize_userdata = model.get();
+                    model->moe_gpu_expert_cache.materialize_userdata = (llama_model *) model;
                     if (const char * pf = getenv("LLAMA_MOE_PREFETCH_MS")) {
                         model->moe_gpu_expert_cache.prefetch_budget_ms = atof(pf);
                     }

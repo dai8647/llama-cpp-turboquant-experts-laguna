@@ -2031,7 +2031,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // flight, so its synchronous H2D copies stay race-free; decode-only
     // (n_tokens_all == 1), opt-in via LLAMA_MOE_PREFETCH_MS
     if (n_tokens_all == 1 && model.moe_gpu_expert_cache.prefetch_budget_ms > 0.0) {
-        llama_moe_gpu_expert_slot_prefetch(model, model.moe_gpu_expert_cache.prefetch_budget_ms);
+        // prefetch mutates the shared cache by design; the context only holds
+        // a const view of the model
+        llama_moe_gpu_expert_slot_prefetch(const_cast<llama_model &>(model),
+                model.moe_gpu_expert_cache.prefetch_budget_ms);
     }
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
