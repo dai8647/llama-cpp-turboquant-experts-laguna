@@ -660,6 +660,11 @@ struct llama_moe_gpu_expert_cache {
         return out;
     }
 
+    int64_t next_clock() {
+        std::lock_guard<std::recursive_mutex> lock(cache_mutex);
+        return ++clock;
+    }
+
     // guards all slot/bank state (expert_to_slot, slots_by_layer, banks_by_layer,
     // compute_tensor_by_src, clock, hit/miss counters). the eval-time slot remap
     // runs as one ggml_map_custom1 op per MoE layer on the CPU thread pool, so

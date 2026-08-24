@@ -862,7 +862,7 @@ void llama_moe_gpu_expert_slot_prefetch(struct llama_model & model, double budge
                 continue;
             }
 
-            int32_t slot = cache.preload_or_assign_slot(layer_id, expert_id, ++cache.clock);
+            int32_t slot = cache.preload_or_assign_slot(layer_id, expert_id, cache.next_clock());
             if (slot < 0) {
                 continue;
             }
