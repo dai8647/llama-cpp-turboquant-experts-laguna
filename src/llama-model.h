@@ -635,6 +635,31 @@ struct llama_moe_gpu_expert_cache {
     int64_t copy_bytes = 0;
     int64_t copy_ns = 0;
 
+    // inter-step speculative prefetch (LLAMA_MOE_PREFETCH_MS), cache_mutex guarded
+    double prefetch_budget_ms = 0.0;
+    std::unordered_map<int32_t, std::vector<int32_t>> last_selections;
+
+    void record_selections(int32_t layer_id, const int32_t * ids, int64_t n) {
+        std::lock_guard<std::recursive_mutex> lock(cache_mutex);
+        auto & v = last_selections[layer_id];
+        for (int64_t i = 0; i < n; ++i) {
+            if (ids[i] >= 0 && std::find(v.begin(), v.end(), ids[i]) == v.end()) {
+                v.push_back(ids[i]);
+            }
+        }
+    }
+
+    std::vector<std::pair<int32_t, std::vector<int32_t>>> take_last_selections() {
+        std::lock_guard<std::recursive_mutex> lock(cache_mutex);
+        std::vector<std::pair<int32_t, std::vector<int32_t>>> out;
+        out.reserve(last_selections.size());
+        for (auto & kv : last_selections) {
+            out.emplace_back(kv.first, std::move(kv.second));
+        }
+        last_selections.clear();
+        return out;
+    }
+
     // guards all slot/bank state (expert_to_slot, slots_by_layer, banks_by_layer,
     // compute_tensor_by_src, clock, hit/miss counters). the eval-time slot remap
     // runs as one ggml_map_custom1 op per MoE layer on the CPU thread pool, so
@@ -675,6 +700,7 @@ struct llama_moe_gpu_expert_cache {
         n_copy = 0;
         copy_bytes = 0;
         copy_ns = 0;
+        last_selections.clear();
     }
 
     bool is_in_frequency_whitelist(int32_t layer_id, int32_t expert_id) const {
@@ -718,6 +744,7 @@ struct llama_moe_gpu_expert_cache {
         n_copy = 0;
         copy_bytes = 0;
         copy_ns = 0;
+        last_selections.clear();
     }
 
     bool enabled() const {
@@ -1069,6 +1096,9 @@ struct llama_moe_gpu_expert_cache {
         return slot;
     }
 };
+
+// inter-step speculative expert prefetch; budget_ms <= 0 disables
+void llama_moe_gpu_expert_slot_prefetch(struct llama_model & model, double budget_ms);
 
 struct llama_model {
     llm_type type = LLM_TYPE_UNKNOWN;

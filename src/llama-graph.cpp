@@ -259,6 +259,10 @@ static void llm_moe_gpu_slot_remap(
     for (int64_t i = 0; i < n; ++i) {
         slots[i] = remap->cache->ensure_resident(remap->layer_id, logical[i], remap->n_experts);
     }
+
+    // remember this step's selections so the inter-step prefetch can warm
+    // likely-next experts while the GPU idles between graphs
+    remap->cache->record_selections(remap->layer_id, logical, n);
 }
 
 void llm_graph_input_mean::set_input(const llama_ubatch * ubatch) {

@@ -142,7 +142,7 @@ synchronous copies are race-free.
 
 ## 7. Implementation status
 
-Phase 1a (this change set, build pending machine idle):
+Phase 1a (commit 2cc99fa06, build pending machine idle):
 
 - materialize_cb wired at cache init (src/llama.cpp, cache init block)
 - direct host->VRAM copy in llama_moe_gpu_expert_bank_copy_tensor when the
@@ -150,5 +150,13 @@ Phase 1a (this change set, build pending machine idle):
 - telemetry: LLAMA_MOE_SLOT_STATS=1 enables n_copy / copy_bytes / copy_ns
   counters with a log line every 4096 materializations
 
-Deferred to follow-up commits: batched per-layer misses inside the remap op,
-inter-step speculative prefetch (Phase 1b).
+Phase 1b (inter-step speculative prefetch, opt-in):
+
+- remap op records per-layer router selections of the finished step
+  (record_selections / take_last_selections, cache_mutex guarded)
+- llama_moe_gpu_expert_slot_prefetch runs after each single-token decode,
+  before the next graph, bounded by LLAMA_MOE_PREFETCH_MS (default 0 = off);
+  synchronous H2D is race-free because no graph is in flight
+- known limitation: assumes serialized decode per model (single context or
+  externally serialized contexts); multi-context concurrent decode against
+  one model must not enable it until stream-level isolation lands

@@ -25,6 +25,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <stdexcept>
@@ -837,6 +838,41 @@ static bool llama_moe_gpu_expert_slot_materialize_cb(
             *static_cast<llama_model *>(userdata), slot_id, layer_id, expert_id, n_experts);
 }
 
+void llama_moe_gpu_expert_slot_prefetch(struct llama_model & model, double budget_ms) {
+    auto & cache = model.moe_gpu_expert_cache;
+    if (!cache.enabled() || budget_ms <= 0.0) {
+        return;
+    }
+
+    // runs between decode steps, while no graph is in flight, so plain
+    // synchronous H2D copies cannot race with backend compute
+    const auto t_start = std::chrono::steady_clock::now();
+    for (const auto & [layer_id, ids] : cache.take_last_selections()) {
+        const auto * bank = static_cast<const llama_moe_gpu_expert_cache &>(cache).bank_for_layer(layer_id);
+        if (bank == nullptr) {
+            continue;
+        }
+
+        for (const int32_t expert_id : ids) {
+            const auto t_now = std::chrono::steady_clock::now();
+            if (std::chrono::duration<double, std::milli>(t_now - t_start).count() >= budget_ms) {
+                return;
+            }
+            if (cache.find(layer_id, expert_id) >= 0) {
+                continue;
+            }
+
+            int32_t slot = cache.preload_or_assign_slot(layer_id, expert_id, ++cache.clock);
+            if (slot < 0) {
+                continue;
+            }
+            if (!llama_moe_gpu_expert_slot_materialize(model, slot, layer_id, expert_id, bank->n_experts)) {
+                cache.release_slot(layer_id, slot);
+            }
+        }
+    }
+}
+
 static void llama_moe_gpu_expert_slot_preload(const llama_model & model) {
     auto & cache = const_cast<llama_model &>(model).moe_gpu_expert_cache;
     llama_model & model_mut = const_cast<llama_model &>(model);
@@ -1089,6 +1125,9 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                     model->moe_gpu_expert_cache.init(effective_slots);
                     model->moe_gpu_expert_cache.materialize_cb       = llama_moe_gpu_expert_slot_materialize_cb;
                     model->moe_gpu_expert_cache.materialize_userdata = model.get();
+                    if (const char * pf = getenv("LLAMA_MOE_PREFETCH_MS")) {
+                        model->moe_gpu_expert_cache.prefetch_budget_ms = atof(pf);
+                    }
                     LLAMA_LOG_INFO("%s: initialized MoE GPU expert slot cache with %d slots (requested %d)\n", __func__, effective_slots, requested_slots);
 
                     // frequency-based placement: set whitelist from freq report
