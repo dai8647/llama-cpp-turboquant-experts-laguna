@@ -1342,7 +1342,7 @@ static bool llama_moe_qstar_exec_build(llama_model & model, int32_t layer_id) {
 
     for (const ggml_tensor * w : { w_in0, w_in1 }) {
         if (w == nullptr || !has_expert_axis(w) ||
-            w->ne[0] != n_embd || w->type != w_down->type) {
+            w->ne[0] != n_embd) {
             LLAMA_LOG_WARN("%s: q* host exec unsupported at layer %d: incompatible expert tensor layout\n",
                     __func__, layer_id);
             ex.supported = false;
