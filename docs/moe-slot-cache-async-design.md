@@ -118,13 +118,24 @@ synchronous copies are race-free.
    locking trivial). A background thread variant is a follow-up once
    measurements show the inline budget truncating useful prefetches.
 
-## 5. Later phases (recorded, not designed here)
+## 5. Later phases
 
 - Phase 2: prefill streaming - per-chunk top-k union bulk placement with
-  double buffering across layers.
+  double buffering across layers. **Outsourced 2026-08-25** (coder B,
+  branch `feat/prefill-double-buffer`, prompt:
+  `docs/outsourcing/coder-b-prefill-double-buffer.md`). Bundled with the
+  argsort graph-capture fix (§8.3) and `--moe-gpu-expert-slot-num auto`
+  elastic sizing as prerequisites.
 - Phase 3: q* split - decide PCIe fetch vs CPU GEMM per miss; requires
   measured effective H2D bandwidth vs DDR GEMV throughput; likely also
   requires exposing the backend stream for true overlap.
+  **Outsourced 2026-08-25** (coder A, branch `feat/qstar-global-lru`,
+  prompt: `docs/outsourcing/coder-a-qstar-global-lru.md`), bundled with
+  globalizing the slot budget (per-layer fixed banks -> shared pool with
+  cross-layer LRU eviction; the current per-layer partition cannot move
+  budget from cold layers to hot ones).
+- Semantic checkpoints (FreeToken technique 3): not on this roadmap yet;
+  deferred to a later round after Phase 2/3 land.
 - Multi-tier note: keep mmap enabled so RAM acts as tier 2 and NVMe as tier 3;
   prefetcher doubles as RAM warmer. DeepSeek-V4-Flash Q2 (86.7 GB) fits 96 GB
   RAM but leaves little slack, making tiers 2/3 mandatory.
@@ -160,3 +171,72 @@ Phase 1b (inter-step speculative prefetch, opt-in):
 - known limitation: assumes serialized decode per model (single context or
   externally serialized contexts); multi-context concurrent decode against
   one model must not enable it until stream-level isolation lands
+
+Phase 1c (runtime validation + lifetime fix, commits 14ebc64aa / ba24f2254 /
+f43c5e4e8, validated 2026-08-25):
+
+- remap userdata ownership moved from graph side to the cache
+  (per-layer pooled unique_ptr in llama_moe_gpu_expert_cache, model
+  lifetime). Fixes dangling userdata when the graph outlives the
+  llm_graph_context; also fixed the gfx1101 build break.
+- runtime validation on Ornith-1.5-35B-A3B and Qwen3.6-35B-A3B:
+  slot_remap fires on all MoE layers, dynamic materialize works, no
+  crash across repeated requests.
+- diagnostic fprintf instrumentation (31 sites) removed after validation;
+  only the stderr-unbuffer setvbuf kept.
+
+## 8. Runtime measurements (2026-08-25, RX 7800 XT 16GB + 96GB RAM)
+
+Model: Huihui-Qwen3.6-35B-A3B-Claude-4.7-Opus-abliterated Q4_K (20.2 GB,
+qwen35moe, 40 MoE layers, 256 experts, top-8). 32K ctx, KV q8_0, --cpu-moe,
+-fa on, -t 6, GGML_CUDA_DISABLE_GRAPHS=1 (see §8.3). Long prompt = 4670
+tokens, tg = 200 tokens.
+
+| config | short tg | long pp / tg |
+|---|---|---|
+| slots disabled (pure CPU streaming) | 12.38 t/s | 135.4 / 10.67 t/s |
+| slot30 (LRU) | 11.91 t/s | 127.8 / **11.84 t/s (+11%)** |
+| slot30 + prefetch 100ms | 11.06 t/s | n/m |
+
+Findings:
+
+1. Cache works when routing has temporal locality: after a long prefill,
+   decode is +11% vs slotless (long context keeps consecutive tokens on
+   similar routing).
+2. Short-prompt single-shot decode is -4% with slots: synchronous miss
+   copies stall more than they save. This is exactly the regime q*
+   (Phase 3) must fix.
+3. Prefill pays a -6% slot tax (miss-copy churn) - the target of Phase 2
+   double buffering.
+4. Phase 1b prefetch at 100ms budget hurts single-shot decode (11.06):
+   synchronous copies outweigh the idle-time saving. Its value must be
+   re-evaluated under batched/consecutive requests, or folded into q*.
+5. Low-locality adversarial model (Ornith-1.5-35B-A3B): ~12.4 t/s flat
+   across slot30/slot96/slotless - per-token routing churn defeats the
+   cache; q* is the only lever there.
+
+Frequency placement (Pass 1/2) status: the DeepSeek-era BLOCKED note in
+BENCH_RESULTS.md (remap deadlock) is stale - fixed by the cache_mutex
+clock fix (5edf04758) and e684d233c. Pass 1 collection now works:
+`ft_freq.json` holds a Qwen3.6-35B-A3B report (~6.9k tokens sampled).
+Top-30/layer covers 50.9% of selections (33-61% per layer), top-96
+85.1%; ~247/256 experts are touched, i.e. routing is diffuse.
+Pass 2 was exercised on 2026-08-25 with negative results (hit rate
+pinned at static coverage, no LRU adaptation, workload-mismatch
+timeouts) - see docs/frequency-placement-findings.md, including the
+finding that the collection-mode gate in ensure_resident disables
+no-whitelist slot caching entirely (relevant to the global-LRU work).
+
+### 8.3 Known bug: HIP graph capture crashes on long prefill (argsort)
+
+Prefills of ~3130+ tokens crash with:
+
+    ROCm error: operation not permitted when stream is capturing
+    -> argsort_f32_i32_cuda_hipcub (DeviceSegmentedRadixSort)
+
+ggml/src/ggml-cuda/argsort.cu already switches to the capture-safe
+DeviceSegmentedRadixSort path, but on ROCm something still allocates
+during capture (pool-miss hipMalloc of the temp workspace and/or hipcub
+internals). Workaround: GGML_CUDA_DISABLE_GRAPHS=1 (used for all §8
+measurements; costs graph wins). Assigned to coder B as the first
+deliverable of feat/prefill-double-buffer.

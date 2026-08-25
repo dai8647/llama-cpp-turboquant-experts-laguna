@@ -35,13 +35,46 @@
 - 合計 VRAM ~17.2 GB (GTT オーバーサブスクで動作)
 - DSpark acceptance ~0.88-0.95, mean len ~5.4-5.7
 
-## ホットエキスパート (frequency配置) の状態: BLOCKED
+## ホットエキスパート (frequency配置) の状態: 解除済み (2026-08-25)
 
-- `--moe-gpu-expert-slot-num 30 --moe-freq-report-out freq_dsv4.json` (Pass1 収集) は
-  実行時に `decode() failed: resource deadlock would occur` (HIP runtime error) で失敗。
-  `--cpu-moe` 併用時はサーバーが接続リセット (クラッシュ)。
-- 原因: フォークの eval-time remap (`build_moe_gpu_slot_ids` -> `ggml_cpy` +
-  `ggml_map_custom1`) が HIP バックエンドでデッドロック。map_custom1 は ggml-cpu のみ実装で、
-  GPU/CPU テンソル境界処理が HIP で破綻。
-- Pass2 (frequency whitelist適用時) も同じ map_custom1 経路を通るため、同様に壊れている可能性が高い。
-- 修正にはフォークの再ビルドが必須 (10-30分規模)。
+旧記述(DeepSeek-V4-Flash時代の `decode() failed: resource deadlock would occur`)は
+ stale。その後の修正で解決済み:
+
+- `5edf04758` moe : bump slot cache clock under cache_mutex in prefetch
+- `e684d233c` moe : fix frequency placement correctness and remove dead slot-map code
+- `ba24f2254` llama : pool MoE slot-remap userdata in the expert cache
+  (remap userdata の寿命問題を構造的に解決、gfx1101 ビルド修正込み)
+
+Pass 1 収集は Qwen3.6-35B-A3B で正常動作済み(`ft_freq.json`、約6.9kトークンサンプリング、
+40層×256エキスパート)。Pass 2 適用も下記のとおり動作確認済み。
+
+### 運用上の罠: ratio と slot 数の関係
+
+`--moe-gpu-expert-ratio` の既定値 1.0 は whitelist = 全エキスパートを意味する。
+whitelist が slot 数より大きいと:
+
+1. プリロードが whitelist 順(頻度降順)にスロットを埋め回った結果、
+   **最後に残るのは最も冷たいエキスパート**(最悪の初期配置)
+2. 全選択が「whitelist 内」と扱われ、ミスごとに 0.81ms の同期コピーが発生
+
+slot30 + ratio 1.0 の実測: ヒット率 51% で頭打ち、ミス=エビクト、6575トークンの
+プリフィルが 600s タイムアウト(コピー総量 417 GB)。**ratio は必ず
+「(1層あたり確保したいslot数 × 層数) ÷ 総エキスパート数」以下に設定すること**
+(slot30/40層/256エキスパートなら 0.117 程度)。
+
+# Huihui-Qwen3.6-35B-A3B (Q4_K 20.2GB) MoEスロットキャッシュ (RX 7800 XT 16GB)
+
+計測: bench_ft.ps1 (コードレビュー風 6575トークンプロンプト + 256トークン生成)、
+32K ctx, KV q8_0, --cpu-moe, -fa on, -t 6, GGML_CUDA_DISABLE_GRAPHS=1
+(グラフONだと長文プリフィルで argsort キャプチャクラッシュのため。
+docs/moe-slot-cache-async-design.md §8.3 参照)
+
+| Run | 構成 | pp t/s | tg t/s | 備考 |
+|---|---|---|---|---|
+| B0 | `--moe-gpu-expert-slot-num 30` (whitelistなし) | 157.6 | 12.00 | **キャッシュはゲートで無効**(実質スロットレス)。docs/frequency-placement-findings.md 発見1 |
+| F1 | B0 + `--moe-expert-placement frequency --moe-freq-report-in ft_freq.json` (ratio 1.0 既定) | TIMEOUT | - | hit 51%、ミス=エビクト、コピー417GB。上記「運用上の罠」+ findings 発見2/3 |
+| F1b | F1 の ratio を 0.117 に修正(≒top-30/層) | TIMEOUT | - | hit 51%で変わらず。whitelist不一致時の致命的悪化の実例 |
+
+(過去セッション計測、4670トークンプロンプト・tg200: スロット無効 12.38 tg /
+135.4 pp、slot30 LRU 11.84 tg(+11%) / 127.8 pp(-6%)、slot30+prefetch100ms 11.06 tg。
+詳細は docs/moe-slot-cache-async-design.md §8)
