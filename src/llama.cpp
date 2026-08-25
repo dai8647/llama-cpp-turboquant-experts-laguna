@@ -1580,6 +1580,19 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                     if (const char * qst = getenv("LLAMA_MOE_QSTAR_STATS")) {
                         model->moe_gpu_expert_cache.qstar_stats = qst[0] != '\0' && qst[0] != '0';
                     }
+                    if (model->moe_gpu_expert_cache.qstar_enabled || model->moe_gpu_expert_cache.global_lru_enabled) {
+                        // the per-step residency/mask decisions live in the
+                        // eval-time planning op; a captured-and-replayed graph
+                        // would freeze them at warmup values. there is no API
+                        // to disable graphs per-context from here, so the env
+                        // var is the only switch until ggml learns to detect
+                        // the remap op in check_compability.
+                        if (getenv("GGML_CUDA_DISABLE_GRAPHS") == nullptr) {
+                            LLAMA_LOG_WARN("%s: q*/global-LRU expert paging is incompatible with CUDA graph "
+                                    "capture (per-step slot decisions would be frozen); set GGML_CUDA_DISABLE_GRAPHS=1\n",
+                                    __func__);
+                        }
+                    }
                     if (model->moe_gpu_expert_cache.qstar_enabled) {
                         LLAMA_LOG_INFO("%s: q* bandwidth-adaptive policy enabled (threads=%d budget=%.0fus)\n",
                                 __func__, model->moe_gpu_expert_cache.qstar_threads,
