@@ -2027,6 +2027,23 @@ int llama_context::decode(const llama_batch & batch_inp) {
             copy_tensor_async_candidates(res->t_candidates,     sampling.candidates, stride, sampling.candidates_count, seq_to_output_row, sched.get());
         }
 
+        // prefill double buffering (opt-in, LLAMA_MOE_PREFILL_PF=1): the
+        // previous ubatch's graph is enqueued and likely still running, so
+        // prefetch the next chunk's predicted experts on the backend copy
+        // stream - miss H2D hides behind compute instead of stalling it
+        if (n_tokens_all > 1 && model.moe_gpu_expert_cache.prefill_pf_enabled) {
+            ggml_backend_t backend_pf = nullptr;
+            for (auto * backend : backend_ptrs) {
+                if (ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
+                    backend_pf = backend;
+                    break;
+                }
+            }
+            if (backend_pf != nullptr) {
+                llama_moe_gpu_expert_slot_prefill_prefetch(const_cast<llama_model &>(model), backend_pf);
+            }
+        }
+
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
     } while (mctx->next());

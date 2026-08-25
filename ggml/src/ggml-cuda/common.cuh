@@ -1507,6 +1507,18 @@ struct ggml_backend_cuda_context {
 
     cudaStream_t stream() { return stream(device, curr_stream_no); }
 
+    // dedicated copy stream for the MoE expert-slot prefetch extension
+    // (ggml_backend_cuda_ext_*); never used for compute
+    cudaStream_t ext_copy_stream = nullptr;
+
+    cudaStream_t ext_copy_stream_get() {
+        if (ext_copy_stream == nullptr) {
+            ggml_cuda_set_device(device);
+            CUDA_CHECK(cudaStreamCreateWithFlags(&ext_copy_stream, cudaStreamNonBlocking));
+        }
+        return ext_copy_stream;
+    }
+
     ggml_cuda_stream_context & stream_context() { return concurrent_stream_context; }
 
     cublasHandle_t cublas_handle(int device) {

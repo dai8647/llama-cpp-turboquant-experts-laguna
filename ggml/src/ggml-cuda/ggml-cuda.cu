@@ -796,6 +796,9 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
+    if (ext_copy_stream != nullptr) {
+        CUDA_CHECK(cudaStreamDestroy(ext_copy_stream));
+    }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
@@ -2651,6 +2654,76 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
+}
+
+// extension: background H2D copies on a dedicated stream (see ggml-cuda.h)
+
+void * ggml_backend_cuda_ext_copy_stream(ggml_backend_t backend) {
+    if (backend == nullptr || !ggml_backend_is_cuda(backend)) {
+        return nullptr;
+    }
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    return (void *) cuda_ctx->ext_copy_stream_get();
+}
+
+void ggml_backend_cuda_ext_h2d_async(ggml_backend_t backend, ggml_tensor * tensor,
+                                     size_t offset, const void * host, size_t size) {
+    if (!ggml_backend_is_cuda(backend)) {
+        GGML_ABORT("ggml_backend_cuda_ext_h2d_async: not a CUDA backend");
+    }
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+
+    GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+
+    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, host, size,
+                               cudaMemcpyHostToDevice, cuda_ctx->ext_copy_stream_get()));
+}
+
+void * ggml_backend_cuda_ext_event_create(ggml_backend_t backend) {
+    if (backend == nullptr || !ggml_backend_is_cuda(backend)) {
+        return nullptr;
+    }
+    cudaEvent_t event = nullptr;
+    CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+    return (void *) event;
+}
+
+void ggml_backend_cuda_ext_event_record(ggml_backend_t backend, void * event) {
+    if (backend == nullptr || !ggml_backend_is_cuda(backend) || event == nullptr) {
+        return;
+    }
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    CUDA_CHECK(cudaEventRecord((cudaEvent_t) event, cuda_ctx->ext_copy_stream_get()));
+}
+
+bool ggml_backend_cuda_ext_event_query(void * event) {
+    if (event == nullptr) {
+        return true;
+    }
+    // hipEventQuery: ROCm 7.1 ships no cudaEventQuery alias, unlike the
+    // other cuda* names used around here
+    hipError_t err = hipEventQuery((hipEvent_t) event);
+    if (err == hipSuccess) {
+        return true;
+    }
+    (void) hipGetLastError();
+    return false;
+}
+
+void ggml_backend_cuda_ext_event_synchronize(void * event) {
+    if (event == nullptr) {
+        return;
+    }
+    CUDA_CHECK(cudaEventSynchronize((cudaEvent_t) event));
+}
+
+void ggml_backend_cuda_ext_event_destroy(ggml_backend_t backend, void * event) {
+    if (event == nullptr) {
+        return;
+    }
+    GGML_UNUSED(backend);
+    CUDA_CHECK(cudaEventDestroy((cudaEvent_t) event));
 }
 
 static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data,
