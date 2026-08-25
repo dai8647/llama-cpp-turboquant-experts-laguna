@@ -153,3 +153,13 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+
+# Local bench/diag run artifacts
+
+/bench_last.json
+/bench_results.jsonl
+/smoke_last.json
+/ft_freq.json
+/pass1.err
+/pass1_*.json
+/server1.err
