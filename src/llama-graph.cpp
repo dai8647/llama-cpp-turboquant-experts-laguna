@@ -2118,7 +2118,18 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         moe_gpu_expert_cache != nullptr &&
         moe_gpu_expert_cache->enabled() &&
         !moe_gpu_expert_cache->frequency_whitelist.empty();
-    const bool use_moe_gpu_slot_cache = moe_gpu_slot_full_layer || has_freq_whitelist;
+    // dynamic paging (global LRU pool): redirect weights to the banks even
+    // with slots < experts and no whitelist. ensure_resident lifts its
+    // collection-mode skip under exactly these conditions, so ids arriving
+    // here are already slot ids (or a safe resident fallback).
+    const bool has_paging_dynamic =
+        moe_gpu_expert_cache != nullptr &&
+        moe_gpu_expert_cache->enabled() &&
+        moe_gpu_expert_cache->size() < n_expert &&
+        moe_gpu_expert_cache->frequency_whitelist.empty() &&
+        !moe_gpu_expert_cache->track_access &&
+        moe_gpu_expert_cache->global_lru_enabled;
+    const bool use_moe_gpu_slot_cache = moe_gpu_slot_full_layer || has_freq_whitelist || has_paging_dynamic;
 
     ggml_tensor * selected_experts_compute = selected_experts;
 
