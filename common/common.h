@@ -464,6 +464,10 @@ struct common_params {
     int32_t n_gpu_layers       = -1;    // number of layers to store in VRAM, -1 is auto, <= -2 is all
     int32_t n_moe_gpu_expert_slot_num = -1; // number of GPU-resident MoE expert slots, -1 disables expert-slot mode
     std::string moe_expert_placement = "all-gpu"; // placement strategy: all-gpu, frequency, cpu-moe, map
+    bool    moe_gpu_expert_global_lru = false; // share the slot budget across all layers with global LRU eviction
+    bool    moe_qstar = false;                 // q* bandwidth-adaptive policy: split cache misses between PCIe transfer and CPU execution
+    int32_t moe_qstar_threads = 3;             // dedicated worker threads for q* host-side expert GEMM
+    int32_t moe_qstar_budget_us = 300;         // per-layer per-step cumulative H2D transfer budget for q* (microseconds)
     float   moe_gpu_expert_ratio   = 1.0f;       // ratio of experts to place on GPU (0.0-1.0) for frequency mode
     std::string moe_freq_report_out;               // Pass 1: path to write frequency stats JSON (empty = no collection)
     std::string moe_freq_report_in;                // Pass 2: path to read frequency stats JSON from (empty = no application)

@@ -639,6 +639,15 @@ struct llama_moe_gpu_expert_cache {
     int64_t n_miss = 0;
     int64_t n_evict = 0;
 
+    // global LRU pool (--moe-gpu-expert-global-lru / LLAMA_MOE_GLOBAL_LRU=1):
+    // the n_slots budget is shared by all layers instead of each layer owning
+    // its own full pool; hot layers take residency from cold ones. banks keep
+    // per-layer capacity n_slots (lazy, stable pointers), only residency is
+    // globally accounted. cache_mutex guarded.
+    bool    global_lru_enabled = false;
+    int64_t n_resident_global  = 0;
+    int64_t n_evict_cross      = 0;
+
     // materialization telemetry (LLAMA_MOE_SLOT_STATS=1), cache_mutex guarded
     int64_t n_copy = 0;
     int64_t copy_bytes = 0;
@@ -729,6 +738,9 @@ struct llama_moe_gpu_expert_cache {
         n_hit = 0;
         n_miss = 0;
         n_evict = 0;
+        global_lru_enabled = false;
+        n_resident_global = 0;
+        n_evict_cross = 0;
         n_copy = 0;
         copy_bytes = 0;
         copy_ns = 0;
@@ -773,6 +785,9 @@ struct llama_moe_gpu_expert_cache {
         n_hit = 0;
         n_miss = 0;
         n_evict = 0;
+        global_lru_enabled = false;
+        n_resident_global = 0;
+        n_evict_cross = 0;
         n_copy = 0;
         copy_bytes = 0;
         copy_ns = 0;
@@ -986,6 +1001,26 @@ struct llama_moe_gpu_expert_cache {
         return victim;
     }
 
+    // globally-oldest resident across all layers; false if nothing is resident.
+    // used by the global LRU pool to let hot layers take budget from cold ones
+    bool find_global_lru_victim(int32_t & victim_layer, int32_t & victim_slot) const {
+        victim_layer = -1;
+        victim_slot  = -1;
+        for (const auto & layer_slots : slots_by_layer) {
+            for (int32_t i = 0; i < (int32_t) layer_slots.second.size(); ++i) {
+                const auto & s = layer_slots.second[i];
+                if (!s.resident) {
+                    continue;
+                }
+                if (victim_slot < 0 || s.last_used < slots_by_layer.at(victim_layer)[victim_slot].last_used) {
+                    victim_layer = layer_slots.first;
+                    victim_slot  = i;
+                }
+            }
+        }
+        return victim_slot >= 0;
+    }
+
     void assign_slot(int32_t slot_id, int32_t layer_id, int32_t expert_id, int64_t step) {
         std::lock_guard<std::recursive_mutex> lock(cache_mutex);
         if (slot_id < 0 || slot_id >= n_slots) {
@@ -995,6 +1030,8 @@ struct llama_moe_gpu_expert_cache {
         if (s.resident) {
             expert_to_slot.erase(key(s.layer_id, s.expert_id));
             s.clear_storage();
+        } else {
+            ++n_resident_global;
         }
         s.layer_id = layer_id;
         s.expert_id = expert_id;
@@ -1014,6 +1051,7 @@ struct llama_moe_gpu_expert_cache {
         auto & s = it_layer->second[slot_id];
         if (s.resident) {
             expert_to_slot.erase(key(s.layer_id, s.expert_id));
+            --n_resident_global;
         }
         s.clear_storage();
         s.resident  = false;
@@ -1098,6 +1136,28 @@ struct llama_moe_gpu_expert_cache {
         }
 
         ++n_miss;
+
+        // global LRU pool: the budget is shared across layers. when it is
+        // exhausted, evict the globally-oldest resident wherever it lives so
+        // hot layers can grow past their fair share. local-full implies
+        // global-full-and-entirely-local (per-layer capacity == n_slots), in
+        // which case the victim is local and a position frees up here too.
+        const bool global_lru = global_lru_enabled && frequency_whitelist.empty();
+        if (global_lru && n_resident_global >= n_slots) {
+            int32_t victim_layer = -1;
+            int32_t victim_slot  = -1;
+            if (find_global_lru_victim(victim_layer, victim_slot)) {
+                const auto * victim = slot_at(victim_layer, victim_slot);
+                if (victim != nullptr && victim->resident) {
+                    ++n_evict;
+                    if (victim_layer != layer_id) {
+                        ++n_evict_cross;
+                    }
+                }
+                release_slot(victim_layer, victim_slot);
+            }
+        }
+
         slot = find_free(layer_id);
         if (slot < 0) {
             slot = find_lru_victim(layer_id);

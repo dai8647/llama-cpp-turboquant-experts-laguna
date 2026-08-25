@@ -728,10 +728,13 @@ static bool llama_moe_gpu_expert_slot_materialize(
             cache.copy_bytes += (int64_t) copied_bytes;
             cache.copy_ns    += copy_ns;
             if (cache.n_copy % 4096 == 0) {
-                LLAMA_LOG_INFO("%s: MoE GPU slot stats: copies=%lld hit=%lld miss=%lld evict=%lld copy=%.1f MiB avg=%.2f ms\n",
+                LLAMA_LOG_INFO("%s: MoE GPU slot stats: copies=%lld hit=%lld miss=%lld evict=%lld residents=%lld cross_evict=%lld copy=%.1f MiB avg=%.2f ms h2d_gbps=%.2f\n",
                         __func__, (long long) cache.n_copy, (long long) cache.n_hit, (long long) cache.n_miss,
-                        (long long) cache.n_evict, cache.copy_bytes / 1048576.0,
-                        cache.copy_ns / 1e6 / (double) std::max<int64_t>(cache.n_copy, 1));
+                        (long long) cache.n_evict, (long long) cache.n_resident_global,
+                        (long long) cache.n_evict_cross,
+                        cache.copy_bytes / 1048576.0,
+                        cache.copy_ns / 1e6 / (double) std::max<int64_t>(cache.n_copy, 1),
+                        (double) cache.copy_bytes / 1e9 / (std::max<int64_t>(cache.copy_ns, 1) / 1e9));
             }
         }
 
@@ -1125,6 +1128,17 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                     model->moe_gpu_expert_cache.init(effective_slots);
                     model->moe_gpu_expert_cache.materialize_cb       = llama_moe_gpu_expert_slot_materialize_cb;
                     model->moe_gpu_expert_cache.materialize_userdata = (llama_model *) model;
+                    if (params.moe_gpu_expert_global_lru) {
+                        model->moe_gpu_expert_cache.global_lru_enabled = true;
+                        LLAMA_LOG_INFO("%s: global LRU slot pool enabled (%d slots shared across layers)\n",
+                                __func__, effective_slots);
+                    } else if (const char * glru = getenv("LLAMA_MOE_GLOBAL_LRU")) {
+                        model->moe_gpu_expert_cache.global_lru_enabled = glru[0] != '\0' && glru[0] != '0';
+                        if (model->moe_gpu_expert_cache.global_lru_enabled) {
+                            LLAMA_LOG_INFO("%s: global LRU slot pool enabled via env (%d slots shared across layers)\n",
+                                    __func__, effective_slots);
+                        }
+                    }
                     if (const char * pf = getenv("LLAMA_MOE_PREFETCH_MS")) {
                         model->moe_gpu_expert_cache.prefetch_budget_ms = atof(pf);
                     }

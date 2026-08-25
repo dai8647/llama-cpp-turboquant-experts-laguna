@@ -2712,6 +2712,40 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"--moe-gpu-expert-global-lru"},
+        "share the MoE GPU expert slot budget across all layers with global LRU eviction (hot layers take residency from cold ones)",
+        [](common_params & params) {
+            params.moe_gpu_expert_global_lru = true;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-qstar"},
+        "q* bandwidth-adaptive policy: split cache misses between PCIe transfer and host-side expert execution based on measured bandwidths (decode only)",
+        [](common_params & params) {
+            params.moe_qstar = true;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-qstar-threads"}, "N",
+        "number of dedicated worker threads for q* host-side expert GEMM (default: 3)",
+        [](common_params & params, int value) {
+            if (value < 1 || value > 32) {
+                throw std::invalid_argument("--moe-qstar-threads must be between 1 and 32");
+            }
+            params.moe_qstar_threads = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-qstar-budget-us"}, "US",
+        "per-layer per-step cumulative H2D transfer budget for q* in microseconds (default: 300)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--moe-qstar-budget-us must be >= 0");
+            }
+            params.moe_qstar_budget_us = value;
+        }
+    ));
+    add_opt(common_arg(
         {"--moe-expert-placement"}, "{all-gpu,frequency,cpu-moe,map}",
         "MoE expert placement strategy (default: all-gpu)\n"
         "- all-gpu: all experts on GPU (full-slot mode)\n"
