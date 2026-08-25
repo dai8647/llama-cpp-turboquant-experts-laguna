@@ -29,3 +29,9 @@ void argsort_f32_i32_cuda_bitonic(const float *   x,
                                   const int       nrows,
                                   ggml_sort_order order,
                                   cudaStream_t    stream);
+
+// Pre-populate the pool with every workspace buffer the cub/hipcub argsort
+// path will allocate for this op, so that a graph capture of the op never
+// triggers a device malloc (illegal while a stream is capturing).
+// No-op when the op would take the bitonic path.
+void argsort_f32_i32_reserve_capture_pool(ggml_cuda_pool & pool, const ggml_tensor * src0);
