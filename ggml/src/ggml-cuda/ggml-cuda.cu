@@ -2726,6 +2726,14 @@ void ggml_backend_cuda_ext_event_destroy(ggml_backend_t backend, void * event) {
     CUDA_CHECK(cudaEventDestroy((cudaEvent_t) event));
 }
 
+void ggml_backend_cuda_ext_set_graphs_enabled(ggml_backend_t backend, bool enable) {
+    if (!ggml_backend_is_cuda(backend)) {
+        GGML_ABORT("ggml_backend_cuda_ext_set_graphs_enabled: not a CUDA backend");
+    }
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    cuda_ctx->ext_graphs_disabled = !enable;
+}
+
 static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data,
         size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
@@ -2851,6 +2859,19 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 #ifndef NDEBUG
                 GGML_LOG_DEBUG("%s: disabling CUDA graphs due to unsupported node type\n", __func__);
 #endif
+            }
+        }
+
+        // host-side custom ops (the MoE expert-slot remap/planning/exec family,
+        // ggml_map_custom*) encode per-evaluation host decisions; capturing one
+        // would freeze them.  The scheduler currently routes these to the CPU
+        // backend so they do not appear here, but bail out if that ever
+        // changes rather than replaying stale decisions.
+        if (node->op == GGML_OP_MAP_CUSTOM1 || node->op == GGML_OP_MAP_CUSTOM2 || node->op == GGML_OP_MAP_CUSTOM3) {
+            use_cuda_graph = false;
+            static std::atomic<bool> custom_op_warned{false};
+            if (!custom_op_warned.exchange(true)) {
+                GGML_LOG_WARN("%s: disabling CUDA graphs: host custom op '%s' must not be captured\n", __func__, node->name);
             }
         }
 
@@ -4495,7 +4516,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
     if (graph->is_enabled()) {
-        const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
+        // ext_graphs_disabled: caller (e.g. MoE expert-slot paging) opted out
+        // of capture for this context via ggml_backend_cuda_ext_set_graphs_enabled
+        const bool graph_compatible = !cuda_ctx->ext_graphs_disabled && ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 

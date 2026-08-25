@@ -56,6 +56,13 @@ GGML_API bool   ggml_backend_cuda_ext_event_query(void * event);
 GGML_API void   ggml_backend_cuda_ext_event_synchronize(void * event);
 GGML_API void   ggml_backend_cuda_ext_event_destroy(ggml_backend_t backend, void * event);
 
+// extension: per-context switch for CUDA graph capture/replay.  MoE
+// expert-slot paging regimes (q*/global-LRU) decide slot residency inside
+// eval-time host ops; a captured graph would freeze those decisions at
+// warmup values, so the caller disables graphs for its accel backends
+// instead of exporting GGML_CUDA_DISABLE_GRAPHS globally.
+GGML_API void   ggml_backend_cuda_ext_set_graphs_enabled(ggml_backend_t backend, bool enable);
+
 #ifdef  __cplusplus
 }
 #endif
