@@ -678,6 +678,15 @@ struct llama_moe_qstar_layer_exec {
 struct llama_moe_gpu_expert_cache {
     using materialize_cb_t = bool (*)(void * userdata, int32_t slot_id, int32_t layer_id, int32_t expert_id, int32_t n_experts);
 
+    // the nested-compute pool is a raw handle; the implicit destructor would
+    // leak it on every model teardown (clear() only runs on explicit resets)
+    ~llama_moe_gpu_expert_cache() {
+        if (qstar_tp != nullptr) {
+            ggml_threadpool_free(qstar_tp);
+            qstar_tp = nullptr;
+        }
+    }
+
     int32_t n_slots = 0;
 
     std::unordered_map<int32_t, std::vector<llama_moe_gpu_expert_slot>> slots_by_layer;
