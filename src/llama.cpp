@@ -16,6 +16,8 @@
 #include "ggml.h"
 #include "ggml-cpp.h"
 #include "ggml-backend.h"
+#include "ggml-cpu.h"
+#include "ggml-cuda.h"
 #include "gguf.h"
 
 #include <algorithm>
@@ -683,6 +685,33 @@ static bool llama_moe_gpu_expert_slot_materialize(
         return false;
     }
 
+    auto & cache = model.moe_gpu_expert_cache;
+
+    // a background prefill copy may still be writing this slot's bank region
+    // (the slot is deliberately non-resident while in flight, so find_free
+    // can hand it to a new owner). wait for it before touching the region -
+    // if the new owner is the same expert the copy already wrote the data.
+    if (cache.prefill_pf_enabled) {
+        std::lock_guard<std::recursive_mutex> lock(cache.cache_mutex);
+        for (auto it = cache.prefill_pf_inflight.begin(); it != cache.prefill_pf_inflight.end(); ++it) {
+            if (it->layer_id != layer_id || it->slot_id != slot_id) {
+                continue;
+            }
+            ggml_backend_cuda_ext_event_synchronize(it->event);
+            ggml_backend_cuda_ext_event_destroy(cache.prefill_pf_backend, it->event);
+            const bool matches = it->expert_id == expert_id;
+            cache.prefill_pf_inflight.erase(it);
+            if (matches) {
+                auto * slot = cache.slot_at(layer_id, slot_id);
+                if (slot != nullptr) {
+                    slot->bank_backed = true;
+                }
+                return true;
+            }
+            break;
+        }
+    }
+
     ggml_backend_dev_t dev = llama_moe_gpu_expert_slot_device(model);
     if (dev == nullptr) {
         LLAMA_LOG_WARN("%s: no GPU backend device available for MoE GPU expert slot allocation\n", __func__);
@@ -871,6 +900,307 @@ void llama_moe_gpu_expert_slot_prefetch(struct llama_model & model, double budge
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// prefill double buffering: background H2D copies on the backend's dedicated
+// copy stream, issued between prefill ubatches while the previous graph is
+// still running. prediction = per-layer router selections of the previous
+// chunk (take_last_selections). opt-in: LLAMA_MOE_PREFILL_PF=1.
+// ---------------------------------------------------------------------------
+
+static void llama_moe_gpu_expert_slot_prefill_configure(llama_moe_gpu_expert_cache & cache) {
+    if (const char * pf = getenv("LLAMA_MOE_PREFILL_PF")) {
+        cache.prefill_pf_enabled = pf[0] != '\0' && pf[0] != '0';
+    }
+    if (const char * mb = getenv("LLAMA_MOE_PREFILL_PF_MB")) {
+        const int64_t v = (int64_t) (atof(mb) * 1048576.0);
+        if (v > 0) {
+            cache.prefill_pf_budget_bytes = v;
+        }
+    }
+    if (const char * n = getenv("LLAMA_MOE_PREFILL_PF_INFLIGHT")) {
+        const int64_t v = atoll(n);
+        if (v > 0) {
+            cache.prefill_pf_max_inflight = v;
+        }
+    }
+    if (cache.prefill_pf_enabled) {
+        LLAMA_LOG_INFO("%s: MoE prefill double buffering enabled (budget=%.2f MiB/ubatch, max_inflight=%lld)\n",
+                __func__, cache.prefill_pf_budget_bytes / 1048576.0,
+                (long long) cache.prefill_pf_max_inflight);
+    }
+}
+
+void llama_moe_gpu_expert_slot_prefill_prefetch(struct llama_model & model, struct ggml_backend * backend) {
+    auto & cache = model.moe_gpu_expert_cache;
+    if (!cache.enabled() || !cache.prefill_pf_enabled || backend == nullptr) {
+        return;
+    }
+    if (ggml_backend_cuda_ext_copy_stream(backend) == nullptr) {
+        return; // unsupported backend: misses stay synchronous
+    }
+    cache.prefill_pf_backend = backend;
+
+    // 1. poll background copies: completed copies flip their slot to resident
+    {
+        std::lock_guard<std::recursive_mutex> lock(cache.cache_mutex);
+        auto & inflight = cache.prefill_pf_inflight;
+        for (auto it = inflight.begin(); it != inflight.end(); ) {
+            if (!ggml_backend_cuda_ext_event_query(it->event)) {
+                ++it;
+                continue;
+            }
+            auto * slot = cache.slot_at(it->layer_id, it->slot_id);
+            if (slot != nullptr && slot->layer_id == it->layer_id &&
+                slot->expert_id == it->expert_id && !slot->resident) {
+                slot->resident = true; // n_resident_global was bumped at assign
+            }
+            ggml_backend_cuda_ext_event_destroy(backend, it->event);
+            it = inflight.erase(it);
+        }
+    }
+
+    // 2. enqueue predicted experts of the next chunk. assignment, the
+    // non-resident flip and the copy enqueue happen under one cache_mutex hold
+    // so the eval remap can never observe a resident-but-unwritten slot. the
+    // hold is per expert (pageable weight copies block the host), keeping lock
+    // waits of concurrently running remap ops bounded.
+    int64_t enqueued_bytes = 0;
+    for (const auto & [layer_id, ids] : cache.take_last_selections()) {
+        if (enqueued_bytes >= cache.prefill_pf_budget_bytes ||
+            (int64_t) cache.prefill_pf_inflight.size() >= cache.prefill_pf_max_inflight) {
+            return;
+        }
+
+        const llama_layer & layer = model.layers.at(layer_id);
+        const int32_t n_experts = llama_moe_expert_count_from_layer(layer);
+        if (n_experts <= 0) {
+            continue;
+        }
+
+        const auto * bank = static_cast<const llama_moe_gpu_expert_cache &>(cache).bank_for_layer(layer_id);
+        if (bank == nullptr || bank->tensors.empty()) {
+            {
+                std::lock_guard<std::recursive_mutex> lock(cache.cache_mutex);
+                if (!llama_moe_gpu_expert_bank_ensure(model, layer_id, n_experts)) {
+                    continue;
+                }
+            }
+            bank = static_cast<const llama_moe_gpu_expert_cache &>(cache).bank_for_layer(layer_id);
+            if (bank == nullptr || bank->tensors.empty()) {
+                continue;
+            }
+        }
+
+        // all bank tensors must be host-backed to feed a straight H2D
+        bool host_backed = true;
+        for (const auto & bt : bank->tensors) {
+            if (bt.src->buffer == nullptr || !ggml_backend_buffer_is_host(bt.src->buffer)) {
+                host_backed = false;
+                break;
+            }
+        }
+        if (!host_backed) {
+            continue; // sync materialize will handle it at remap time
+        }
+
+        for (const int32_t expert_id : ids) {
+            if (expert_id < 0 || expert_id >= n_experts) {
+                continue;
+            }
+            if (enqueued_bytes >= cache.prefill_pf_budget_bytes ||
+                (int64_t) cache.prefill_pf_inflight.size() >= cache.prefill_pf_max_inflight) {
+                return;
+            }
+
+            std::lock_guard<std::recursive_mutex> lock(cache.cache_mutex);
+            if (cache.find(layer_id, expert_id) >= 0) {
+                continue;
+            }
+            bool in_flight = false;
+            for (const auto & c : cache.prefill_pf_inflight) {
+                if (c.layer_id == layer_id && c.expert_id == expert_id) {
+                    in_flight = true;
+                    break;
+                }
+            }
+            if (in_flight) {
+                continue;
+            }
+
+            int32_t slot = cache.preload_or_assign_slot(layer_id, expert_id, cache.next_clock());
+            if (slot < 0) {
+                continue;
+            }
+            auto * s = cache.slot_at(layer_id, slot);
+            if (s == nullptr) {
+                continue;
+            }
+
+            // find_free hands out non-resident slots, so the assigned slot may
+            // still own an in-flight copy of a different expert: writing the
+            // new expert over it would corrupt the pending copy, and a later
+            // materialize drain for the old expert would then see the wrong
+            // data. release the slot and skip - the sync path takes over.
+            bool slot_busy = false;
+            for (const auto & c : cache.prefill_pf_inflight) {
+                if (c.layer_id == layer_id && c.slot_id == slot && c.expert_id != expert_id) {
+                    slot_busy = true;
+                    break;
+                }
+            }
+            if (slot_busy) {
+                cache.release_slot(layer_id, slot);
+                continue;
+            }
+
+            void * event = ggml_backend_cuda_ext_event_create(backend);
+            if (event == nullptr) {
+                cache.release_slot(layer_id, slot);
+                continue;
+            }
+            for (const auto & bt : bank->tensors) {
+                const uint8_t * host = (const uint8_t *) bt.src->data +
+                        (size_t) expert_id * bt.src->nb[bt.expert_dim];
+                const size_t dst_offset = (size_t) slot * bt.dev->nb[bt.expert_dim];
+                ggml_backend_cuda_ext_h2d_async(backend, bt.dev, dst_offset, host, bt.nbytes_per_expert);
+                enqueued_bytes += bt.nbytes_per_expert;
+            }
+            ggml_backend_cuda_ext_event_record(backend, event);
+
+            // non-resident until the copy completes: find() must miss so the
+            // graph never reads an unwritten bank region
+            s->resident = false;
+            cache.prefill_pf_inflight.push_back({ layer_id, slot, expert_id, event });
+        }
+    }
+}
+
+void llama_moe_gpu_expert_slot_prefill_shutdown(struct llama_model & model) {
+    auto & cache = model.moe_gpu_expert_cache;
+    if (cache.prefill_pf_inflight.empty()) {
+        return;
+    }
+    std::lock_guard<std::recursive_mutex> lock(cache.cache_mutex);
+    for (auto & c : cache.prefill_pf_inflight) {
+        ggml_backend_cuda_ext_event_synchronize(c.event);
+        ggml_backend_cuda_ext_event_destroy(cache.prefill_pf_backend, c.event);
+    }
+    cache.prefill_pf_inflight.clear();
+}
+
+// ---------------------------------------------------------------------------
+// elastic VRAM sizing: resolve --moe-gpu-expert-slot-num auto from free VRAM
+// after model weights + KV caches + compute buffers are resident. the cache
+// was left uninitialized at load time (auto_pending); this is the deferred
+// half of the load-time init block.
+// ---------------------------------------------------------------------------
+
+static void llama_moe_gpu_expert_slot_preload(const llama_model & model); // defined below (shared with manual init)
+
+void llama_moe_gpu_expert_slot_auto_init(struct llama_model & model) {
+    auto & cache = model.moe_gpu_expert_cache;
+    if (!cache.auto_pending) {
+        return;
+    }
+    cache.auto_pending = false;
+
+    if (model.hparams.n_expert <= 0 || !llama_model_has_moe_experts(model)) {
+        LLAMA_LOG_INFO("%s: MoE GPU expert slot auto sizing skipped: model has no MoE experts\n", __func__);
+        cache.clear();
+        return;
+    }
+
+    ggml_backend_dev_t dev = llama_moe_gpu_expert_slot_device(model);
+    if (dev == nullptr) {
+        LLAMA_LOG_WARN("%s: MoE GPU expert slot auto sizing skipped: no GPU backend device\n", __func__);
+        cache.clear();
+        return;
+    }
+
+    size_t vram_free = 0;
+    size_t vram_total = 0;
+    ggml_backend_dev_memory(dev, &vram_free, &vram_total);
+
+    // one-expert cost across ALL banks: each layer bank holds n_slots copies
+    // of every expert tensor, so a slot's footprint is the sum of per-layer
+    // per-expert strides
+    int64_t unit_bytes = 0;
+    const int32_t n_experts = (int32_t) model.hparams.n_expert;
+    for (const llama_layer & layer : model.layers) {
+        const ggml_tensor * sources[] = {
+            layer.ffn_gate_exps,
+            layer.ffn_down_exps,
+            layer.ffn_up_exps,
+            layer.ffn_gate_up_exps,
+            layer.ffn_gate_exps_b,
+            layer.ffn_down_exps_b,
+            layer.ffn_up_exps_b,
+            layer.ffn_gate_up_exps_b,
+            layer.ffn_gate_exps_s,
+            layer.ffn_down_exps_s,
+            layer.ffn_up_exps_s,
+        };
+        for (const ggml_tensor * src : sources) {
+            const int32_t expert_dim = llama_moe_gpu_expert_dim(src, n_experts);
+            if (expert_dim >= 0) {
+                unit_bytes += (int64_t) src->nb[expert_dim];
+            }
+        }
+    }
+    if (unit_bytes <= 0) {
+        LLAMA_LOG_WARN("%s: MoE GPU expert slot auto sizing skipped: could not compute expert unit cost\n", __func__);
+        cache.clear();
+        return;
+    }
+
+    double margin = 0.80;
+    if (const char * m = getenv("LLAMA_MOE_AUTO_VMARGIN_FRACTION")) {
+        margin = atof(m);
+        margin = std::clamp(margin, 0.0, 1.0);
+    }
+    const int64_t budget = (int64_t) ((double) vram_free * margin);
+
+    int32_t slots_max = (int32_t) model.hparams.n_expert;
+    if (const char * cap = getenv("LLAMA_MOE_AUTO_SLOT_CAP")) {
+        const int32_t v = atoi(cap);
+        if (v > 0) {
+            slots_max = std::min(slots_max, v);
+        }
+    }
+    const int32_t slots_min = (int32_t) model.hparams.n_expert_used;
+    int32_t slots = (int32_t) (budget / unit_bytes);
+    slots = std::clamp(slots, slots_min, slots_max);
+
+    LLAMA_LOG_INFO("%s: MoE GPU expert slot auto sizing: free_vram=%.2f MiB total_vram=%.2f MiB margin=%.2f budget=%.2f MiB unit=%.2f MiB/slot slots=%d (clamped to [%d, %d])\n",
+            __func__, vram_free / 1048576.0, vram_total / 1048576.0, margin,
+            budget / 1048576.0, unit_bytes / 1048576.0, slots, slots_min, slots_max);
+
+    if (slots <= 0) {
+        LLAMA_LOG_INFO("%s: MoE GPU expert slot auto sizing: budget too small, slot mode disabled\n", __func__);
+        cache.clear();
+        return;
+    }
+
+    cache.init(slots);
+    cache.materialize_cb       = llama_moe_gpu_expert_slot_materialize_cb;
+    cache.materialize_userdata = (llama_model *) &model;
+    cache.owner_model          = &model;
+
+    // same env knobs as the manual path
+    if (const char * glru = getenv("LLAMA_MOE_GLOBAL_LRU")) {
+        cache.global_lru_enabled = glru[0] != '\0' && glru[0] != '0';
+    }
+    if (const char * pf = getenv("LLAMA_MOE_PREFETCH_MS")) {
+        cache.prefetch_budget_ms = atof(pf);
+    }
+    // (b) main merge: q* bandwidth-adaptive split dropped (audit 2026-08-25:
+    // qstar_cpu=0 across all measured rounds, calibrate crashes mid-loop)
+    llama_moe_gpu_expert_slot_prefill_configure(cache);
+
+    llama_moe_gpu_expert_slot_preload(model);
+    LLAMA_LOG_INFO("%s: MoE GPU expert slot cache initialized with %d slots (auto)\n", __func__, slots);
 }
 
 static void llama_moe_gpu_expert_slot_preload(const llama_model & model) {
@@ -1108,7 +1438,19 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                     requested_slots = INT32_MAX;
                 }
             }
-            if (requested_slots < 0) {
+            if (params.moe_gpu_expert_slot_auto) {
+                // elastic sizing: expert weights were already routed off-GPU at
+                // create_tensor time; the concrete slot count needs free VRAM
+                // AFTER weights + KV are resident, so resolve it in llama_context
+                if (params.no_alloc || !llama_model_has_moe_experts(*model)) {
+                    LLAMA_LOG_INFO("%s: MoE GPU expert slot auto sizing skipped (no_alloc=%d, has_moe=%d)\n",
+                            __func__, (int) params.no_alloc, (int) llama_model_has_moe_experts(*model));
+                    model->moe_gpu_expert_cache.clear();
+                } else {
+                    model->moe_gpu_expert_cache.auto_pending = true;
+                    LLAMA_LOG_INFO("%s: MoE GPU expert slot auto sizing requested - deferring until after KV allocation\n", __func__);
+                }
+            } else if (requested_slots < 0) {
                 model->moe_gpu_expert_cache.clear();
             } else if (params.no_alloc) {
                 LLAMA_LOG_INFO("%s: MoE GPU expert slot mode requested but no_alloc=true - skipping slot preload (tensor data not loaded)\n", __func__);
@@ -1128,6 +1470,7 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                     if (const char * pf = getenv("LLAMA_MOE_PREFETCH_MS")) {
                         model->moe_gpu_expert_cache.prefetch_budget_ms = atof(pf);
                     }
+                    llama_moe_gpu_expert_slot_prefill_configure(model->moe_gpu_expert_cache);
                     LLAMA_LOG_INFO("%s: initialized MoE GPU expert slot cache with %d slots (requested %d)\n", __func__, effective_slots, requested_slots);
 
                     // frequency-based placement: set whitelist from freq report

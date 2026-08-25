@@ -105,5 +105,80 @@ host畳み込み `mul_mat(p_mat[n_embd,r], w_col[r,1])` は ne[0] 不一致で�
 A適用後に再検証する。
 
 **スラッシング対策の方向性**: stage-b のデータは FreeToken の q* 論点そのもの
-(転送コストが勝つmissはCPU実行へ)。q*修正後、(1) -Mode qstar でCPUオフロード効果、
-(2) auto相当(157slot)のglobal-LRUでミス率低減、を測るのが次。
+(転送コストが勝つmissはCPU実行へ)。q* は (b) main merge で一旦 drop
+(下記監査 + A 受入撤回 + 8fa0959bc 系列の q* body 全削除)。
+coder A が q* cpu_exec crash を debug ビルド+ASan で切り分け直す
+までは q* は main に乗せない方針。
+
+# q* 受入基準 再現性検証 (2026-08-25 夜、 レビュー側独自)
+
+coder A の受入基準「全達成」報告 (短文 15.78 t/s / 長文 13.43 t/s / Ornith 13.07 t/s)
+を独立に検証。結論: **私の環境では短文・長文とも A の 1/3 〜 1/2 の数字で、
+   A の 13.43 t/s は再現不能**。 main マージは保留し A に確認依頼する。
+
+## 検証セットアップ (B 環境・私の手元)
+
+- feat/prefill-double-buffer HEAD = 8fa0959bc (私の逆マージ込み)
+- build-hip/bin/llama-server.exe = 17:21 ビルド (build 10471)
+- ROCm 7.1, gfx1101, RX 7800 XT 16GB + 96GB RAM
+- bench_glru_qstar.ps1 + 自作 qstar_short.ps1 を使用
+- `LLAMA_MOE_PREFILL_PF=1`, `LLAMA_MOE_SLOT_STATS=1`, `LLAMA_MOE_QSTAR_STATS=1`
+- `--moe-gpu-expert-slot-num 96 --moe-qstar`
+- graphs 状態: デフォルト (PF 有効時は graphs-ON、それ以外 OFF)
+
+## 短文 (Huihui) 9 tok → tg 256
+
+| | A 報告 | 私の実測 | 差分 |
+|---|---|---|---|
+| r1 | 13.78 t/s | 5.95 t/s | **-57%** |
+| r2 | 16.81 t/s | 5.36 t/s | **-68%** |
+| r3 | 16.76 t/s | 6.49 t/s | **-61%** |
+| avg | 15.78 | 5.93 | **-62%** |
+
+統計: `qstar_xfer=51596→145645→177254` (vs A の長文 4201 の 100倍)、
+`qstar_cpu=0` 全ラウンド、 hit 率 84% 程度、 avg copy 0.83-1.13 ms
+
+## 長文 (Huihui) 6575 tok
+
+- PF=0: REQUEST-FAILED (600s タイムアウト)
+- PF=1 (dot-source ラッパー経由で env 確認ログ出力済): REQUEST-FAILED
+- 統計: hit 80% / miss 25万回 × 0.71ms ≒ 178s → 600s タイムアウトに到達
+- `qstar_xfer=4201 qstar_cpu=0` = host exec フォールバック不発火
+
+## Ornith (短文)
+
+- 未検証 (モデルロードが必要、 GPU 占有時間を考慮し省略)
+- A 報告 avg 13.07 t/s、 Ornith テンソルレイアウトが Huihui と異なるため
+  再現性は別の話
+
+## 根本原因の仮説
+
+すべてのケースで `qstar_cpu=0` = **q* の host exec 分岐が一度も発火していない**。
+A の分析「Huihui で全ミスが CPU パスに落ちていない可能性」が正しいと
+私の検証で裏付けられた。 A の 13.43 t/s は「H2D ループが GPU 並列実行で
+多少隠れた状態で、運良く TG サンプル窓に収まった」数字と推測。
+
+## 考えられる差分
+
+- A のビルドハッシュ (最新?) と私の 8fa0959bc HEAD の挙動差
+- A の warmup 回数・q* calibration EMA の収束状態
+- A の graphs 設定 (明示なし)
+- A の 1 回目 13.78 と 2-3 回目 16+ の乖離 = warmup 不安定性の可能性
+
+## main マージ保留の根拠
+
+- 受入基準 3 項目のうち 2 項目で再現性なし
+- q* の真の寄与が機能していない疑い濃厚
+- main マージ後に再現不能が発覚するとロールバック コスト大
+- A へ確認 → 回答次第でマージ可否判断
+
+## (b) main merge 採用 (2026-08-25 夜)
+
+A 公式回答 (coder-a-reply-2026-08-25.md) + 受入数字撤回 (8dc94e3e5) を
+受けて方針変更: q* body は revert、 B の prefill double-buffering +
+elastic VRAM + per-context graphs kill switch のみ main マージ。
+
+- 採用: feat/b-only (a414acc7f)、 cherry-pick 11 コミット + q* drop
+- A 残作業: q* cpu_exec crash を debug+ASan で切り分け直し
+- B 残作業: large-prefill (6575 tok, slot96) + glru の無言クラッシュ調査
+- 監査記録は BENCH_RESULTS.md 上半分に永続化

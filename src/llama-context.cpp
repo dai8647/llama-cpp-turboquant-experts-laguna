@@ -1,6 +1,7 @@
 #include "llama-context.h"
 
 #include "ggml.h"
+#include "ggml-cuda.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
@@ -456,6 +457,22 @@ llama_context::llama_context(
         }
 
         sched_reserve();
+
+        // elastic VRAM sizing: KV caches and compute buffers are now resident,
+        // so free VRAM is the real budget for the MoE expert banks
+        llama_moe_gpu_expert_slot_auto_init(const_cast<llama_model &>(model));
+
+        // q*/global-LRU paging freezes per-step slot decisions into a captured
+        // graph; disable capture for this context's accel backends instead of
+        // requiring GGML_CUDA_DISABLE_GRAPHS globally (see llama.cpp model load)
+        if (model.moe_gpu_expert_cache.graphs_disable_pending) {
+            for (auto * backend : backend_ptrs) {
+                if (ggml_backend_is_cuda(backend)) {
+                    ggml_backend_cuda_ext_set_graphs_enabled(backend, false);
+                }
+            }
+            LLAMA_LOG_INFO("%s: q*/global-LRU paging active - CUDA graphs disabled for accel backends\n", __func__);
+        }
 
         if (!cparams.flash_attn) {
             if (ggml_is_quantized(params.type_v)) {
@@ -2021,6 +2038,23 @@ int llama_context::decode(const llama_batch & batch_inp) {
             copy_tensor_async_floats    (res->t_sampled_logits, sampling.logits,     stride, sampling.logits_count,     seq_to_output_row, sched.get());
             copy_tensor_async_floats    (res->t_sampled_probs,  sampling.probs,      stride, sampling.probs_count,      seq_to_output_row, sched.get());
             copy_tensor_async_candidates(res->t_candidates,     sampling.candidates, stride, sampling.candidates_count, seq_to_output_row, sched.get());
+        }
+
+        // prefill double buffering (opt-in, LLAMA_MOE_PREFILL_PF=1): the
+        // previous ubatch's graph is enqueued and likely still running, so
+        // prefetch the next chunk's predicted experts on the backend copy
+        // stream - miss H2D hides behind compute instead of stalling it
+        if (n_tokens_all > 1 && model.moe_gpu_expert_cache.prefill_pf_enabled) {
+            ggml_backend_t backend_pf = nullptr;
+            for (auto * backend : backend_ptrs) {
+                if (ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
+                    backend_pf = backend;
+                    break;
+                }
+            }
+            if (backend_pf != nullptr) {
+                llama_moe_gpu_expert_slot_prefill_prefetch(const_cast<llama_model &>(model), backend_pf);
+            }
         }
 
         n_outputs_prev += n_outputs;

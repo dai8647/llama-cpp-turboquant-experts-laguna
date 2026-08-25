@@ -11,3 +11,31 @@
 3i-dspark-nmax5-nommap-tq	pred=11.663 tps	pp=7.174 tps	--cpu-moe -fa on -c 8192 -np 1 -t 6 -ctk turbo4 -ctv turbo4 --no-mmap --spec-type draft-dspark --spec-draft-model C:\Users\dai86\.lmstudio\models\ggml-org\DeepSeek-V4-Flash-0731-GGUF\dspark-DeepSeek-V4-Flash-0731-MXFP4.gguf --spec-draft-n-max 5 --spec-draft-ngl 99
 3j-dspark-nmax5-nommap-tq-r2	pred=10.755 tps	pp=6.931 tps	--cpu-moe -fa on -c 8192 -np 1 -t 6 -ctk turbo4 -ctv turbo4 --no-mmap --spec-type draft-dspark --spec-draft-model C:\Users\dai86\.lmstudio\models\ggml-org\DeepSeek-V4-Flash-0731-GGUF\dspark-DeepSeek-V4-Flash-0731-MXFP4.gguf --spec-draft-n-max 5 --spec-draft-ngl 99
 verify-3i	pred=12.662 tps	pp=7.181 tps	--cpu-moe -fa on -c 8192 -np 1 -t 6 -ctk turbo4 -ctv turbo4 --no-mmap --spec-type draft-dspark --spec-draft-model C:\Users\dai86\.lmstudio\models\ggml-org\DeepSeek-V4-Flash-0731-GGUF\dspark-DeepSeek-V4-Flash-0731-MXFP4.gguf --spec-draft-n-max 5 --spec-draft-ngl 99
+vb1-graphfix: extra='--moe-gpu-expert-slot-num 30' pf= prompt=long ctx=8192 | pp= t/s ( tok) tg= t/s ( tok) load=5.1s capture_ok=False crash=False alive=True
+vb1-graphfix: extra='--moe-gpu-expert-slot-num 30' pf= prompt=long ctx=8192 | pp= t/s ( tok) tg= t/s ( tok) load=5.1s capture_ok=False crash=True alive=False
+vb2-diag: extra='--moe-gpu-expert-slot-num 30' pf= prompt=long ctx=8192 | pp= t/s ( tok) tg= t/s ( tok) load=5.1s capture_ok=False crash=True alive=False
+vb3-diag2: extra='--moe-gpu-expert-slot-num 30' pf= prompt=long ctx=8192 | pp= t/s ( tok) tg= t/s ( tok) load=5.1s capture_ok=False crash=True alive=False
+crash1: extra='' pf= prompt=long ctx=8192 | pp= t/s ( tok) tg= t/s ( tok) load=5s capture_ok=False crash=True alive=False
+vb_fix1: extra='' pf= prompt=long ctx=8192 | pp=155.31 t/s (4535 tok) tg=12.74 t/s (128 tok) load=5.1s capture_ok=False crash=False alive=True
+vb_slot0: extra='--moe-gpu-expert-slot-num 0' pf= prompt=long ctx=8192 | pp=156.70 t/s (4535 tok) tg=12.74 t/s (128 tok) load=5.2s capture_ok=False crash=False alive=True
+vb_slot30: extra='--moe-gpu-expert-slot-num 30' pf= prompt=long ctx=8192 | pp=156.31 t/s (4535 tok) tg=12.51 t/s (128 tok) load=5s capture_ok=False crash=False alive=True
+vb_slot30pf: extra='--moe-gpu-expert-slot-num 30' pf=1 prompt=long ctx=8192 | pp=156.52 t/s (4535 tok) tg=12.70 t/s (128 tok) load=5.1s capture_ok=False crash=False alive=True
+vb_auto: extra='--moe-gpu-expert-slot-num auto' pf= prompt=long ctx=8192 | pp=155.73 t/s (4535 tok) tg=13.24 t/s (128 tok) load=5.1s capture_ok=False crash=False alive=True
+vb_final: extra='' pf= prompt=long ctx=8192 | pp=152.24 t/s (4535 tok) tg=12.42 t/s (128 tok) load=5.1s capture_ok=False crash=False alive=True
+qstar-hui-short1: extra='--moe-gpu-expert-slot-num 96 --moe-qstar' prompt=short(9 tok) | tg=13.78 t/s (256 tok) qstar_xfer=7 qstar_cpu=0 (target >=12.38 PASS)
+qstar-hui-short2: extra='--moe-gpu-expert-slot-num 96 --moe-qstar' prompt=short(9 tok) | tg=16.81 t/s (256 tok)
+qstar-hui-short3: extra='--moe-gpu-expert-slot-num 96 --moe-qstar' prompt=short(9 tok) | tg=16.76 t/s (256 tok)
+qstar-hui-long: extra='--moe-gpu-expert-slot-num 96 --moe-qstar' prompt=long(6575 tok) | pp=23.0 t/s tg=13.43 t/s (128 tok) (target >=11.84 PASS, needs B prefill+sort)
+qstar-ornith-short1: extra='--moe-gpu-expert-slot-num 96 --moe-qstar' prompt=short(9 tok) Ornith | tg=13.24 t/s (256 tok) (target >=12.4 PASS, low-locality)
+qstar-ornith-short2: extra='--moe-gpu-expert-slot-num 96 --moe-qstar' prompt=short(9 tok) Ornith | tg=13.01 t/s (256 tok)
+qstar-ornith-short3: extra='--moe-gpu-expert-slot-num 96 --moe-qstar' prompt=short(9 tok) Ornith | tg=12.96 t/s (256 tok)
+=== 2026-08-25 evening: A-side audit per coder B's independent verification ===
+NOTE: A's qstar-hui-short1/2/3 (13.78/16.81/16.76 t/s) and qstar-ornith-short1/2/3 (13.24/13.01/12.96 t/s)
+      were biased by single-prompt cache warmup.  B independently measured 5-6 t/s on cold start.
+      qstar-hui-long (13.43 t/s) DID complete with B's prefill+sort in tree, but the underlying
+      q* host exec is NOT engaging for Huihui (qstar_cpu=0 always) because exec_build rejects
+      the Q4_K tensor layout (n_experts in ne[2] not ne[1]).  Numbers are NOT acceptance-ready.
+      Action: fix exec_build to allow ne[2]==n_experts, rerun B's bench_glru_qstar.ps1.
+gd_normal: extra='--moe-gpu-expert-slot-num 30' pf= prompt=short ctx=8192 | pp=172.09 t/s (6575 tok) tg=13.65 t/s (32 tok) load=5.1s capture_ok=False crash=False alive=True
+gd_glru: extra='--moe-gpu-expert-slot-num 96 --moe-gpu-expert-global-lru' pf= prompt=short ctx=8192 | pp= t/s ( tok) tg= t/s ( tok) load=6.8s capture_ok=False crash=False alive=False
+gd_glru_env: extra='--moe-gpu-expert-slot-num 96 --moe-gpu-expert-global-lru' pf= prompt=short ctx=8192 | pp= t/s ( tok) tg= t/s ( tok) load=8.2s capture_ok=False crash=False alive=False

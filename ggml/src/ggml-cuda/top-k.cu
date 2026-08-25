@@ -126,3 +126,62 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                                  cudaMemcpyDeviceToDevice, stream));
 #endif
 }
+
+void top_k_f32_i32_reserve_capture_pool(ggml_cuda_pool & pool, const ggml_tensor * src0, int64_t k) {
+    if (src0 == nullptr || src0->type != GGML_TYPE_F32 || !ggml_is_contiguous(src0)) {
+        return;
+    }
+
+    const int64_t ncols = src0->ne[0];
+    const int64_t nrows = ggml_nrows(src0);
+
+    GGML_UNUSED(k);
+
+#ifdef CUB_TOP_K_AVAILABLE
+    {
+        auto requirements = cuda::execution::require(cuda::execution::determinism::not_guaranteed,
+                                                     cuda::execution::output_ordering::unsorted);
+        auto stream_env   = cuda::stream_ref{ cudaStreamLegacy };
+        auto env          = cuda::std::execution::env{ stream_env, requirements };
+
+        auto indexes_in = cuda::make_counting_iterator(0);
+
+        size_t temp_storage_bytes = 0;
+        CUDA_CHECK(DeviceTopK::MaxPairs(nullptr, temp_storage_bytes, (float *) nullptr, cuda::discard_iterator(),
+                                        indexes_in, (int *) nullptr, (int) ncols, (int) k, env));
+        ggml_cuda_pool_alloc<uint8_t> stg(pool, std::max<size_t>(temp_storage_bytes, 256));
+    }
+#elif defined(GGML_CUDA_USE_CUB)  // CUB_TOP_K_AVAILABLE
+    {
+        const size_t ncols_pad_bytes = next_power_of_2((int) ncols) * sizeof(int);
+        const size_t max_shared_mem  = ggml_cuda_info().devices[ggml_cuda_get_device()].smpb;
+        const bool   use_bitonic     = ncols_pad_bytes <= max_shared_mem && ncols <= 1024;
+        const int    chunk_nrows     = argsort_f32_i32_cuda_cub_chunk_nrows(src0->nb[1], nrows);
+
+        ggml_cuda_pool_alloc<uint8_t> tmp_dst(pool, ncols * chunk_nrows * sizeof(int));
+        if (!use_bitonic) {
+            argsort_f32_i32_reserve_capture_pool(pool, src0);
+        }
+    }
+#elif defined(GGML_CUDA_USE_HIPCUB)  // CUB_TOP_K_AVAILABLE
+    {
+        const int chunk_nrows = argsort_f32_i32_cuda_hipcub_chunk_nrows(src0->nb[1], nrows);
+        const int64_t iter_nrows = std::min((int64_t) chunk_nrows, nrows);
+
+        size_t temp_storage_bytes = 0;
+        DeviceSegmentedRadixSort::SortPairs(nullptr, temp_storage_bytes, (float *) nullptr, (float *) nullptr,
+                                            (int *) nullptr, (int *) nullptr, (int) (ncols * iter_nrows), iter_nrows,
+                                            (const int *) nullptr, (const int *) nullptr, 0, sizeof(float) * 8);
+
+        // tmp_dst lives across the whole loop; the sort workspaces are
+        // reused per iteration, so reserving one instance covers all chunks
+        ggml_cuda_pool_alloc<uint8_t> tmp_dst(pool, ncols * chunk_nrows * sizeof(int));
+        ggml_cuda_pool_alloc<uint8_t> keys(pool, ncols * iter_nrows * sizeof(float));
+        ggml_cuda_pool_alloc<uint8_t> idx(pool, ncols * iter_nrows * sizeof(int));
+        ggml_cuda_pool_alloc<uint8_t> offs(pool, (iter_nrows + 1) * sizeof(int));
+        ggml_cuda_pool_alloc<uint8_t> stg(pool, temp_storage_bytes);
+    }
+#else                              // CUB_TOP_K_AVAILABLE
+    ggml_cuda_pool_alloc<uint8_t> tmp_dst(pool, ncols * nrows * sizeof(int));
+#endif
+}

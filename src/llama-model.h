@@ -648,6 +648,38 @@ struct llama_moe_gpu_expert_cache {
     double prefetch_budget_ms = 0.0;
     std::unordered_map<int32_t, std::vector<int32_t>> last_selections;
 
+    // elastic VRAM sizing (--moe-gpu-expert-slot-num auto): set at model load,
+    // resolved after KV allocation in the llama_context constructor
+    bool auto_pending = false;
+
+    // global-LRU paging freezes per-step slot decisions into a captured
+    // graph, so graphs must be off. set at model load, applied to the accel
+    // backends (ggml_backend_cuda_ext_set_graphs_enabled) once the context -
+    // and with it the backend pointers - exists
+    bool graphs_disable_pending = false;
+
+    // prefill double buffering (LLAMA_MOE_PREFILL_PF=1), cache_mutex guarded.
+    // background H2D copies run on the backend's dedicated copy stream; the
+    // target slot stays NON-resident until its event completes, so the eval
+    // remap treats it as a miss and materialize() drains (waits for) the copy
+    // before reusing the region - readers only ever see fully-written data.
+    bool            prefill_pf_enabled      = false;
+    int64_t         prefill_pf_budget_bytes = 256LL * 1024 * 1024; // per ubatch
+    int64_t         prefill_pf_max_inflight = 64;                  // entries
+    ggml_backend_t  prefill_pf_backend      = nullptr; // ext API backend
+
+    struct prefill_pf_copy {
+        int32_t layer_id  = -1;
+        int32_t slot_id   = -1;
+        int32_t expert_id = -1;
+        void  * event     = nullptr; // copy-stream event (ext API)
+    };
+    std::vector<prefill_pf_copy> prefill_pf_inflight;
+
+    // back-pointer to the owning model for the pooled remap userdata (the
+    // graph context carries no model reference); set alongside init()
+    const struct llama_model * owner_model = nullptr;
+
     void record_selections(int32_t layer_id, const int32_t * ids, int64_t n) {
         std::lock_guard<std::recursive_mutex> lock(cache_mutex);
         auto & v = last_selections[layer_id];
@@ -681,6 +713,16 @@ struct llama_moe_gpu_expert_cache {
     // unordered_map access corrupts the heap (observed crash inside the
     // access_mutex lock during record_access). recursive: helpers re-enter.
     // lock order is always cache_mutex -> access_mutex (one-way, no deadlock).
+    //
+    // hold-time contract shared with prefill-PF users (no other lock may be
+    // taken while held, so ordering cannot deadlock; only hold LENGTH is
+    // negotiated):
+    //  - prefill-PF: one hold per expert, around the H2D enqueue only - bounded
+    //    by pageable-copy speed, never spans graph execution
+    //  - materialize slot_busy drain: holds while synchronizing one event -
+    //    bounded by the in-flight copy that is about to finish anyway
+    // (q* bandwidth-adaptive split was dropped for the (b) main merge; if a
+    // future host-exec path is added, it must respect the same contract.)
     mutable std::recursive_mutex cache_mutex;
 
     // access tracking for frequency stats
@@ -939,6 +981,25 @@ struct llama_moe_gpu_expert_cache {
         return &(*layer_slots)[slot_id];
     }
 
+    // hit/miss classification without assigning a slot: hits bump recency and
+    // counters, misses only record the access and return -1. kept around as a
+    // utility for any future planning pass (q* was dropped in the (b) main
+    // merge; the original use case was its transfer-vs-host-exec decision).
+    int32_t find_touch(int32_t layer_id, int32_t expert_id, int64_t step) {
+        std::lock_guard<std::recursive_mutex> lock(cache_mutex);
+        record_access(layer_id, expert_id);
+        const int32_t slot = find(layer_id, expert_id);
+        if (slot >= 0) {
+            ++n_hit;
+            if (auto * s = slot_at(layer_id, slot)) {
+                s->last_used = ++clock;
+            }
+            return slot;
+        }
+        ++n_miss;
+        return -1;
+    }
+
     int32_t find(int32_t layer_id, int32_t expert_id) const {
         std::lock_guard<std::recursive_mutex> lock(cache_mutex);
         const auto it = expert_to_slot.find(key(layer_id, expert_id));
@@ -1082,9 +1143,14 @@ struct llama_moe_gpu_expert_cache {
         std::lock_guard<std::recursive_mutex> lock(cache_mutex);
         record_access(layer_id, expert_id);
 
-        // collection mode (Pass 1 of the frequency workflow, slots < experts,
-        // no whitelist): count access only, no slot assignment/materialization
-        if (frequency_whitelist.empty() && n_slots < n_experts) {
+        // Pass 1 collection (track_access) counts access only. Plain paging
+        // runs (slots < experts, no whitelist) historically did the same
+        // because graphs never redirect weights to banks in that regime; the
+        // global LRU pool is what makes dynamic banking reachable
+        // end-to-end, so it lifts the skip (graphs extend their redirect
+        // accordingly).
+        if (frequency_whitelist.empty() && n_slots < n_experts &&
+                (track_access || !global_lru_enabled)) {
             return expert_id;
         }
 

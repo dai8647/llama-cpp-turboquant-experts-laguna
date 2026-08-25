@@ -1241,7 +1241,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     pimpl(new impl{}) {
     // auto-activate frequency mode: when expert placement is "frequency" and slot-num is default (-1),
     // set slot-num to INT32_MAX so the fit calculation and model load both see the slot cache overhead
-    if (params.moe_expert_placement == "frequency" && params.n_moe_gpu_expert_slot_num < 0) {
+    if (params.moe_expert_placement == "frequency" && params.n_moe_gpu_expert_slot_num < 0 && !params.moe_gpu_expert_slot_auto) {
         params.n_moe_gpu_expert_slot_num = INT32_MAX;
     }
 
@@ -1615,7 +1615,9 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
 
     mparams.n_gpu_layers    = params.n_gpu_layers;
     mparams.n_moe_gpu_expert_slot_num = params.n_moe_gpu_expert_slot_num;
-    mparams.moe_expert_placement = params.moe_expert_placement.empty() ? nullptr : params.moe_expert_placement.c_str();
+    mparams.moe_gpu_expert_slot_auto  = params.moe_gpu_expert_slot_auto;
+    mparams.moe_gpu_expert_global_lru = params.moe_gpu_expert_global_lru;
+                mparams.moe_expert_placement = params.moe_expert_placement.empty() ? nullptr : params.moe_expert_placement.c_str();
     mparams.moe_gpu_expert_ratio = params.moe_gpu_expert_ratio;
     // Pass 1 (out) / Pass 2 (in) report paths; the deprecated --moe-freq-report-path acts as both
     const std::string & moe_report_in  = !params.moe_freq_report_in.empty()  ? params.moe_freq_report_in  : params.moe_freq_report_path;
