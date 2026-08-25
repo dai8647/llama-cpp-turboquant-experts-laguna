@@ -1615,6 +1615,10 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
 
     mparams.n_gpu_layers    = params.n_gpu_layers;
     mparams.n_moe_gpu_expert_slot_num = params.n_moe_gpu_expert_slot_num;
+    mparams.moe_gpu_expert_global_lru = params.moe_gpu_expert_global_lru;
+    mparams.moe_qstar        = params.moe_qstar;
+    mparams.moe_qstar_threads = params.moe_qstar_threads;
+    mparams.moe_qstar_budget_us = params.moe_qstar_budget_us;
     mparams.moe_expert_placement = params.moe_expert_placement.empty() ? nullptr : params.moe_expert_placement.c_str();
     mparams.moe_gpu_expert_ratio = params.moe_gpu_expert_ratio;
     // Pass 1 (out) / Pass 2 (in) report paths; the deprecated --moe-freq-report-path acts as both

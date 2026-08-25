@@ -8,6 +8,7 @@
 #include "llama-vocab.h"
 #include "llama-moe-stats.h"
 #include "ggml-cpp.h"
+#include "ggml-cpu.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -614,11 +615,64 @@ struct llama_moe_gpu_expert_bank {
 
 // userdata for the eval-time expert-id -> slot-id remap op; one instance per
 // MoE layer is pooled here (model lifetime) because built graphs are reused
-// across steps and outlive the llm_graph_context that created the nodes
+// across steps and outlive the llm_graph_context that created the nodes.
+// with the q* policy the same instance is shared by the two decode custom ops
+// (planning op, then host-exec op); graph dependencies order them per step.
 struct llm_moe_gpu_slot_remap_userdata {
     llama_moe_gpu_expert_cache * cache = nullptr;
+    const struct llama_model * model = nullptr;
     int32_t layer_id = -1;
     int32_t n_experts = 0;
+
+    // q* decode variant (filled at graph build)
+    bool    qstar_active = false;
+    int32_t n_used  = 0;   // selections per step (= n_expert_used)
+    int32_t n_embd  = 0;
+
+    // q* planning -> exec handoff, rewritten every step by the planning op
+    std::vector<int32_t> qstar_deferred; // experts routed to host execution
+};
+
+// per-layer host-side expert execution engine for the q* policy: one tiny
+// static ggml graph whose weight tensors alias the original host/mmap weight
+// storage (zero copies; any expert id selectable at run time via mul_mat_id).
+// all non-weight tensors live in one owned scratch block with data pointers
+// assigned at build time.
+struct llama_moe_qstar_layer_exec {
+    bool ready     = false;
+    bool supported = true; // false: layer falls back to transfer-always
+
+    int32_t n_ff   = 0;
+    int32_t n_embd = 0;
+    size_t r_max   = 0;
+    bool fused_gate_up = false;
+
+    // aliased source weights and per-expert strides (bytes)
+    const void * gate_data   = nullptr;
+    const void * up_data     = nullptr;
+    const void * down_data   = nullptr;
+    const void * gateup_data = nullptr;
+    size_t gate_stride = 0, up_stride = 0, down_stride = 0, gateup_stride = 0;
+    enum ggml_type wtype = GGML_TYPE_F32;
+    float scale_gate = 1.0f, scale_up = 1.0f, scale_down = 1.0f;
+
+    ggml_context_ptr ctx;
+    ggml_cgraph * gf = nullptr;          // owned by ctx
+    ggml_tensor * t_ids = nullptr;       // [r,1] i32, data swapped per call
+    ggml_tensor * t_ids_down = nullptr;  // [1,r] i32, same linear buffer
+    ggml_tensor * t_x   = nullptr;       // [n_embd, 1, 1] f32 token vector
+    ggml_tensor * t_y   = nullptr;       // [n_embd, r] f32 out
+    std::vector<uint8_t> mem;            // activations/intermediates scratch
+    std::vector<uint8_t> work;           // cplan work buffer
+
+    void clear_storage() {
+        ready = false;
+        gf = nullptr;
+        t_ids = t_ids_down = t_x = t_y = nullptr;
+        mem.clear();
+        work.clear();
+        ctx.reset();
+    }
 };
 
 struct llama_moe_gpu_expert_cache {
@@ -656,6 +710,68 @@ struct llama_moe_gpu_expert_cache {
     // inter-step speculative prefetch (LLAMA_MOE_PREFETCH_MS), cache_mutex guarded
     double prefetch_budget_ms = 0.0;
     std::unordered_map<int32_t, std::vector<int32_t>> last_selections;
+
+    // elastic VRAM sizing (--moe-gpu-expert-slot-num auto): set at model load,
+    // resolved after KV allocation in the llama_context constructor
+    bool auto_pending = false;
+
+    // prefill double buffering (LLAMA_MOE_PREFILL_PF=1), cache_mutex guarded.
+    // background H2D copies run on the backend's dedicated copy stream; the
+    // target slot stays NON-resident until its event completes, so the eval
+    // remap treats it as a miss and materialize() drains (waits for) the copy
+    // before reusing the region - readers only ever see fully-written data.
+    bool            prefill_pf_enabled      = false;
+    int64_t         prefill_pf_budget_bytes = 256LL * 1024 * 1024; // per ubatch
+    int64_t         prefill_pf_max_inflight = 64;                  // entries
+    ggml_backend_t  prefill_pf_backend      = nullptr; // ext API backend
+
+    struct prefill_pf_copy {
+        int32_t layer_id  = -1;
+        int32_t slot_id   = -1;
+        int32_t expert_id = -1;
+        void  * event     = nullptr; // copy-stream event (ext API)
+    };
+    std::vector<prefill_pf_copy> prefill_pf_inflight;
+
+    // back-pointer to the owning model for the pooled remap userdata (the
+    // graph context carries no model reference); set alongside init()
+    const struct llama_model * owner_model = nullptr;
+
+    // q* bandwidth-adaptive policy (--moe-qstar / LLAMA_MOE_QSTAR=1),
+    // cache_mutex guarded
+    bool    qstar_enabled   = false;
+    int32_t qstar_threads   = 3;      // dedicated host GEMM workers
+    double  qstar_budget_us = 300.0;  // per-layer per-step transfer budget
+    bool    qstar_stats     = false;  // LLAMA_MOE_QSTAR_STATS per-step logging
+
+    // calibration + runtime EMAs (us/byte units kept implicit: bytes and ns)
+    double  qstar_h2d_bps     = 0.0;  // effective H2D bandwidth (bytes/s)
+    double  qstar_h2d_fix_ns  = 0.0;  // fixed per-copy overhead (ns)
+    double  qstar_cpu_bps     = 0.0;  // host GEMV streaming rate (bytes/s)
+    int64_t qstar_expert_bytes = 0;   // weight bytes of one expert (one layer)
+    int64_t n_qstar_xfer = 0;
+    int64_t n_qstar_cpu  = 0;
+
+    struct ggml_threadpool * qstar_tp = nullptr; // dedicated nested-compute pool
+    std::map<int32_t, llama_moe_qstar_layer_exec> qstar_exec_by_layer;
+
+    // hit/miss classification without assigning a slot: hits bump recency and
+    // counters, misses only record the access and return -1 (used by the q*
+    // planning pass, which decides per miss between transfer and CPU exec)
+    int32_t find_touch(int32_t layer_id, int32_t expert_id, int64_t step) {
+        std::lock_guard<std::recursive_mutex> lock(cache_mutex);
+        record_access(layer_id, expert_id);
+        const int32_t slot = find(layer_id, expert_id);
+        if (slot >= 0) {
+            ++n_hit;
+            if (auto * s = slot_at(layer_id, slot)) {
+                s->last_used = ++clock;
+            }
+            return slot;
+        }
+        ++n_miss;
+        return -1;
+    }
 
     void record_selections(int32_t layer_id, const int32_t * ids, int64_t n) {
         std::lock_guard<std::recursive_mutex> lock(cache_mutex);
@@ -716,6 +832,7 @@ struct llama_moe_gpu_expert_cache {
         }
         llm_moe_gpu_slot_remap_userdata * ud = it->second.get();
         ud->cache     = const_cast<llama_moe_gpu_expert_cache *>(this);
+        ud->model     = owner_model;
         ud->layer_id  = layer_id;
         ud->n_experts = n_experts;
         return ud;
@@ -745,6 +862,13 @@ struct llama_moe_gpu_expert_cache {
         copy_bytes = 0;
         copy_ns = 0;
         last_selections.clear();
+        prefill_pf_enabled      = false;
+        prefill_pf_budget_bytes = 256LL * 1024 * 1024;
+        prefill_pf_max_inflight = 64;
+        prefill_pf_backend      = nullptr;
+        prefill_pf_inflight.clear();
+        n_qstar_xfer = 0;
+        n_qstar_cpu = 0;
     }
 
     bool is_in_frequency_whitelist(int32_t layer_id, int32_t expert_id) const {
@@ -792,6 +916,21 @@ struct llama_moe_gpu_expert_cache {
         copy_bytes = 0;
         copy_ns = 0;
         last_selections.clear();
+        prefill_pf_enabled      = false;
+        prefill_pf_budget_bytes = 256LL * 1024 * 1024;
+        prefill_pf_max_inflight = 64;
+        prefill_pf_backend      = nullptr;
+        prefill_pf_inflight.clear();
+        n_qstar_xfer = 0;
+        n_qstar_cpu = 0;
+        for (auto & exec : qstar_exec_by_layer) {
+            exec.second.clear_storage();
+        }
+        qstar_exec_by_layer.clear();
+        if (qstar_tp != nullptr) {
+            ggml_threadpool_free(qstar_tp);
+            qstar_tp = nullptr;
+        }
     }
 
     bool enabled() const {
@@ -1021,6 +1160,22 @@ struct llama_moe_gpu_expert_cache {
         return victim_slot >= 0;
     }
 
+    // any resident slot of this layer, or -1; used to keep paging-regime
+    // graphs from ever receiving an unbanked logical id on materialize failure
+    int32_t find_any_resident(int32_t layer_id) const {
+        std::lock_guard<std::recursive_mutex> lock(cache_mutex);
+        const auto * layer_slots = slots_for_layer(layer_id);
+        if (layer_slots == nullptr) {
+            return -1;
+        }
+        for (int32_t i = 0; i < (int32_t) layer_slots->size(); ++i) {
+            if ((*layer_slots)[i].resident) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
     void assign_slot(int32_t slot_id, int32_t layer_id, int32_t expert_id, int64_t step) {
         std::lock_guard<std::recursive_mutex> lock(cache_mutex);
         if (slot_id < 0 || slot_id >= n_slots) {
@@ -1123,11 +1278,11 @@ struct llama_moe_gpu_expert_cache {
         // Pass 1 collection (track_access) counts access only. Plain paging
         // runs (slots < experts, no whitelist) historically did the same
         // because graphs never redirect weights to banks in that regime; the
-        // global LRU pool is what makes dynamic banking reachable
-        // end-to-end, so it lifts the skip (graphs extend their redirect
-        // accordingly).
+        // global LRU pool and the q* policy are what make dynamic banking
+        // reachable end-to-end, so they lift the skip (graphs extend their
+        // redirect accordingly).
         if (frequency_whitelist.empty() && n_slots < n_experts &&
-                (track_access || !global_lru_enabled)) {
+                (track_access || !(global_lru_enabled || qstar_enabled))) {
             return expert_id;
         }
 
@@ -1180,22 +1335,64 @@ struct llama_moe_gpu_expert_cache {
 
         slot = preload_or_assign_slot(layer_id, expert_id, ++clock);
         if (slot < 0) {
-            return expert_id;
+            return safe_unbanked_fallback(layer_id, expert_id, n_experts);
         }
 
         if (materialize_cb != nullptr && !materialize_cb(materialize_userdata, slot, layer_id, expert_id, n_experts)) {
             // storage could not be allocated (e.g. VRAM exhausted); undo the
             // resident marking so the expert falls back to its CPU tensor
             release_slot(layer_id, slot);
-            return expert_id;
+            return safe_unbanked_fallback(layer_id, expert_id, n_experts);
         }
 
         return slot;
+    }
+
+    // when the graph indexes bank tensors with our return value (any paging
+    // regime), an unbanked logical id would read past the bank; hand back a
+    // resident slot instead. full-slot mode can return the logical id itself.
+    int32_t safe_unbanked_fallback(int32_t layer_id, int32_t expert_id, int32_t n_experts) const {
+        if (n_slots < n_experts) {
+            const int32_t any = find_any_resident(layer_id);
+            return any >= 0 ? any : 0;
+        }
+        return expert_id;
     }
 };
 
 // inter-step speculative expert prefetch; budget_ms <= 0 disables
 void llama_moe_gpu_expert_slot_prefetch(struct llama_model & model, double budget_ms);
+
+// elastic VRAM sizing: resolve cache.auto_pending into a concrete slot count
+// from free VRAM after model weights + KV caches are resident; runs the
+// standard preload. no-op unless auto_pending is set.
+void llama_moe_gpu_expert_slot_auto_init(struct llama_model & model);
+
+// prefill double buffering: poll completed background copies, then enqueue
+// predicted-expert H2D copies for the next prefill chunk on backend's copy
+// stream (opt-in via LLAMA_MOE_PREFILL_PF=1). backend may be null (falls back
+// to a no-op).
+void llama_moe_gpu_expert_slot_prefill_prefetch(struct llama_model & model, struct ggml_backend * backend);
+
+// prefill double buffering teardown: synchronize and release any still-in-
+// flight background copies (model unload path).
+void llama_moe_gpu_expert_slot_prefill_shutdown(struct llama_model & model);
+
+// q* bandwidth-adaptive policy: measure effective H2D and host-side GEMV
+// rates once after model load (LLAMA_MOE_SLOT_STATS logs the results)
+void llama_moe_gpu_qstar_calibrate(struct llama_model & model);
+
+// host-side execution of the given experts' FFN against the token vector x
+// (n_embd floats); accumulates UNWEIGHTED outputs into partials_out laid out
+// as [i * n_embd + d]. returns false when the layer's layout is unsupported
+// (caller then falls back to transferring that expert instead).
+bool llama_moe_gpu_qstar_cpu_exec(struct llama_model & model, int32_t layer_id,
+        const int32_t * experts, int32_t n, const float * x, float * partials_out);
+
+// lazily build (or fetch) the layer's q* host-exec mini graph without running
+// it; lets the planning op know up front whether CPU exec is available so
+// unsupported layers transfer-always instead of deferring into a void
+bool llama_moe_qstar_exec_prepare(struct llama_model & model, int32_t layer_id);
 
 struct llama_model {
     llm_type type = LLM_TYPE_UNKNOWN;

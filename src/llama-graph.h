@@ -1046,6 +1046,24 @@ struct llm_graph_context {
                   int64_t   n_expert,
                       int   il) const;
 
+    // q* decode variant of the remap above (decode-shaped ubatches only):
+    // the custom op plans residency per selection and also emits a f32 GPU
+    // mask ([r]; 0 = expert runs on host) through gpu_mask_out
+    ggml_tensor * build_moe_gpu_slot_ids_qstar(
+              ggml_tensor * logical_experts,
+                  int64_t   n_expert,
+                      int   il,
+          ggml_tensor ** gpu_mask_out) const;
+
+    // q* host-exec stage: appends a custom op over [mask | cur | pad] that
+    // computes deferred experts' FFN outputs on the CPU mini-graph; returns
+    // partials [r*n_embd] for the caller to weight and add to the aggregate
+    ggml_tensor * build_moe_qstar_exec(
+              ggml_tensor * gpu_mask,
+              ggml_tensor * ffn_inp,
+                  int64_t   n_expert,
+                      int   il) const;
+
     ggml_tensor * build_norm(
              ggml_tensor * cur,
              ggml_tensor * mw,

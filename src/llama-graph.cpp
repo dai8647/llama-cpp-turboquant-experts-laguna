@@ -265,6 +265,211 @@ static void llm_moe_gpu_slot_remap(
     remap->cache->record_selections(remap->layer_id, logical, n);
 }
 
+// q* decode planning op. input a packs [logical ids | pad] as f32 ([2r]); the
+// output carries [slot ids | gpu mask] in the same layout (ids stored as
+// float-representable integers, cast back to i32 by the graph). for each
+// selection: hits keep their slot; misses are decided by the calibrated
+// bandwidth model -- transfer iff S/B_h2d + T_fix <= S/B_cpu and the
+// per-layer-per-step budget allows, else defer to host execution (mask 0,
+// dummy slot standing in for the bank read). transfers go through
+// ensure_resident, so the global-LRU pool sees exactly the truly-resident set.
+static void llm_moe_gpu_slot_remap_qstar(
+        struct ggml_tensor * dst,
+        const struct ggml_tensor * a,
+        int ith,
+        int nth,
+        void * userdata) {
+    GGML_UNUSED(nth);
+
+    if (ith != 0) {
+        return;
+    }
+
+    auto * remap = static_cast<llm_moe_gpu_slot_remap_userdata *>(userdata);
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(a) && ggml_is_contiguous(dst));
+
+    const int64_t n2   = ggml_nelements(a);
+    const int64_t r    = n2 / 2;
+    const float * in   = static_cast<const float *>(a->data);
+    float *       out  = static_cast<float *>(dst->data);
+
+    if (remap == nullptr || remap->cache == nullptr || !remap->cache->enabled() || r == 0) {
+        // degenerate: pass ids through, everything computed on GPU
+        for (int64_t i = 0; i < r; ++i) {
+            out[i]     = in[i];
+            out[r + i] = 1.0f;
+        }
+        return;
+    }
+
+    auto * cache = remap->cache;
+
+    const int64_t step = cache->next_clock();
+
+    std::vector<int32_t>    slots(r, -1);
+    std::vector<int32_t>    logical(r);
+    std::vector<float>      mask(r, 1.0f);
+    for (int64_t i = 0; i < r; ++i) {
+        logical[i] = (int32_t) in[i];
+    }
+
+    int32_t dummy_slot = -1;
+    for (int64_t i = 0; i < r && dummy_slot < 0; ++i) {
+        slots[i] = cache->find_touch(remap->layer_id, logical[i], step);
+        if (slots[i] >= 0) {
+            dummy_slot = slots[i]; // any hit is an initialized slot
+        }
+    }
+
+    // probe (and lazily build) this layer's host-exec engine once; unsupported
+    // layers transfer-always instead of deferring into a void
+    bool cpu_ok = false;
+    if (remap->model != nullptr && cache->qstar_enabled) {
+        cpu_ok = llama_moe_qstar_exec_prepare(*const_cast<struct llama_model *>(remap->model), remap->layer_id);
+    }
+
+    const double b_h2d  = cache->qstar_h2d_bps;
+    const double t_fix  = cache->qstar_h2d_fix_ns;
+    const double b_cpu  = cache->qstar_cpu_bps;
+    const double budget = cache->qstar_budget_us * 1000.0;
+    const double bytes  = (double) cache->qstar_expert_bytes;
+
+    double   budget_used = 0.0;
+    int64_t  n_xfer      = 0;
+    remap->qstar_deferred.clear();
+
+    for (int64_t i = 0; i < r; ++i) {
+        if (slots[i] >= 0) {
+            continue; // hit: resident, stays on GPU
+        }
+
+        bool transfer = true;
+        double t_xfer = 0.0;
+        if (cpu_ok && b_h2d > 0.0 && b_cpu > 0.0 && bytes > 0.0) {
+            t_xfer   = bytes / b_h2d * 1e9 + t_fix;
+            transfer = t_xfer <= bytes / b_cpu * 1e9 &&
+                       budget_used + t_xfer <= budget;
+        }
+
+        if (!transfer) {
+            mask[i] = 0.0f;
+            remap->qstar_deferred.push_back(logical[i]);
+            continue;
+        }
+
+        const int32_t slot = cache->ensure_resident(remap->layer_id, logical[i], remap->n_experts);
+        const auto * s     = cache->slot_at(remap->layer_id, slot);
+        if (slot >= 0 && s != nullptr && s->resident) {
+            if (dummy_slot < 0) {
+                dummy_slot = slot;
+            }
+            if (cache->find(remap->layer_id, logical[i]) == slot) {
+                slots[i] = slot;
+                ++n_xfer;
+                budget_used += t_xfer;
+                continue;
+            }
+            // storage could not be materialized (fallback id); run on host
+        }
+        mask[i] = 0.0f;
+        remap->qstar_deferred.push_back(logical[i]);
+    }
+
+    // the bank chain below reads SOME slot for every selection; when nothing
+    // is resident for this layer the graph would touch uninitialized VRAM
+    // whose NaNs survive masking -- force-transfer one deferred expert first
+    if (dummy_slot < 0 && !remap->qstar_deferred.empty()) {
+        const int32_t lid  = remap->qstar_deferred.front();
+        const int32_t slot = cache->ensure_resident(remap->layer_id, lid, remap->n_experts);
+        const auto * s     = cache->slot_at(remap->layer_id, slot);
+        GGML_ASSERT(slot >= 0 && s != nullptr && s->resident &&
+                "q*: no resident slot available for a safe dummy read");
+        dummy_slot = slot;
+    }
+    GGML_ASSERT(dummy_slot >= 0);
+
+    for (int64_t i = 0; i < r; ++i) {
+        if (slots[i] < 0) {
+            slots[i] = dummy_slot; // masked out downstream
+        }
+        out[i]     = (float) slots[i];
+        out[r + i] = mask[i];
+    }
+
+    {
+        std::lock_guard<std::recursive_mutex> lock(cache->cache_mutex);
+        cache->n_qstar_xfer += n_xfer;
+        cache->n_qstar_cpu  += (int64_t) remap->qstar_deferred.size();
+        if (cache->qstar_stats) {
+            LLAMA_LOG_INFO("[q*] layer=%d xfer=%lld cpu=%zu budget_left=%.0fus\n",
+                    remap->layer_id, (long long) n_xfer, remap->qstar_deferred.size(),
+                    std::max(0.0, budget - budget_used) / 1000.0);
+        }
+    }
+
+    cache->record_selections(remap->layer_id, logical.data(), r);
+}
+
+// q* host-exec op. input packs [gpu mask | cur | pad] as f32 ([r*n_embd]);
+// output is the same-sized partials buffer, zero-filled here, with row j
+// holding the unweighted FFN output of the expert routed to the j-th
+// mask-zero selection (router weights are applied by the graph afterwards).
+static void llm_moe_gpu_qstar_exec_op(
+        struct ggml_tensor * dst,
+        const struct ggml_tensor * a,
+        int ith,
+        int nth,
+        void * userdata) {
+    GGML_UNUSED(nth);
+
+    if (ith != 0) {
+        return;
+    }
+
+    auto * remap = static_cast<llm_moe_gpu_slot_remap_userdata *>(userdata);
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+
+    const int32_t r = remap ? remap->n_used : 0;
+    const int32_t d = remap ? remap->n_embd : 0;
+    if (r <= 0 || d <= 0 || remap->model == nullptr || remap->cache == nullptr) {
+        return;
+    }
+
+    const int64_t total = ggml_nelements(dst);
+    float *       out   = static_cast<float *>(dst->data);
+    memset(out, 0, total*sizeof(float));
+
+    if (remap->qstar_deferred.empty()) {
+        return; // everything ran on the GPU this step
+    }
+
+    // k-th mask-zero selection consumes deferred[k]
+    const float * in = static_cast<const float *>(a->data);
+    std::vector<int32_t> ids;
+    std::vector<int32_t> pos;
+    ids.reserve(remap->qstar_deferred.size());
+    pos.reserve(remap->qstar_deferred.size());
+    for (int32_t i = 0; i < r && ids.size() < remap->qstar_deferred.size(); ++i) {
+        if (!(in[i] > 0.5f)) {
+            ids.push_back(remap->qstar_deferred[ids.size()]);
+            pos.push_back(i);
+        }
+    }
+    if (ids.empty()) {
+        return;
+    }
+
+    std::vector<float> tmp(ids.size()*d);
+    if (!llama_moe_gpu_qstar_cpu_exec(*const_cast<struct llama_model *>(remap->model),
+                remap->layer_id, ids.data(), (int32_t) ids.size(), in + r, tmp.data())) {
+        return; // leave zeros rather than poison the sum with garbage
+    }
+    for (size_t j = 0; j < ids.size(); ++j) {
+        memcpy(out + (size_t) pos[j]*d, tmp.data() + j*d, d*sizeof(float));
+    }
+}
+
 void llm_graph_input_mean::set_input(const llama_ubatch * ubatch) {
     if (cparams.embeddings   &&
        (cparams.pooling_type == LLAMA_POOLING_TYPE_MEAN ||
@@ -1617,6 +1822,94 @@ ggml_tensor * llm_graph_context::build_moe_gpu_slot_ids(
     return slot_ids;
 }
 
+// q* decode variant of the id remap: same contiguous-copy preamble, but the
+// custom op is the planning callback and its output additionally yields the
+// per-selection GPU mask consumed by build_moe_qstar_exec
+ggml_tensor * llm_graph_context::build_moe_gpu_slot_ids_qstar(
+          ggml_tensor * logical_experts,
+              int64_t   n_expert,
+                  int   il,
+      ggml_tensor ** gpu_mask_out) const {
+    if (logical_experts == nullptr ||
+        moe_gpu_expert_cache == nullptr ||
+        !moe_gpu_expert_cache->enabled() ||
+        il < 0 ||
+        n_expert <= 0) {
+        if (gpu_mask_out) {
+            *gpu_mask_out = nullptr;
+        }
+        return logical_experts;
+    }
+
+    // pooled with the legacy remap userdata (model lifetime): the exec op
+    // reads the deferred list the planning op wrote earlier in this graph
+    llm_moe_gpu_slot_remap_userdata * remap_ptr =
+        moe_gpu_expert_cache->get_or_create_remap_userdata(il, (int32_t) n_expert);
+    remap_ptr->qstar_active = true;
+    remap_ptr->n_used       = (int32_t) logical_experts->ne[0];
+    remap_ptr->n_embd       = (int32_t) hparams.n_embd;
+    remap_ptr->qstar_deferred.clear();
+
+    ggml_tensor * contiguous_experts = ggml_cpy(ctx0, logical_experts,
+        ggml_new_tensor_2d(ctx0, logical_experts->type, logical_experts->ne[0], logical_experts->ne[1]));
+    ggml_tensor * ids_flat = ggml_view_1d(ctx0, contiguous_experts, logical_experts->ne[0], 0);
+    ggml_tensor * ids_f32  = ggml_cast(ctx0, ids_flat, GGML_TYPE_F32);
+
+    ggml_tensor * zeros = ggml_fill(ctx0,
+            ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, ids_flat->ne[0]), 0.0f);
+    ggml_tensor * plan_in = ggml_concat(ctx0, ids_f32, zeros, 0); // [2r]
+    cb(plan_in, "ffn_moe_qstar_plan_in", il);
+
+    ggml_tensor * plan = ggml_map_custom1(ctx0, plan_in, llm_moe_gpu_slot_remap_qstar, 1, remap_ptr);
+    cb(plan, "ffn_moe_qstar_plan", il);
+
+    const int64_t r = plan->ne[0] / 2;
+    ggml_tensor * slot_ids = ggml_cast(ctx0, ggml_view_1d(ctx0, plan, r, 0), GGML_TYPE_I32);
+    if (gpu_mask_out) {
+        *gpu_mask_out = ggml_view_1d(ctx0, plan, r, r*sizeof(float));
+    }
+    cb(slot_ids, "ffn_moe_gpu_slot_ids", il);
+
+    return slot_ids;
+}
+
+// q* host-exec stage: packs [gpu mask | cur | pad] into one host buffer so the
+// custom op both runs after the planning op (data dependency via the mask) and
+// receives the token activations; returns the partials tensor [r*n_embd]
+ggml_tensor * llm_graph_context::build_moe_qstar_exec(
+          ggml_tensor * gpu_mask,
+          ggml_tensor * ffn_inp,
+              int64_t   n_expert,
+                  int   il) const {
+    if (gpu_mask == nullptr || ffn_inp == nullptr ||
+        moe_gpu_expert_cache == nullptr ||
+        !moe_gpu_expert_cache->enabled() ||
+        il < 0) {
+        return nullptr;
+    }
+
+    llm_moe_gpu_slot_remap_userdata * remap_ptr =
+        moe_gpu_expert_cache->get_or_create_remap_userdata(il, (int32_t) n_expert);
+
+    const int64_t r      = gpu_mask->ne[0];
+    const int64_t n_embd = hparams.n_embd;
+    const int64_t pad    = r*n_embd - r - n_embd;
+
+    ggml_tensor * flat_cur = ggml_reshape_1d(ctx0, ffn_inp, n_embd);
+    ggml_tensor * in_b     = flat_cur;
+    if (pad > 0) {
+        ggml_tensor * mask_pad = ggml_concat(ctx0, gpu_mask, flat_cur, 0);
+        in_b = ggml_concat(ctx0, mask_pad,
+                ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, pad), 0.0f), 0);
+    }
+    cb(in_b, "ffn_moe_qstar_exec_in", il);
+
+    ggml_tensor * partials = ggml_map_custom1(ctx0, in_b, llm_moe_gpu_qstar_exec_op, 1, remap_ptr);
+    cb(partials, "ffn_moe_qstar_partials", il);
+
+    return partials;
+}
+
 ggml_tensor * llm_graph_context::build_norm(
          ggml_tensor * cur,
          ggml_tensor * mw,
@@ -2118,9 +2411,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         moe_gpu_expert_cache != nullptr &&
         moe_gpu_expert_cache->enabled() &&
         !moe_gpu_expert_cache->frequency_whitelist.empty();
-    // dynamic paging (global LRU pool): redirect weights to the banks even
-    // with slots < experts and no whitelist. ensure_resident lifts its
-    // collection-mode skip under exactly these conditions, so ids arriving
+    // dynamic paging (global LRU pool / q* policy): redirect weights to the
+    // banks even with slots < experts and no whitelist. ensure_resident lifts
+    // its collection-mode skip under exactly these conditions, so ids arriving
     // here are already slot ids (or a safe resident fallback).
     const bool has_paging_dynamic =
         moe_gpu_expert_cache != nullptr &&
@@ -2128,17 +2421,32 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         moe_gpu_expert_cache->size() < n_expert &&
         moe_gpu_expert_cache->frequency_whitelist.empty() &&
         !moe_gpu_expert_cache->track_access &&
-        moe_gpu_expert_cache->global_lru_enabled;
+        (moe_gpu_expert_cache->global_lru_enabled || moe_gpu_expert_cache->qstar_enabled);
     const bool use_moe_gpu_slot_cache = moe_gpu_slot_full_layer || has_freq_whitelist || has_paging_dynamic;
 
+    // q* decode variant: plan residency per selection and split work between
+    // the bank chain and the host-exec engine (decode-shaped ubatches only;
+    // every other shape keeps the legacy remap so graph caches stay keyed)
+    const bool use_qstar_decode =
+        has_paging_dynamic &&
+        moe_gpu_expert_cache->qstar_enabled &&
+        n_tokens == 1 &&
+        n_expert_used >= 2;
+
     ggml_tensor * selected_experts_compute = selected_experts;
+    ggml_tensor * qstar_gpu_mask           = nullptr;
 
     // remap logical expert ids to slot ids whenever the slot cache is enabled;
     // the eval-time remap callback also records access counts for the frequency
     // report (Pass 1), which otherwise never fires when use_moe_gpu_slot_cache
     // is false (collection mode: slots < experts, no whitelist)
     if (moe_gpu_expert_cache != nullptr && moe_gpu_expert_cache->enabled()) {
-        selected_experts_compute = build_moe_gpu_slot_ids(selected_experts, n_expert, il);
+        if (use_qstar_decode) {
+            selected_experts_compute =
+                build_moe_gpu_slot_ids_qstar(selected_experts, n_expert, il, &qstar_gpu_mask);
+        } else {
+            selected_experts_compute = build_moe_gpu_slot_ids(selected_experts, n_expert, il);
+        }
     }
 
     if (use_moe_gpu_slot_cache && moe_gpu_expert_cache != nullptr) {
@@ -2182,10 +2490,22 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(weights, "ffn_moe_weights_scaled", il);
     }
 
+    // q*: zero the GPU-side contribution of host-executed selections so their
+    // dummy-slot outputs never reach the aggregate; their true router weight
+    // is re-applied on the host partial sum after aggregation
+    ggml_tensor * qstar_weights_flat = nullptr;
+    if (use_qstar_decode && qstar_gpu_mask != nullptr) {
+        qstar_weights_flat = ggml_reshape_1d(ctx0, weights, hparams.n_expert_used*n_tokens);
+        ggml_tensor * masked = ggml_mul(ctx0, qstar_weights_flat, qstar_gpu_mask);
+        cb(masked, "ffn_moe_weights_qstar_masked", il);
+        weights = ggml_reshape_3d(ctx0, masked, 1, hparams.n_expert_used, n_tokens);
+    }
+
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+    ggml_tensor * qstar_ffn_inp = cur; // pre-FFN activations for the host path
 
     if (weight_before_ffn) {
         // repeat cur to [n_embd, n_expert_used, n_tokens]
@@ -2368,6 +2688,20 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (hparams.n_expert_used == 1) {
         // avoid returning a non-contiguous tensor
         moe_out = ggml_cont(ctx0, moe_out);
+    }
+
+    // q*: run deferred experts on the host mini-graph and fold their outputs
+    // in with the true router weights (the GPU aggregate saw masked zeros)
+    if (use_qstar_decode && qstar_gpu_mask != nullptr && qstar_weights_flat != nullptr) {
+        ggml_tensor * partials = build_moe_qstar_exec(qstar_gpu_mask, qstar_ffn_inp, n_expert, il);
+        if (partials != nullptr) {
+            ggml_tensor * p_mat   = ggml_reshape_2d(ctx0, partials, n_embd, hparams.n_expert_used);
+            ggml_tensor * w_col   = ggml_reshape_2d(ctx0, qstar_weights_flat, hparams.n_expert_used, 1);
+            ggml_tensor * cpu_sum = ggml_mul_mat(ctx0, p_mat, w_col); // [n_embd, n_tokens]
+            cb(cpu_sum, "ffn_moe_qstar_cpu_out", il);
+            moe_out = ggml_add(ctx0, moe_out, cpu_sum);
+            cb(moe_out, "ffn_moe_qstar_combined", il);
+        }
     }
 
     cb(moe_out, "ffn_moe_out", il);

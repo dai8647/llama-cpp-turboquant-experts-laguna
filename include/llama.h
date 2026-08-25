@@ -314,6 +314,11 @@ extern "C" {
 
         int32_t n_gpu_layers; // number of layers to store in VRAM, a negative value means all layers
         int32_t n_moe_gpu_expert_slot_num; // number of GPU-resident MoE expert slots, -1 disables expert-slot mode
+        bool moe_gpu_expert_slot_auto; // size the slot budget from free VRAM after model+KV load (elastic sizing)
+        bool moe_gpu_expert_global_lru; // share the slot budget across all layers with a global LRU eviction pool
+        bool moe_qstar;                 // bandwidth-adaptive split of cache misses between PCIe transfer and host exec
+        int32_t moe_qstar_threads;      // dedicated worker threads for the q* host-side expert GEMM
+        int32_t moe_qstar_budget_us;    // per-layer per-step cumulative H2D transfer budget for q* (microseconds)
         const char * moe_expert_placement; // "all-gpu", "frequency", "cpu-moe", or NULL (default: all-gpu)
         float moe_gpu_expert_ratio; // ratio of experts to place on GPU for frequency mode (0.0-1.0)
         const char * moe_freq_report_in;  // Pass 2: path to read frequency stats JSON from, or NULL
