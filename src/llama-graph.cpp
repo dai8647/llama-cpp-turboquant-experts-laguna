@@ -2699,7 +2699,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             ggml_tensor * w_col   = ggml_reshape_2d(ctx0, qstar_weights_flat, hparams.n_expert_used, 1);
             // mul_mat contracts over A's ne[0], so the expert axis must sit on
             // K: transpose(p_mat)[r, n_embd] x w_col[r, 1] -> [n_embd, 1]
-            ggml_tensor * cpu_sum = ggml_mul_mat(ctx0, ggml_transpose(p_mat), w_col);
+            ggml_tensor * cpu_sum = ggml_mul_mat(ctx0, ggml_transpose(ctx0, p_mat), w_col);
             cb(cpu_sum, "ffn_moe_qstar_cpu_out", il);
             moe_out = ggml_add(ctx0, moe_out, cpu_sum);
             cb(moe_out, "ffn_moe_qstar_combined", il);
