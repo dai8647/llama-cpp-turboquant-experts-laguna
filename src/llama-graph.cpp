@@ -2697,9 +2697,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         if (partials != nullptr) {
             ggml_tensor * p_mat   = ggml_reshape_2d(ctx0, partials, n_embd, hparams.n_expert_used);
             ggml_tensor * w_col   = ggml_reshape_2d(ctx0, qstar_weights_flat, hparams.n_expert_used, 1);
-            // mul_mat contracts over A's ne[0], so the expert axis must sit on
-            // K: transpose(p_mat)[r, n_embd] x w_col[r, 1] -> [n_embd, 1]
-            ggml_tensor * cpu_sum = ggml_mul_mat(ctx0, ggml_transpose(ctx0, p_mat), w_col);
+            // the fold needs p_mat^T as the mul_mat A-side, but ggml_mul_mat
+            // rejects transposed tensors outright, so materialize the [r,
+            // n_embd] copy explicitly; r*n_embd floats per step is noise next
+            // to the host GEMV it feeds
+            ggml_tensor * pt_cont = ggml_cont(ctx0, ggml_transpose(ctx0, p_mat)); // [r, n_embd]
+            ggml_tensor * cpu_sum = ggml_mul_mat(ctx0, pt_cont, w_col);           // [n_embd, 1]
             cb(cpu_sum, "ffn_moe_qstar_cpu_out", il);
             moe_out = ggml_add(ctx0, moe_out, cpu_sum);
             cb(moe_out, "ffn_moe_qstar_combined", il);
