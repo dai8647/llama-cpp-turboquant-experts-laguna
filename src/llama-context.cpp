@@ -1,6 +1,7 @@
 #include "llama-context.h"
 
 #include "ggml.h"
+#include "ggml-cuda.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
@@ -460,6 +461,18 @@ llama_context::llama_context(
         // elastic VRAM sizing: KV caches and compute buffers are now resident,
         // so free VRAM is the real budget for the MoE expert banks
         llama_moe_gpu_expert_slot_auto_init(const_cast<llama_model &>(model));
+
+        // q*/global-LRU paging freezes per-step slot decisions into a captured
+        // graph; disable capture for this context's accel backends instead of
+        // requiring GGML_CUDA_DISABLE_GRAPHS globally (see llama.cpp model load)
+        if (model.moe_gpu_expert_cache.graphs_disable_pending) {
+            for (auto * backend : backend_ptrs) {
+                if (ggml_backend_is_cuda(backend)) {
+                    ggml_backend_cuda_ext_set_graphs_enabled(backend, false);
+                }
+            }
+            LLAMA_LOG_INFO("%s: q*/global-LRU paging active - CUDA graphs disabled for accel backends\n", __func__);
+        }
 
         if (!cparams.flash_attn) {
             if (ggml_is_quantized(params.type_v)) {
