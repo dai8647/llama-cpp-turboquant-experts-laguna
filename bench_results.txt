@@ -11,3 +11,14 @@
 3i-dspark-nmax5-nommap-tq	pred=11.663 tps	pp=7.174 tps	--cpu-moe -fa on -c 8192 -np 1 -t 6 -ctk turbo4 -ctv turbo4 --no-mmap --spec-type draft-dspark --spec-draft-model C:\Users\dai86\.lmstudio\models\ggml-org\DeepSeek-V4-Flash-0731-GGUF\dspark-DeepSeek-V4-Flash-0731-MXFP4.gguf --spec-draft-n-max 5 --spec-draft-ngl 99
 3j-dspark-nmax5-nommap-tq-r2	pred=10.755 tps	pp=6.931 tps	--cpu-moe -fa on -c 8192 -np 1 -t 6 -ctk turbo4 -ctv turbo4 --no-mmap --spec-type draft-dspark --spec-draft-model C:\Users\dai86\.lmstudio\models\ggml-org\DeepSeek-V4-Flash-0731-GGUF\dspark-DeepSeek-V4-Flash-0731-MXFP4.gguf --spec-draft-n-max 5 --spec-draft-ngl 99
 verify-3i	pred=12.662 tps	pp=7.181 tps	--cpu-moe -fa on -c 8192 -np 1 -t 6 -ctk turbo4 -ctv turbo4 --no-mmap --spec-type draft-dspark --spec-draft-model C:\Users\dai86\.lmstudio\models\ggml-org\DeepSeek-V4-Flash-0731-GGUF\dspark-DeepSeek-V4-Flash-0731-MXFP4.gguf --spec-draft-n-max 5 --spec-draft-ngl 99
+vb1-graphfix: extra='--moe-gpu-expert-slot-num 30' pf= prompt=long ctx=8192 | pp= t/s ( tok) tg= t/s ( tok) load=5.1s capture_ok=False crash=False alive=True
+vb1-graphfix: extra='--moe-gpu-expert-slot-num 30' pf= prompt=long ctx=8192 | pp= t/s ( tok) tg= t/s ( tok) load=5.1s capture_ok=False crash=True alive=False
+vb2-diag: extra='--moe-gpu-expert-slot-num 30' pf= prompt=long ctx=8192 | pp= t/s ( tok) tg= t/s ( tok) load=5.1s capture_ok=False crash=True alive=False
+vb3-diag2: extra='--moe-gpu-expert-slot-num 30' pf= prompt=long ctx=8192 | pp= t/s ( tok) tg= t/s ( tok) load=5.1s capture_ok=False crash=True alive=False
+crash1: extra='' pf= prompt=long ctx=8192 | pp= t/s ( tok) tg= t/s ( tok) load=5s capture_ok=False crash=True alive=False
+vb_fix1: extra='' pf= prompt=long ctx=8192 | pp=155.31 t/s (4535 tok) tg=12.74 t/s (128 tok) load=5.1s capture_ok=False crash=False alive=True
+vb_slot0: extra='--moe-gpu-expert-slot-num 0' pf= prompt=long ctx=8192 | pp=156.70 t/s (4535 tok) tg=12.74 t/s (128 tok) load=5.2s capture_ok=False crash=False alive=True
+vb_slot30: extra='--moe-gpu-expert-slot-num 30' pf= prompt=long ctx=8192 | pp=156.31 t/s (4535 tok) tg=12.51 t/s (128 tok) load=5s capture_ok=False crash=False alive=True
+vb_slot30pf: extra='--moe-gpu-expert-slot-num 30' pf=1 prompt=long ctx=8192 | pp=156.52 t/s (4535 tok) tg=12.70 t/s (128 tok) load=5.1s capture_ok=False crash=False alive=True
+vb_auto: extra='--moe-gpu-expert-slot-num auto' pf= prompt=long ctx=8192 | pp=155.73 t/s (4535 tok) tg=13.24 t/s (128 tok) load=5.1s capture_ok=False crash=False alive=True
+vb_final: extra='' pf= prompt=long ctx=8192 | pp=152.24 t/s (4535 tok) tg=12.42 t/s (128 tok) load=5.1s capture_ok=False crash=False alive=True
