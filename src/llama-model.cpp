@@ -2536,6 +2536,9 @@ void llama_free_model(llama_model * model) {
 }
 
 void llama_model_free(llama_model * model) {
+    if (model) {
+        llama_moe_gpu_expert_slot_prefill_shutdown(*model);
+    }
     delete model;
 }
 
