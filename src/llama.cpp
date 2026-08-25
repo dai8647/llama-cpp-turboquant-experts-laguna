@@ -1453,9 +1453,17 @@ bool llama_moe_gpu_qstar_cpu_exec(struct llama_model & model, int32_t layer_id,
     memcpy(ex.t_x->data, x, ex.n_embd*sizeof(float));
 
     // dedicated nested-compute pool; falls back to a single inline worker
+    // if the platform refuses to spawn the requested thread count (ggml_threadpool_new
+    // returns nullptr on alloc / worker-creation failure).  Treat that as a
+    // soft failure so the host exec path stays alive on a single thread.
     if (cache.qstar_tp == nullptr && cache.qstar_threads > 1) {
         struct ggml_threadpool_params tpp = ggml_threadpool_params_default(cache.qstar_threads);
         cache.qstar_tp = ggml_threadpool_new(&tpp);
+        if (cache.qstar_tp == nullptr) {
+            LLAMA_LOG_WARN("%s: q* threadpool alloc failed for n=%d, falling back to single-threaded host exec\n",
+                    __func__, cache.qstar_threads);
+            cache.qstar_threads = 1;
+        }
     }
 
     struct ggml_cplan cplan = ggml_graph_plan(ex.gf,
