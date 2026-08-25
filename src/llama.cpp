@@ -1318,7 +1318,15 @@ static bool llama_moe_qstar_exec_build(llama_model & model, int32_t layer_id) {
     }
 
     const ggml_tensor * w_down = layer.ffn_down_exps;
-    if (w_down == nullptr || llama_moe_gpu_expert_dim(w_down, n_experts) != 2) {
+    // expert tensors in the wild use two layouts: (a) Q4_K/Mixtral/GLM
+    // stores [n_embd, n_ff, n_experts, 1] (ne[2]=E, i=2) and (b) the legacy
+    // ggml MoE path stores [n_embd, n_ff, 1, n_experts] (ne[3]=E, i=3). The
+    // expert axis may sit on either dim; reject only if neither matches.
+    auto has_expert_axis = [n_experts](const ggml_tensor * w) {
+        return w != nullptr && n_experts > 0 &&
+               (w->ne[2] == n_experts || w->ne[3] == n_experts);
+    };
+    if (w_down == nullptr || !has_expert_axis(w_down)) {
         ex.supported = false;
         return false;
     }
@@ -1333,8 +1341,8 @@ static bool llama_moe_qstar_exec_build(llama_model & model, int32_t layer_id) {
     const ggml_tensor * w_in1 = fused ? w_gate_up : w_up;
 
     for (const ggml_tensor * w : { w_in0, w_in1 }) {
-        if (w == nullptr || llama_moe_gpu_expert_dim(w, n_experts) != 2 ||
-            w->ne[0] != n_embd || w->type != w_down->type || w->ne[3] != 1) {
+        if (w == nullptr || !has_expert_axis(w) ||
+            w->ne[0] != n_embd || w->type != w_down->type) {
             LLAMA_LOG_WARN("%s: q* host exec unsupported at layer %d: incompatible expert tensor layout\n",
                     __func__, layer_id);
             ex.supported = false;
