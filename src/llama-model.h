@@ -724,6 +724,12 @@ struct llama_moe_gpu_expert_cache {
     // resolved after KV allocation in the llama_context constructor
     bool auto_pending = false;
 
+    // q*/global-LRU paging freezes per-step slot decisions into a captured
+    // graph, so graphs must be off. set at model load, applied to the accel
+    // backends (ggml_backend_cuda_ext_set_graphs_enabled) once the context -
+    // and with it the backend pointers - exists
+    bool graphs_disable_pending = false;
+
     // prefill double buffering (LLAMA_MOE_PREFILL_PF=1), cache_mutex guarded.
     // background H2D copies run on the backend's dedicated copy stream; the
     // target slot stays NON-resident until its event completes, so the eval
@@ -815,6 +821,16 @@ struct llama_moe_gpu_expert_cache {
     // unordered_map access corrupts the heap (observed crash inside the
     // access_mutex lock during record_access). recursive: helpers re-enter.
     // lock order is always cache_mutex -> access_mutex (one-way, no deadlock).
+    //
+    // hold-time contract shared with q* and prefill-PF users (no other lock may
+    // be taken while held, so ordering cannot deadlock; only hold LENGTH is
+    // negotiated):
+    //  - prefill-PF: one hold per expert, around the H2D enqueue only - bounded
+    //    by pageable-copy speed, never spans graph execution
+    //  - q* exec: one hold across the whole host GEMM (tens of ms) - accepted
+    //    head-of-line blocking for np=1; PF inflight polls simply wait it out
+    //  - materialize slot_busy drain: holds while synchronizing one event -
+    //    bounded by the in-flight copy that is about to finish anyway
     mutable std::recursive_mutex cache_mutex;
 
     // access tracking for frequency stats
