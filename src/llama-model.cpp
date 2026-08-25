@@ -1305,7 +1305,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const auto & tensor_split = params.tensor_split;
 
     const int n_layer_all = hparams.n_layer_all;
-    const bool moe_gpu_expert_slot_mode = params.n_moe_gpu_expert_slot_num >= 0 && hparams.n_expert > 0;
+    // auto sizing also routes expert weights off-GPU at load time; the exact
+    // slot count is resolved after KV allocation (llama_moe_gpu_expert_slot_auto_init)
+    const bool moe_gpu_expert_slot_mode = (params.n_moe_gpu_expert_slot_num >= 0 || params.moe_gpu_expert_slot_auto) && hparams.n_expert > 0;
     const int n_gpu_layers = moe_gpu_expert_slot_mode ? n_layer_all + 1 : this->n_gpu_layers();
 
     const bool use_mmap_buffer = true;
@@ -1721,7 +1723,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 }
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
-    const bool force_cpu = (params.n_moe_gpu_expert_slot_num >= 0) && (hparams.n_expert > 0) && llama_moe_tensor_is_expert_slot_source(tn.tensor);
+    const bool force_cpu = (params.n_moe_gpu_expert_slot_num >= 0 || params.moe_gpu_expert_slot_auto) && (hparams.n_expert > 0) && llama_moe_tensor_is_expert_slot_source(tn.tensor);
     const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : force_cpu ? &pimpl->cpu_buft_list : pimpl->dev_layer.at(tn.bid).buft_list;
     ggml_tensor * t = ml.create_tensor(
         hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,

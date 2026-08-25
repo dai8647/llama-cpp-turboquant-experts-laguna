@@ -457,6 +457,10 @@ llama_context::llama_context(
 
         sched_reserve();
 
+        // elastic VRAM sizing: KV caches and compute buffers are now resident,
+        // so free VRAM is the real budget for the MoE expert banks
+        llama_moe_gpu_expert_slot_auto_init(const_cast<llama_model &>(model));
+
         if (!cparams.flash_attn) {
             if (ggml_is_quantized(params.type_v)) {
                 throw std::runtime_error("quantized V cache was requested, but this requires Flash Attention");

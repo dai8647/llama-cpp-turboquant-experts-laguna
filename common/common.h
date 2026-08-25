@@ -463,6 +463,7 @@ struct common_params {
 
     int32_t n_gpu_layers       = -1;    // number of layers to store in VRAM, -1 is auto, <= -2 is all
     int32_t n_moe_gpu_expert_slot_num = -1; // number of GPU-resident MoE expert slots, -1 disables expert-slot mode
+    bool    moe_gpu_expert_slot_auto = false; // --moe-gpu-expert-slot-num auto: size the slot budget from free VRAM after model+KV load
     std::string moe_expert_placement = "all-gpu"; // placement strategy: all-gpu, frequency, cpu-moe, map
     bool    moe_gpu_expert_global_lru = false; // share the slot budget across all layers with global LRU eviction
     bool    moe_qstar = false;                 // q* bandwidth-adaptive policy: split cache misses between PCIe transfer and CPU execution

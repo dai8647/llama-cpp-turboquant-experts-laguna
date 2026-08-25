@@ -2703,14 +2703,25 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_N_GPU_LAYERS"));
     add_opt(common_arg(
         {"--moe-gpu-expert-slot-num"}, "N",
-        "number of GPU-resident MoE expert slots for router-aware expert paging (default: -1, disabled; 0 = active_expert_count)",
-        [](common_params & params, int value) {
-            if (value < -1) {
-                throw std::invalid_argument("--moe-gpu-expert-slot-num must be >= -1");
+        "number of GPU-resident MoE expert slots for router-aware expert paging (default: -1, disabled; 0 = active_expert_count; 'auto' = size from free VRAM after model+KV load)",
+        [](common_params & params, const std::string & value) {
+            if (value == "auto") {
+                params.moe_gpu_expert_slot_auto = true;
+                params.n_moe_gpu_expert_slot_num = -1;
+                return;
             }
-            params.n_moe_gpu_expert_slot_num = value;
+            int value_i;
+            try {
+                value_i = std::stoi(value);
+            } catch (const std::exception &) {
+                throw std::invalid_argument("--moe-gpu-expert-slot-num must be 'auto' or an integer >= -1");
+            }
+            if (value_i < -1) {
+                throw std::invalid_argument("--moe-gpu-expert-slot-num must be 'auto' or an integer >= -1");
+            }
+            params.n_moe_gpu_expert_slot_num = value_i;
         }
-    ));
+    ).set_env("LLAMA_ARG_MOE_GPU_EXPERT_SLOT_NUM"));
     add_opt(common_arg(
         {"--moe-gpu-expert-global-lru"},
         "share the MoE GPU expert slot budget across all layers with global LRU eviction (hot layers take residency from cold ones)",
