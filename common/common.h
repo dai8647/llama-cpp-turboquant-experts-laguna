@@ -463,6 +463,7 @@ struct common_params {
 
     int32_t n_gpu_layers       = -1;    // number of layers to store in VRAM, -1 is auto, <= -2 is all
     int32_t n_moe_gpu_expert_slot_num = -1; // number of GPU-resident MoE expert slots, -1 disables expert-slot mode
+    bool    moe_gpu_expert_slot_auto = false; // --moe-gpu-expert-slot-num auto: size the slot budget from free VRAM after model+KV load
     std::string moe_expert_placement = "all-gpu"; // placement strategy: all-gpu, frequency, cpu-moe, map
     float   moe_gpu_expert_ratio   = 1.0f;       // ratio of experts to place on GPU (0.0-1.0) for frequency mode
     std::string moe_freq_report_out;               // Pass 1: path to write frequency stats JSON (empty = no collection)

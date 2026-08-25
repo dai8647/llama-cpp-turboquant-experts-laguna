@@ -1108,7 +1108,19 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                     requested_slots = INT32_MAX;
                 }
             }
-            if (requested_slots < 0) {
+            if (params.moe_gpu_expert_slot_auto) {
+                // elastic sizing: expert weights were already routed off-GPU at
+                // create_tensor time; the concrete slot count needs free VRAM
+                // AFTER weights + KV are resident, so resolve it in llama_context
+                if (params.no_alloc || !llama_model_has_moe_experts(*model)) {
+                    LLAMA_LOG_INFO("%s: MoE GPU expert slot auto sizing skipped (no_alloc=%d, has_moe=%d)\n",
+                            __func__, (int) params.no_alloc, (int) llama_model_has_moe_experts(*model));
+                    model->moe_gpu_expert_cache.clear();
+                } else {
+                    model->moe_gpu_expert_cache.auto_pending = true;
+                    LLAMA_LOG_INFO("%s: MoE GPU expert slot auto sizing requested - deferring until after KV allocation\n", __func__);
+                }
+            } else if (requested_slots < 0) {
                 model->moe_gpu_expert_cache.clear();
             } else if (params.no_alloc) {
                 LLAMA_LOG_INFO("%s: MoE GPU expert slot mode requested but no_alloc=true - skipping slot preload (tensor data not loaded)\n", __func__);
