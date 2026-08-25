@@ -652,7 +652,7 @@ struct llama_moe_gpu_expert_cache {
     // resolved after KV allocation in the llama_context constructor
     bool auto_pending = false;
 
-    // q*/global-LRU paging freezes per-step slot decisions into a captured
+    // global-LRU paging freezes per-step slot decisions into a captured
     // graph, so graphs must be off. set at model load, applied to the accel
     // backends (ggml_backend_cuda_ext_set_graphs_enabled) once the context -
     // and with it the backend pointers - exists
@@ -714,15 +714,15 @@ struct llama_moe_gpu_expert_cache {
     // access_mutex lock during record_access). recursive: helpers re-enter.
     // lock order is always cache_mutex -> access_mutex (one-way, no deadlock).
     //
-    // hold-time contract shared with q* and prefill-PF users (no other lock may
-    // be taken while held, so ordering cannot deadlock; only hold LENGTH is
+    // hold-time contract shared with prefill-PF users (no other lock may be
+    // taken while held, so ordering cannot deadlock; only hold LENGTH is
     // negotiated):
     //  - prefill-PF: one hold per expert, around the H2D enqueue only - bounded
     //    by pageable-copy speed, never spans graph execution
-    //  - q* exec: one hold across the whole host GEMM (tens of ms) - accepted
-    //    head-of-line blocking for np=1; PF inflight polls simply wait it out
     //  - materialize slot_busy drain: holds while synchronizing one event -
     //    bounded by the in-flight copy that is about to finish anyway
+    // (q* bandwidth-adaptive split was dropped for the (b) main merge; if a
+    // future host-exec path is added, it must respect the same contract.)
     mutable std::recursive_mutex cache_mutex;
 
     // access tracking for frequency stats
@@ -982,8 +982,9 @@ struct llama_moe_gpu_expert_cache {
     }
 
     // hit/miss classification without assigning a slot: hits bump recency and
-    // counters, misses only record the access and return -1 (used by the q*
-    // planning pass, which decides per miss between transfer and CPU exec)
+    // counters, misses only record the access and return -1. kept around as a
+    // utility for any future planning pass (q* was dropped in the (b) main
+    // merge; the original use case was its transfer-vs-host-exec decision).
     int32_t find_touch(int32_t layer_id, int32_t expert_id, int64_t step) {
         std::lock_guard<std::recursive_mutex> lock(cache_mutex);
         record_access(layer_id, expert_id);
