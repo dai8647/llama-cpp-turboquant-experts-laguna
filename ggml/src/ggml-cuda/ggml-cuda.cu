@@ -4362,6 +4362,50 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 }
 #endif // USE_CUDA_GRAPH
 
+#ifdef USE_CUDA_GRAPH
+// A device malloc while a stream is capturing aborts on HIP ("operation not
+// permitted when stream is capturing"). The cub/hipcub sort paths allocate
+// their workspaces from the pool lazily; on long-prompt shapes the pool has no
+// buffer of the required size yet, so the first captured evaluation misses.
+// Walk the graph up front and pre-populate the pool with every workspace the
+// captured ops will request.  (The other capture breaker on HIP, rocPRIM's
+// partitioned segmented radix sort doing a D2H sync copy inside the call, is
+// fixed separately in argsort.cu by switching to an unpartitioned config
+// while capturing.)
+static void ggml_cuda_reserve_capture_workspaces(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph) {
+    static const bool disabled = getenv("GGML_CUDA_DISABLE_WS_RESERVE") != nullptr;
+    if (disabled) {
+        return;
+    }
+
+    ggml_cuda_pool & pool = cuda_ctx->pool();
+
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (node == nullptr || ggml_cuda_is_view_or_noop(node)) {
+            continue;
+        }
+        if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 && node->op != GGML_OP_ARGSORT && node->op != GGML_OP_TOP_K) {
+            continue;
+        }
+        switch (node->op) {
+            case GGML_OP_ARGSORT:
+                if (node->src[0] != nullptr) {
+                    argsort_f32_i32_reserve_capture_pool(pool, node->src[0]);
+                }
+                break;
+            case GGML_OP_TOP_K:
+                if (node->src[0] != nullptr) {
+                    top_k_f32_i32_reserve_capture_pool(pool, node->src[0], node->ne[0]);
+                }
+                break;
+            default:
+                break;
+        }
+    }
+}
+#endif // USE_CUDA_GRAPH
+
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
@@ -4409,6 +4453,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
         {
+#ifdef USE_CUDA_GRAPH
+            ggml_cuda_reserve_capture_workspaces(cuda_ctx, cgraph);
+#endif
             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
             ggml_cuda_lock_counter.fetch_add(1, std::memory_order_relaxed);
         }

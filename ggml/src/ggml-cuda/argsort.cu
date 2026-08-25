@@ -162,6 +162,15 @@ void argsort_f32_i32_cuda_cub(ggml_cuda_pool & pool,
 
 #ifdef GGML_CUDA_USE_HIPCUB
 
+// capture-safe segmented radix sort configuration: same kernel/radix parameters
+// as the runtime default for float/int keys, but with the warp-sort partitioning
+// disabled.  rocPRIM's partitioning path performs a device->host sync copy
+// (memcpy_and_sync) which the graph capture runtime rejects.
+using hipcub_capture_safe_sort_config = rocprim::segmented_radix_sort_config<
+    8,
+    rocprim::kernel_config<256, 16>,
+    rocprim::DisabledWarpSortConfig>;
+
 // hipcub provides the CUB API on ROCm/HIP, keeping top_k/argsort on the GPU
 // for long score columns instead of falling back to CPU (llama.cpp #26399)
 int argsort_f32_i32_cuda_hipcub_chunk_nrows(const size_t nb01, const int64_t nrows) {
@@ -201,6 +210,21 @@ void argsort_f32_i32_cuda_hipcub(ggml_cuda_pool & pool,
 
     CUDA_CHECK(cudaMemcpyAsync(temp_keys, x, ncols * nrows * sizeof(float), cudaMemcpyDeviceToDevice, stream));
 
+    // rocPRIM's segmented radix sort is not stream-capture compatible when its
+    // partitioning path is active: the path performs a device->host sync copy
+    // inside the call, which the capture runtime rejects.  gfx1101 builds always
+    // hit that path for >= 64 segments because gfx1101 is missing from rocPRIM's
+    // target_arch list and the unknown-arch fallback config uses
+    // partitioning_threshold=64.  While capturing, fall back to the
+    // unpartitioned sort (pure kernel launches, capture-safe); the replayed
+    // graph then runs the recorded plain kernels.
+    bool is_capturing = false;
+#ifdef USE_CUDA_GRAPH
+    cudaStreamCaptureStatus capture_status;
+    CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
+    is_capturing = capture_status != cudaStreamCaptureStatusNone;
+#endif // USE_CUDA_GRAPH
+
     size_t temp_storage_bytes = 0;
 
     if (nrows == 1) {
@@ -214,6 +238,18 @@ void argsort_f32_i32_cuda_hipcub(ggml_cuda_pool & pool,
                                                             temp_keys,          // keys (in-place)
                                                             temp_indices, dst,  // values (indices)
                                                             ncols, 0, sizeof(float) * 8, stream));
+        }
+    } else if (is_capturing) {
+        if (order == GGML_SORT_ORDER_ASC) {
+            CUDA_CHECK(rocprim::segmented_radix_sort_pairs<hipcub_capture_safe_sort_config>(
+                nullptr, temp_storage_bytes, temp_keys, temp_keys, temp_indices, dst,
+                (unsigned int) (ncols * nrows), (unsigned int) nrows,
+                offsets, offsets + 1, 0, sizeof(float) * 8, stream));
+        } else {
+            CUDA_CHECK(rocprim::segmented_radix_sort_pairs_desc<hipcub_capture_safe_sort_config>(
+                nullptr, temp_storage_bytes, temp_keys, temp_keys, temp_indices, dst,
+                (unsigned int) (ncols * nrows), (unsigned int) nrows,
+                offsets, offsets + 1, 0, sizeof(float) * 8, stream));
         }
     } else {
         if (order == GGML_SORT_ORDER_ASC) {
@@ -241,6 +277,18 @@ void argsort_f32_i32_cuda_hipcub(ggml_cuda_pool & pool,
                                                             temp_keys,          // keys (in-place)
                                                             temp_indices, dst,  // values (indices)
                                                             ncols, 0, sizeof(float) * 8, stream));
+        }
+    } else if (is_capturing) {
+        if (order == GGML_SORT_ORDER_ASC) {
+            CUDA_CHECK(rocprim::segmented_radix_sort_pairs<hipcub_capture_safe_sort_config>(
+                d_temp_storage, temp_storage_bytes, temp_keys, temp_keys, temp_indices, dst,
+                (unsigned int) (ncols * nrows), (unsigned int) nrows,
+                offsets, offsets + 1, 0, sizeof(float) * 8, stream));
+        } else {
+            CUDA_CHECK(rocprim::segmented_radix_sort_pairs_desc<hipcub_capture_safe_sort_config>(
+                d_temp_storage, temp_storage_bytes, temp_keys, temp_keys, temp_indices, dst,
+                (unsigned int) (ncols * nrows), (unsigned int) nrows,
+                offsets, offsets + 1, 0, sizeof(float) * 8, stream));
         }
     } else {
         if (order == GGML_SORT_ORDER_ASC) {
@@ -405,5 +453,76 @@ void ggml_cuda_op_argsort(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     }
 #else
     argsort_f32_i32_cuda_bitonic(src0_d, (int *) dst_d, ncols, nrows, order, stream);
+#endif
+}
+
+void argsort_f32_i32_reserve_capture_pool(ggml_cuda_pool & pool, const ggml_tensor * src0) {
+    if (src0 == nullptr || src0->type != GGML_TYPE_F32 || !ggml_is_contiguous(src0)) {
+        return;
+    }
+
+#ifdef GGML_CUDA_USE_CUB
+    // mirror ggml_cuda_op_argsort: bitonic early-out means no pool workspaces
+    const int64_t ncols = src0->ne[0];
+    const size_t ncols_pad_bytes = next_power_of_2((int) ncols) * sizeof(int);
+    const size_t max_shared_mem = ggml_cuda_info().devices[ggml_cuda_get_device()].smpb;
+    if (ncols_pad_bytes <= max_shared_mem && ncols <= 1024) {
+        return;
+    }
+
+    const int64_t nrows = ggml_nrows(src0);
+    const int chunk_nrows = argsort_f32_i32_cuda_cub_chunk_nrows(src0->nb[1], nrows);
+
+    for (int64_t i = 0; i < nrows; i += chunk_nrows) {
+        const int iter_nrows = std::min((int64_t) chunk_nrows, nrows - i);
+
+        size_t temp_storage_bytes = 0;
+        // storage size is identical for both sort orders; take the max of the
+        // plain and segmented variants to be safe
+        DeviceRadixSort::SortPairs(nullptr, temp_storage_bytes, (float *) nullptr, (float *) nullptr,
+                                   (int *) nullptr, (int *) nullptr, (int) (ncols * iter_nrows),
+                                   0, sizeof(float) * 8);
+        DeviceSegmentedRadixSort::SortPairs(nullptr, temp_storage_bytes, (float *) nullptr, (float *) nullptr,
+                                            (int *) nullptr, (int *) nullptr, (int) (ncols * iter_nrows), iter_nrows,
+                                            (const int *) nullptr, (const int *) nullptr, 0, sizeof(float) * 8);
+
+        // keys + indices live simultaneously with the storage inside one call
+        ggml_cuda_pool_alloc<uint8_t> keys(pool, ncols * iter_nrows * sizeof(float));
+        ggml_cuda_pool_alloc<uint8_t> idx(pool, ncols * iter_nrows * sizeof(int));
+        ggml_cuda_pool_alloc<uint8_t> offs(pool, (iter_nrows + 1) * sizeof(int));
+        ggml_cuda_pool_alloc<uint8_t> stg(pool, temp_storage_bytes);
+    }
+#elif defined(GGML_CUDA_USE_HIPCUB)
+    // mirror ggml_cuda_op_argsort: hipcub is always used on HIP
+    const int64_t nrows = ggml_nrows(src0);
+    const int64_t ncols = src0->ne[0];
+    const int chunk_nrows = argsort_f32_i32_cuda_hipcub_chunk_nrows(src0->nb[1], nrows);
+
+    for (int64_t i = 0; i < nrows; i += chunk_nrows) {
+        const int iter_nrows = std::min((int64_t) chunk_nrows, nrows - i);
+
+        // null-pointer sizing queries: pure host-side arithmetic in rocPRIM.
+        // Reserve both the default (partitioning) and the capture-safe
+        // (unpartitioned) storage sizes, since either can be requested at
+        // capture time depending on the is_capturing branch in the op.
+        size_t temp_storage_bytes = 0;
+        DeviceSegmentedRadixSort::SortPairs(nullptr, temp_storage_bytes, (float *) nullptr, (float *) nullptr,
+                                            (int *) nullptr, (int *) nullptr, (int) (ncols * iter_nrows), iter_nrows,
+                                            (const int *) nullptr, (const int *) nullptr, 0, sizeof(float) * 8);
+        size_t capture_safe_storage_bytes = 0;
+        rocprim::segmented_radix_sort_pairs<hipcub_capture_safe_sort_config>(
+            nullptr, capture_safe_storage_bytes, (float *) nullptr, (float *) nullptr,
+            (int *) nullptr, (int *) nullptr, (unsigned int) (ncols * iter_nrows), (unsigned int) iter_nrows,
+            (const int *) nullptr, (const int *) nullptr, 0, sizeof(float) * 8);
+        temp_storage_bytes = std::max(temp_storage_bytes, capture_safe_storage_bytes);
+
+        ggml_cuda_pool_alloc<uint8_t> keys(pool, ncols * iter_nrows * sizeof(float));
+        ggml_cuda_pool_alloc<uint8_t> idx(pool, ncols * iter_nrows * sizeof(int));
+        ggml_cuda_pool_alloc<uint8_t> offs(pool, (iter_nrows + 1) * sizeof(int));
+        ggml_cuda_pool_alloc<uint8_t> stg(pool, temp_storage_bytes);
+    }
+#else
+    // bitonic-only build: no pool workspaces to reserve
+    GGML_UNUSED(pool);
 #endif
 }
