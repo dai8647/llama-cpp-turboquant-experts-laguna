@@ -612,6 +612,15 @@ struct llama_moe_gpu_expert_bank {
     }
 };
 
+// userdata for the eval-time expert-id -> slot-id remap op; one instance per
+// MoE layer is pooled here (model lifetime) because built graphs are reused
+// across steps and outlive the llm_graph_context that created the nodes
+struct llm_moe_gpu_slot_remap_userdata {
+    llama_moe_gpu_expert_cache * cache = nullptr;
+    int32_t layer_id = -1;
+    int32_t n_experts = 0;
+};
+
 struct llama_moe_gpu_expert_cache {
     using materialize_cb_t = bool (*)(void * userdata, int32_t slot_id, int32_t layer_id, int32_t expert_id, int32_t n_experts);
 
@@ -684,6 +693,24 @@ struct llama_moe_gpu_expert_cache {
     // frequency-based placement: preload experts in this list (frequency order)
     // empty means preload all (full-slot mode)
     std::vector<std::pair<int32_t, int32_t>> frequency_whitelist;
+
+    // pooled remap userdata, one per MoE layer; pointers handed to ggml custom
+    // ops must stay valid for as long as the built graph may be reused
+    mutable std::map<int32_t, std::unique_ptr<llm_moe_gpu_slot_remap_userdata>> remap_userdata_by_layer;
+
+    llm_moe_gpu_slot_remap_userdata * get_or_create_remap_userdata(int32_t layer_id, int32_t n_experts) const {
+        std::lock_guard<std::recursive_mutex> lock(cache_mutex);
+        auto it = remap_userdata_by_layer.find(layer_id);
+        if (it == remap_userdata_by_layer.end()) {
+            it = remap_userdata_by_layer.emplace(layer_id,
+                    std::make_unique<llm_moe_gpu_slot_remap_userdata>()).first;
+        }
+        llm_moe_gpu_slot_remap_userdata * ud = it->second.get();
+        ud->cache     = const_cast<llama_moe_gpu_expert_cache *>(this);
+        ud->layer_id  = layer_id;
+        ud->n_experts = n_experts;
+        return ud;
+    }
 
     static uint64_t key(int32_t layer_id, int32_t expert_id) {
         return (uint64_t(uint32_t(layer_id)) << 32) | uint32_t(expert_id);

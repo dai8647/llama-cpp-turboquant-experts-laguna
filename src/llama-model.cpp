@@ -1723,9 +1723,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     const bool force_cpu = (params.n_moe_gpu_expert_slot_num >= 0) && (hparams.n_expert > 0) && llama_moe_tensor_is_expert_slot_source(tn.tensor);
     const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : force_cpu ? &pimpl->cpu_buft_list : pimpl->dev_layer.at(tn.bid).buft_list;
-    return ml.create_tensor(
+    ggml_tensor * t = ml.create_tensor(
         hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
         tn, ne, flags);
+    return t;
 }
 
 std::string llama_model::arch_name() const {

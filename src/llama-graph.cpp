@@ -1601,13 +1601,11 @@ ggml_tensor * llm_graph_context::build_moe_gpu_slot_ids(
         return logical_experts;
     }
 
-    auto remap = std::make_unique<llm_moe_gpu_slot_remap_userdata>();
-    remap->cache = const_cast<llama_moe_gpu_expert_cache *>(moe_gpu_expert_cache);
-    remap->layer_id = il;
-    remap->n_experts = (int32_t) n_expert;
-
-    llm_moe_gpu_slot_remap_userdata * remap_ptr = remap.get();
-    moe_gpu_slot_remap_userdata.push_back(std::move(remap));
+    // the graph may be cached and re-evaluated long after this
+    // llm_graph_context is gone, so the userdata is pooled in the cache
+    // (model lifetime) instead of being owned here
+    llm_moe_gpu_slot_remap_userdata * remap_ptr =
+        moe_gpu_expert_cache->get_or_create_remap_userdata(il, (int32_t) n_expert);
 
     // selected_experts can be a non-contiguous view; the remap callback operates
     // on a flat host tensor, so materialize a contiguous copy first
