@@ -78,3 +78,32 @@ docs/moe-slot-cache-async-design.md §8.3 参照)
 (過去セッション計測、4670トークンプロンプト・tg200: スロット無効 12.38 tg /
 135.4 pp、slot30 LRU 11.84 tg(+11%) / 127.8 pp(-6%)、slot30+prefetch100ms 11.06 tg。
 詳細は docs/moe-slot-cache-async-design.md §8)
+
+# Global-LRU ページング最初の実測 + TDR切り分け (2026-08-25 午後, GPU独占)
+
+コーダーA/Bの実装(q*: 991bf3042/b54973372/f80401d2d、capture修正: deb32dd9e、
+以降 8ca1025a6 auto / 3b49ca50a prefill二重バッファ)をレビューエージェントが
+GPU独占状態で検証。`bench_glru_qstar.ps1`(main)を使用。
+
+| Stage | 構成 | 結果 |
+|---|---|---|
+| a | slot96, graphs OFF, global-LRU無し | **pp=166.5 / tg=12.91** — TDR無し。歴代最高ベースライン |
+| b | a + `--moe-gpu-expert-global-lru` | **TDR無し**(両ラウンド600sタイムアウトまでサーバー生存)。ただし応答なし: hit 79.4%でも miss 471k×0.74ms ≈ 純コピー349秒、cross_evict=60k の激しいスラッシング。96グローバルslotでは動作セット(40層×top-8=320同時必要)に全く足りない |
+| b' | 同 + slot160(auto実測157相当) | **完走するが遅い**: r1 pp=15.9/tg=1.13、r2 pp=17.4/tg=1.31(ベースライン比~10倍)。hit率は89.2%に改善、TDR無し。miss 348k×0.71ms≈純コピー247秒がそのままwalltime — remap op内の同期H2Dが直列ボトルネック。予算増でミス率は下がるが同期コピーコストは残る |
+| c | graphs ON + 4535tok ロングプレフィル (deb32dd9e 二重修正入り) | コーダーB計測: 全構成クラッシュゼロ・graphs reused 140回。slot無効 156.7/12.74、slot30 156.3/12.51、slot30+PF 156.5/12.70、**auto(実測157slot) 155.7/13.24** — 受入基準(pp≥135.4/tg≥11.84)全クリア |
+
+**TDRの帰結**: 当日14:27/14:39の LiveKernelEvent 141(WATCHDOG)は、Bが発見した
+rocPRIM問題(gfx1101がtarget_names不在→partitioning_threshold=64フォールバック→
+キャプチャ中 memcpy_and_sync D2H同期)のグラフキャプチャ実験がドライバーごと巻き込み、
+同時刻に走っていたAのglruサーバーを道連れにしたものと特定。GPU独占での再試行では
+global-LRU経路は一度もTDRしていない(stage-b)。
+
+**q* 初の実ラン = ロード即死(未修正)**: `-Mode qstar` で warmup 時
+`GGML_ASSERT(ggml_can_mul_mat)` (ggml.c:3327)。src/llama-graph.cpp:2698-2700 の
+host畳み込み `mul_mat(p_mat[n_embd,r], w_col[r,1])` は ne[0] 不一致で不正。
+修正案: `ggml_mul_mat(ctx0, ggml_transpose(p_mat), w_col)` ([n_embd,1]、数学は同一)。
+A適用後に再検証する。
+
+**スラッシング対策の方向性**: stage-b のデータは FreeToken の q* 論点そのもの
+(転送コストが勝つmissはCPU実行へ)。q*修正後、(1) -Mode qstar でCPUオフロード効果、
+(2) auto相当(157slot)のglobal-LRUでミス率低減、を測るのが次。
