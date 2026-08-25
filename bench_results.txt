@@ -29,3 +29,10 @@ qstar-hui-long: extra='--moe-gpu-expert-slot-num 96 --moe-qstar' prompt=long(657
 qstar-ornith-short1: extra='--moe-gpu-expert-slot-num 96 --moe-qstar' prompt=short(9 tok) Ornith | tg=13.24 t/s (256 tok) (target >=12.4 PASS, low-locality)
 qstar-ornith-short2: extra='--moe-gpu-expert-slot-num 96 --moe-qstar' prompt=short(9 tok) Ornith | tg=13.01 t/s (256 tok)
 qstar-ornith-short3: extra='--moe-gpu-expert-slot-num 96 --moe-qstar' prompt=short(9 tok) Ornith | tg=12.96 t/s (256 tok)
+=== 2026-08-25 evening: A-side audit per coder B's independent verification ===
+NOTE: A's qstar-hui-short1/2/3 (13.78/16.81/16.76 t/s) and qstar-ornith-short1/2/3 (13.24/13.01/12.96 t/s)
+      were biased by single-prompt cache warmup.  B independently measured 5-6 t/s on cold start.
+      qstar-hui-long (13.43 t/s) DID complete with B's prefill+sort in tree, but the underlying
+      q* host exec is NOT engaging for Huihui (qstar_cpu=0 always) because exec_build rejects
+      the Q4_K tensor layout (n_experts in ne[2] not ne[1]).  Numbers are NOT acceptance-ready.
+      Action: fix exec_build to allow ne[2]==n_experts, rerun B's bench_glru_qstar.ps1.
