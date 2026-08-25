@@ -1120,9 +1120,14 @@ struct llama_moe_gpu_expert_cache {
         std::lock_guard<std::recursive_mutex> lock(cache_mutex);
         record_access(layer_id, expert_id);
 
-        // collection mode (Pass 1 of the frequency workflow, slots < experts,
-        // no whitelist): count access only, no slot assignment/materialization
-        if (frequency_whitelist.empty() && n_slots < n_experts) {
+        // Pass 1 collection (track_access) counts access only. Plain paging
+        // runs (slots < experts, no whitelist) historically did the same
+        // because graphs never redirect weights to banks in that regime; the
+        // global LRU pool is what makes dynamic banking reachable
+        // end-to-end, so it lifts the skip (graphs extend their redirect
+        // accordingly).
+        if (frequency_whitelist.empty() && n_slots < n_experts &&
+                (track_access || !global_lru_enabled)) {
             return expert_id;
         }
 
