@@ -233,3 +233,42 @@ API decls), src/llama-context.cpp (prefill hook), src/llama.cpp
 5. `--moe-gpu-expert-slot-num auto`: rationale log line sane; performance
    >= manual slot30.
 6. Results appended to bench_results.txt (tab-separated, one config per line).
+
+## 8. cache_mutex hold-time contract (q* x prefill-PF agreement)
+
+There is exactly ONE lock guarding all cache state (`cache_mutex`,
+`src/llama-model.h`). No code path takes a second mutex while holding it, so
+a deadlock by ordering is impossible by construction; the q*/prefill-PF
+coordination problem is therefore purely about hold LENGTH. Agreed rules:
+
+1. **Lock order** (unchanged): `cache_mutex -> access_mutex`, one-way.
+2. **prefill-PF holds are short and per-expert**: assignment + non-resident
+   flip + H2D enqueue happen under one hold per expert (pageable-copy speed,
+   milliseconds), never spanning graph execution or an event wait.
+3. **q* exec holds are long**: `llama_moe_gpu_qstar_cpu_exec` keeps the lock
+   across the whole host GEMM (tens of ms). This head-of-line blocks PF
+   inflight polls and remap ops for the duration - accepted for np=1; revisit
+   with a sharded or read-write lock only if np>1 validation shows it.
+4. **materialize slot_busy drain**: holds the lock while synchronizing ONE
+   in-flight event - bounded by a copy that is about to finish anyway.
+5. No condition variables or nested acquisitions anywhere in the cache.
+
+## 9. CUDA graphs vs paging regimes - permanent switch
+
+Captured graphs freeze per-step slot decisions (q* planning op, global-LRU
+eviction), so those regimes previously REQUIRED `GGML_CUDA_DISABLE_GRAPHS=1`
+(warn added in b54973372). Permanent mechanism:
+
+- New ext API `ggml_backend_cuda_ext_set_graphs_enabled(backend, enable)`
+  sets a per-context kill switch (`ext_graphs_disabled`) honored at the top
+  of `ggml_backend_cuda_graph_compute`.
+- Model load flags `moe_gpu_expert_cache.graphs_disable_pending` when
+  q*/global-LRU is active (no backends exist yet at that point);
+  `llama_context` applies it to every CUDA backend right after
+  `sched_reserve()` and logs "CUDA graphs disabled for accel backends".
+- Defense-in-depth: `ggml_cuda_graph_check_compability` also refuses capture
+  if a `ggml_map_custom*` node ever appears IN a CUDA subgraph (today the
+  scheduler routes these host ops to the CPU backend, so the guard is
+  normally silent).
+- Static/whitelist slot modes keep graphs: their banks never change after
+  preload, so captured addresses stay valid.
