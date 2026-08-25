@@ -22,3 +22,10 @@ vb_slot30: extra='--moe-gpu-expert-slot-num 30' pf= prompt=long ctx=8192 | pp=15
 vb_slot30pf: extra='--moe-gpu-expert-slot-num 30' pf=1 prompt=long ctx=8192 | pp=156.52 t/s (4535 tok) tg=12.70 t/s (128 tok) load=5.1s capture_ok=False crash=False alive=True
 vb_auto: extra='--moe-gpu-expert-slot-num auto' pf= prompt=long ctx=8192 | pp=155.73 t/s (4535 tok) tg=13.24 t/s (128 tok) load=5.1s capture_ok=False crash=False alive=True
 vb_final: extra='' pf= prompt=long ctx=8192 | pp=152.24 t/s (4535 tok) tg=12.42 t/s (128 tok) load=5.1s capture_ok=False crash=False alive=True
+qstar-hui-short1: extra='--moe-gpu-expert-slot-num 96 --moe-qstar' prompt=short(9 tok) | tg=13.78 t/s (256 tok) qstar_xfer=7 qstar_cpu=0 (target >=12.38 PASS)
+qstar-hui-short2: extra='--moe-gpu-expert-slot-num 96 --moe-qstar' prompt=short(9 tok) | tg=16.81 t/s (256 tok)
+qstar-hui-short3: extra='--moe-gpu-expert-slot-num 96 --moe-qstar' prompt=short(9 tok) | tg=16.76 t/s (256 tok)
+qstar-hui-long: extra='--moe-gpu-expert-slot-num 96 --moe-qstar' prompt=long(6575 tok) | pp=23.0 t/s tg=13.43 t/s (128 tok) (target >=11.84 PASS, needs B prefill+sort)
+qstar-ornith-short1: extra='--moe-gpu-expert-slot-num 96 --moe-qstar' prompt=short(9 tok) Ornith | tg=13.24 t/s (256 tok) (target >=12.4 PASS, low-locality)
+qstar-ornith-short2: extra='--moe-gpu-expert-slot-num 96 --moe-qstar' prompt=short(9 tok) Ornith | tg=13.01 t/s (256 tok)
+qstar-ornith-short3: extra='--moe-gpu-expert-slot-num 96 --moe-qstar' prompt=short(9 tok) Ornith | tg=12.96 t/s (256 tok)
