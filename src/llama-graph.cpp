@@ -15,6 +15,7 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
+#include <atomic>
 #include <cassert>
 #include <cmath>
 #include <cstring>
@@ -395,9 +396,36 @@ static void llm_moe_gpu_slot_remap_qstar(
         const int32_t lid  = remap->qstar_deferred.front();
         const int32_t slot = cache->ensure_resident(remap->layer_id, lid, remap->n_experts);
         const auto * s     = cache->slot_at(remap->layer_id, slot);
-        GGML_ASSERT(slot >= 0 && s != nullptr && s->resident &&
-                "q*: no resident slot available for a safe dummy read");
-        dummy_slot = slot;
+        if (slot >= 0 && s != nullptr && s->resident) {
+            dummy_slot = slot;
+        } else if (cpu_ok) {
+            // VRAM cannot hold any expert this step (e.g. transient OOM):
+            // keep generating instead of aborting mid-generation. every
+            // selection goes to the host exec stage, which reproduces the
+            // whole layer from the original tensors. the masked-out bank
+            // reads below still land on whichever slots the ids point at,
+            // but their router weights are zeroed before they reach the
+            // aggregate - the same treatment as any other host-deferred
+            // selection. warn once: this state tends to repeat per token.
+            static std::atomic<bool> no_resident_warned{false};
+            if (!no_resident_warned.exchange(true)) {
+                LLAMA_LOG_WARN("%s: q* layer %d has no materializable slot; running all %d selections on the host\n",
+                        __func__, remap->layer_id, (int) r);
+            }
+            remap->qstar_deferred.clear();
+            for (int64_t i = 0; i < r; ++i) {
+                slots[i] = -1;
+                mask[i]  = 0.0f;
+                remap->qstar_deferred.push_back(logical[i]);
+            }
+            dummy_slot = 0; // placeholder read; its contribution is masked out
+        } else {
+            // no working host engine and transfers fail too: there is no
+            // correct computation for this layer available at all, so fail
+            // loudly rather than silently poisoning downstream layers
+            GGML_ASSERT(slot >= 0 && s != nullptr && s->resident &&
+                    "q*: no resident slot available for a safe dummy read");
+        }
     }
     GGML_ASSERT(dummy_slot >= 0);
 
