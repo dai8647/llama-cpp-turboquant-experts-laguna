@@ -2309,6 +2309,26 @@ common_params common_base_params_to_speculative(const common_params & params) {
     const auto & params_spec = params.speculative.draft;
     common_params result = params;
 
+    // the full copy above carries the target model's fork-specific expert
+    // paging setup into the draft, which must not happen: the draft CLI
+    // surface exposes none of these knobs, so any non-default value is a
+    // pure leak. on MoE draft models (e.g. MTP/DSpark lineage) it would
+    // silently activate a second paging instance (slot cache / global-LRU /
+    // q* / frequency placement) next to the target's; reset everything to
+    // its disabled default instead.
+    result.n_moe_gpu_expert_slot_num = -1;
+    result.moe_gpu_expert_slot_auto  = false;
+    result.moe_expert_placement      = "all-gpu";
+    result.moe_gpu_expert_global_lru = false;
+    result.moe_qstar                 = false;
+    result.moe_qstar_threads         = 3;
+    result.moe_qstar_budget_us       = 300;
+    result.moe_gpu_expert_ratio      = 1.0f;
+    result.moe_freq_report_out.clear();
+    result.moe_freq_report_in.clear();
+    result.moe_freq_report_path.clear();
+    result.moe_expert_map_path.clear();
+
     if (has_draft) {
         result.devices               = params_spec.devices;
         result.model                 = params_spec.mparams;
