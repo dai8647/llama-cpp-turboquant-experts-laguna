@@ -331,9 +331,15 @@ static void llm_moe_gpu_slot_remap_qstar(
 
     const double b_h2d  = cache->qstar_h2d_bps;
     const double t_fix  = cache->qstar_h2d_fix_ns;
-    const double b_cpu  = cache->qstar_cpu_bps;
+    double b_cpu        = cache->qstar_cpu_bps;
     const double budget = cache->qstar_budget_us * 1000.0;
     const double bytes  = (double) cache->qstar_expert_bytes;
+
+    // a degenerate calibration means the host GEMV can never beat even a slow
+    // copy; keep every miss on the transfer path instead of deferring into it
+    if (b_cpu > 0.0 && b_cpu < 0.5e9) {
+        cpu_ok = false;
+    }
 
     double   budget_used = 0.0;
     int64_t  n_xfer      = 0;
@@ -347,9 +353,15 @@ static void llm_moe_gpu_slot_remap_qstar(
         bool transfer = true;
         double t_xfer = 0.0;
         if (cpu_ok && b_h2d > 0.0 && b_cpu > 0.0 && bytes > 0.0) {
+            // defer to the host only when the host GEMV genuinely beats the
+            // H2D copy. The transfer budget is deliberately NOT part of this
+            // decision: over-budget misses still run on the GPU because a
+            // slow copy always beats an even slower host compute, and the old
+            // form used budget overrun to evict misses into exactly that
+            // slower path (budget 300us < one expert's copy => everything
+            // deferred). budget_used below is kept as a statistic.
             t_xfer   = bytes / b_h2d * 1e9 + t_fix;
-            transfer = t_xfer <= bytes / b_cpu * 1e9 &&
-                       budget_used + t_xfer <= budget;
+            transfer = t_xfer <= bytes / b_cpu * 1e9;
         }
 
         if (!transfer) {

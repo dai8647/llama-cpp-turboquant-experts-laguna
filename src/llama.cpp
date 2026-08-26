@@ -1494,7 +1494,11 @@ bool llama_moe_gpu_qstar_cpu_exec(struct llama_model & model, int32_t layer_id,
     }
     cplan.work_data = ex.work.data();
 
-    const int64_t bytes = (int64_t) r * cache.qstar_expert_bytes;
+    // the padded id table makes the mini-graph compute every one of its
+    // r_max expert columns regardless of r, so the byte count charged to the
+    // EMA must cover them all — dividing by r alone under-reports bps by
+    // roughly r_max/r and poisoned the calibration with a fake ~0.1 GB/s
+    const int64_t bytes = (int64_t) ex.r_max * cache.qstar_expert_bytes;
     const auto t0 = std::chrono::steady_clock::now();
     fprintf(stderr, "[QSTAR-CPUEXEC] before ggml_graph_compute: n_nodes=%zu work_size=%zu bytes=%lld\n",
             ggml_graph_n_nodes(ex.gf), cplan.work_size, (long long) bytes);
