@@ -107,10 +107,12 @@ r_max=8 experts 分計算するのに bps は r=1×expert_bytes で割るため�
 set GGML_CUDA_DISABLE_GRAPHS=1` — glru 使用時はコード自身が graphs 強制無効。
 graphs 条件は常に「無効」で統一されており対照比較としては公平。
 
-**転送路理論上限の試算**: MoE 層 ~36 × r=8 × expert 2.04MB ÷ h2d 3.6GB/s ≈ 163ms/token
-→ 天井 ~6 t/s。budget 30000 の実測 1.45 t/s (オーバーヘッド込み) と整合。
-旧監査 ~13 t/s とは環境 (モデル/expert サイズ/h2d) が異なるため直接比較不可。
-このマシン×このモデルでは転送路ベース q* は原理的に ~6 t/s 止まり。
+**転送路理論上限の試算 (glru コピー経路限定)**: MoE 層 ~36 × r=8 × expert 2.04MB ÷
+h2d 3.6GB/s ≈ 163ms/token → **この経路の**天井 ~6 t/s。budget 30000 の実測 1.45 t/s
+(オーバーヘッド込み) と整合。※全 miss expert を H2D コピーする glru paging 経路に限った
+上限であり q* 全体 (CPU 直計算経路含む) の上限ではない。
+監査 tg=12.91 は `--cpu-moe`・glru 無しの CPU 直計算経路の記録なので、素ベースライン
+判定は B の stage-a 完全再現 bench (P1) 待ちで行う。
 
 ### 受入バーへの影響と次手
 - バー① は観測済みだが cache 冷 (全 miss) 状態の観測であり健全性の証拠でない (B 指摘通り)。
