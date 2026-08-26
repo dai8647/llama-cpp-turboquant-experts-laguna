@@ -2309,6 +2309,7 @@ common_params common_base_params_to_speculative(const common_params & params) {
     const auto & params_spec = params.speculative.draft;
     common_params result = params;
 
+    // moe-flag-scrub: keep-in-sync with common.h MoE fields (search this marker)
     // the full copy above carries the target model's fork-specific expert
     // paging setup into the draft, which must not happen: the draft CLI
     // surface exposes none of these knobs, so any non-default value is a
