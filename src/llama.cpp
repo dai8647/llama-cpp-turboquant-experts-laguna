@@ -1244,35 +1244,6 @@ static ggml_tensor * llama_moe_qstar_alias_weight(ggml_context * ctx, const ggml
     return t;
 }
 
-static ggml_tensor * llama_moe_qstar_owned_tensor(
-        ggml_context * ctx,
-        ggml_type       type,
-        int64_t         n0,
-        int64_t         n1,
-        int64_t         n2,
-        std::vector<uint8_t> & mem,
-        size_t & off) {
-    const int64_t ne[3] = { n0, n1, n2 };
-    ggml_tensor * t = ggml_new_tensor(ctx, type, 3, ne);
-    const size_t nbytes = ggml_nbytes(t);
-    if (off + nbytes > mem.size()) {
-        mem.resize(off + nbytes);
-    }
-    t->data = mem.data() + off;
-    off += nbytes;
-    return t;
-}
-
-// place an op-produced tensor's storage inside the engine scratch block
-static void llama_moe_qstar_own_node(ggml_tensor * t, std::vector<uint8_t> & mem, size_t & off) {
-    const size_t nbytes = ggml_nbytes(t);
-    if (off + nbytes > mem.size()) {
-        mem.resize(off + nbytes);
-    }
-    t->data = mem.data() + off;
-    off += nbytes;
-}
-
 static int64_t llama_moe_qstar_expert_bytes(const llama_moe_qstar_layer_exec & ex) {
     return (int64_t)(ex.fused_gate_up ? ex.gateup_stride + ex.down_stride
                                       : ex.gate_stride + ex.up_stride + ex.down_stride);
@@ -1384,8 +1355,15 @@ static bool llama_moe_qstar_exec_build(llama_model & model, int32_t layer_id) {
     ggml_context * ctx = ex.ctx.get();
 
     // scratch plan (all f32): gout/uout or fused gu [n_ff|2*n_ff, r], h
-    // [n_ff, r], y [n_embd, r], x [n_embd]
+    // [n_ff, r], y [n_embd, r], x [n_embd]. storage pointers are handed out
+    // only AFTER the block reaches its final size: a vector resize reallocates
+    // and would dangle every pointer assigned before it.
     size_t off = 0;
+    std::vector<std::pair<ggml_tensor *, size_t>> scratch;
+    auto own_node = [&scratch, &off](ggml_tensor * t) {
+        scratch.emplace_back(t, off);
+        off += ggml_nbytes(t);
+    };
     const size_t r_max = ex.r_max;
 
     // expert-id lists: metadata only, data pointers swapped per call; [r,1]
@@ -1399,7 +1377,9 @@ static bool llama_moe_qstar_exec_build(llama_model & model, int32_t layer_id) {
     ggml_tensor * w_in1_t  = fused ? w_in0_t : llama_moe_qstar_alias_weight(ctx, w_up);
     ggml_tensor * w_down_t = llama_moe_qstar_alias_weight(ctx, w_down);
 
-    ggml_tensor * t_x = llama_moe_qstar_owned_tensor(ctx, GGML_TYPE_F32, n_embd, 1, 1, ex.mem, off);
+    const int64_t ne_x[3] = { n_embd, 1, 1 };
+    ggml_tensor * t_x = ggml_new_tensor(ctx, GGML_TYPE_F32, 3, ne_x);
+    own_node(t_x);
 
     // stage 1: gate/up projections of all r experts against the shared token
     ggml_tensor * gout = ggml_mul_mat_id(ctx, w_in0_t, t_x, t_ids_up);      // [n_ff, r, 1]
@@ -1407,16 +1387,23 @@ static bool llama_moe_qstar_exec_build(llama_model & model, int32_t layer_id) {
     ggml_tensor * gate_v = gout;
     ggml_tensor * up_v   = uout;
     ggml_tensor * h      = nullptr;
+    // views need explicit data binding: no backend allocator runs on this
+    // mini-graph, so a view's data stays NULL unless we point it at the
+    // parent's storage ourselves (CPU forward reads src->data directly)
+    std::vector<std::tuple<ggml_tensor *, ggml_tensor *, size_t>> view_fixups;
     if (fused) {
         // split merged [2*n_ff, r, 1] output into gate/up halves
         gate_v = ggml_view_3d(ctx, gout, n_ff, r_max, 1, gout->nb[1], gout->nb[2], 0);
         up_v   = ggml_view_3d(ctx, gout, n_ff, r_max, 1, gout->nb[1], gout->nb[2], n_ff*gout->nb[0]);
+        view_fixups.emplace_back(gate_v, gout, 0);
+        view_fixups.emplace_back(up_v, gout, n_ff*gout->nb[0]);
     }
     h = ggml_swiglu_split(ctx, gate_v, up_v);                               // [n_ff, r, 1]
 
     // stage 2: down projection; h reinterpreted as r column vectors so each
     // expert multiplies exactly its own hidden activation
     ggml_tensor * h_cols = ggml_view_3d(ctx, h, n_ff, 1, r_max, sizeof(float), h->nb[1], 0);
+    view_fixups.emplace_back(h_cols, h, 0);
     ggml_tensor * t_y = ggml_mul_mat_id(ctx, w_down_t, h_cols, t_ids_down); // [n_embd, r, 1]
 
     ggml_cgraph * gf = ggml_new_graph(ctx);
@@ -1424,14 +1411,22 @@ static bool llama_moe_qstar_exec_build(llama_model & model, int32_t layer_id) {
 
     // assign scratch storage to every computed node (weights alias sources,
     // ids swap per call, everything else lands in ex.mem)
-    llama_moe_qstar_own_node(gout, ex.mem, off);
+    own_node(gout);
     if (!fused) {
-        llama_moe_qstar_own_node(uout, ex.mem, off);
+        own_node(uout);
     } else {
         GGML_UNUSED(w_in1_t);
     }
-    llama_moe_qstar_own_node(h, ex.mem, off);
-    llama_moe_qstar_own_node(t_y, ex.mem, off);
+    own_node(h);
+    own_node(t_y);
+
+    ex.mem.resize(off); // single allocation: no growth past this point
+    for (auto & [t, o] : scratch) {
+        t->data = ex.mem.data() + o;
+    }
+    for (auto & [v, p, vo] : view_fixups) {
+        v->data = (char *) p->data + vo;
+    }
 
     ex.gf    = gf;
     ex.t_ids = t_ids_up;

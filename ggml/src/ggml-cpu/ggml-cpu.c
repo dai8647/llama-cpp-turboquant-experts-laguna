@@ -3154,6 +3154,21 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             continue;
         }
 
+        static int qnode_trace = -1;
+        if (qnode_trace < 0) {
+            const char * qe = getenv("LLAMA_QSTAR_NODE_TRACE");
+            qnode_trace = (qe != NULL && qe[0] != '\0' && qe[0] != '0') ? 1 : 0;
+        }
+        if (qnode_trace && state->ith == 0) {
+            fprintf(stderr, "[QNODE] n=%d/%d op=%d %s ne=[%lld,%lld,%lld] data=%p src0data=%p src1data=%p\n",
+                    node_n, cgraph->n_nodes, (int) node->op, ggml_op_desc(node),
+                    (long long) node->ne[0], (long long) node->ne[1], (long long) node->ne[2],
+                    (void *) node->data,
+                    node->src[0] ? (void *) node->src[0]->data : NULL,
+                    node->src[1] ? (void *) node->src[1]->data : NULL);
+            fflush(stderr);
+        }
+
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
         // Try fused ops, fall back to normal compute
         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
