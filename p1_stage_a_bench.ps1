@@ -13,7 +13,10 @@ param(
     [string]$BinaryPath = 'C:\Users\dai86\llama-cpp-turboquant-experts-laguna\build-hip\bin\llama-server.exe',
     [string]$Model = 'C:\Users\dai86\.lmstudio\models\huihui-ai\Huihui-Qwen3.6-35B-A3B-Claude-4.7-Opus-abliterated-MTP-GGUF\Huihui-Qwen3.6-35B-A3B-Claude-4.7-Opus-abliterated-ggml-model-Q4_K.gguf',
     [int]$Port = 8091,
-    [string]$BuildNote = ''   # record the confirmed build hash / provenance here
+    [string]$BuildNote = '',  # record the confirmed build hash / provenance here
+    # F3 binaries suppress INFO (slot-mode / slot-stats lines) below lv 4;
+    # the review doc mandates capturing those lines, so keep >= 4
+    [int]$Lv = 4
 )
 $ErrorActionPreference = 'Continue'
 $root = 'C:\Users\dai86\llama-cpp-turboquant-experts-laguna'
@@ -36,7 +39,7 @@ foreach ($f in @($outLog, $errLog)) {
 Remove-Item $outLog, $errLog -ErrorAction SilentlyContinue
 
 $baseArgs = @('-m', $Model, '--host', '127.0.0.1', '--port', "$Port", '--no-webui',
-    '-ngl', '999', '-ctk', 'q8_0', '-ctv', 'q8_0', '-fa', 'on', '--cpu-moe')
+    '-lv', "$Lv", '-ngl', '999', '-ctk', 'q8_0', '-ctv', 'q8_0', '-fa', 'on', '--cpu-moe')
 if ($Arm -in 'a','b') {
     $baseArgs += @('-c', '32768', '-t', '6', '--moe-gpu-expert-slot-num', '96')
 } else { # arm c: A-control estimated config
