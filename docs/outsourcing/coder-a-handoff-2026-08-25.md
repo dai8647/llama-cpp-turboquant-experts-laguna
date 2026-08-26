@@ -67,3 +67,9 @@ cache_mutex 契約追加)。 追加で B に依頼したいことがあれば別
 3. (b) 選択の場合: A 承認後 5 分以内に main マージ完了予定
    (q* 4 commit を revert するブランチ `feat/b-only` を作成)
 4. (a) 選択の場合: A の debug 完了後、 私が q* 再検証 → 結果次第で main マージ
+
+---
+
+**STATUS: merged 76adf21e4 (2026-08-26)** — (b) 経路で main マージ完了。
+A は別 branch `feat/qstar-debug` で ASan 切り分け継続、 main 再マージ条件は
+`qstar_cpu>0` + 3 項目の再現性確認。

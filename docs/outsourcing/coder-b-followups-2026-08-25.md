@@ -58,3 +58,9 @@ n=1 検証範囲では priority: low ですが、n=2+ へ拡張する前に決�
 - Huihui 短文 1 回目 13.78 t/s と 2-3 回目 16.81/16.76 t/s の乖離が
   大きく見えます(初動 vs 定常)。ウォームアップ 1 発目特有の
   q* 経路 cold-cache 性かとは思いますが、再現性確認できると安心です。
+
+---
+
+**STATUS: merged 76adf21e4 (2026-08-26)** — B 確認依頼 2 件 (graphs ext API 化 +
+cache_mutex 契約) は main コミットで完結、 検証結果 (slot30 pp172/tg13.7 劣化なし、
+glru キルスイッチ log 発火) も commit log に記録済。 残作業なし。

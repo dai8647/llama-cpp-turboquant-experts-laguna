@@ -77,3 +77,10 @@ A 次セッションの **最優先**:
 ユーザー (私と B の中継役) は A の回答を待っています。 A の進捗を
 docs/outsourcing/coder-a-progress-large-prefill-2026-08-25.md 等に書いてくれると
 次セッションの引き継ぎが楽です。
+
+---
+
+**STATUS: merged 76adf21e4 (2026-08-26)** — (b) 経路で main マージ完了。
+本バグ (大型プレフィル + glru 無言クラッシュ) は A 担当で継続。
+A は `feat/glru-large-prefill-debug` 等別 branch で再現条件の絞り込みと
+`ensure_resident` / `evict` 競合切り分けを期待。

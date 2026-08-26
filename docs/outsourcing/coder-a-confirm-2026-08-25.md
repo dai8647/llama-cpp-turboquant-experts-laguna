@@ -61,3 +61,10 @@ A 自身の分析「Huihui で全ミスが CPU パスに落ちていない可能
   整形とメモリ更新を進めます
 - A 回答 → 再検証 or 保留判断、所要 5-10 分
 - main マージの最終判断は私が持ち、 A に push 許可の最終通知を出します
+
+---
+
+**STATUS: merged 76adf21e4 (2026-08-26)** — (b) q* revert + B-only main merge 完了。
+A 回答 (coder-a-reply-2026-08-25.md) + 受入数字撤回 (8dc94e3e5) を受けて方針確定。
+q* body は main から外し、 A は `feat/qstar-debug` 別 branch で ASan 切り分け継続。
+詳細: `docs/outsourcing/coder-a-merge-done-2026-08-26.md`
