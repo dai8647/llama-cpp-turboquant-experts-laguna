@@ -124,3 +124,25 @@ h2d 3.6GB/s ≈ 163ms/token → **この経路の**天井 ~6 t/s。budget 30000 
 - 78c4a0486 moe : fix q* scratch dangling + bind view data + env-gated [QNODE] trace
 - 3492f6f49 moe : own q* expert-id buffer in layer exec, pad to r_max, log calibrate result
 - 両方 push 済 (feat/qstar-r2-rebuild)
+
+### F3 実装 + 検証 (2026-08-26 夜, commit 7850c38db)
+- **予算条項を分割判定から削除** (llama-graph.cpp): budget 超過 → 転送拒否 → CPU 追い出し
+  という倒錯を解消。deferred は「host GEMV が H2D copy に本当に勝つ時だけ」。
+  budget は [q*] stats 行の budget_left 表示として統計存続。
+- **degenerate guard**: b_cpu < 0.5 GB/s なら cpu_ok=false (毒された EMA が host 経路へ
+  流すことを構造的に禁止)。
+- **cpu_bps EMA の分母修正** (llama.cpp): ids pad により r_max 列全部計算するため
+  bytes を r_max ベースに。従来は ~r_max/r 倍過小 (表示 0.1 GB/s ↔ 実測 1.1 GB/s)。
+
+検証 (Huihui Q4_K, slot32+glru+qstar threads=4, budget デフォルト 300):
+```
+[QSTAR-CALIB] result: h2d=3.8 GB/s cpu=1.1 GB/s expert=1.95 MiB threads=4 budget_us=300
+同一リクエスト eval: 0.73 → 1.54 tok/s、推論中 [QSTAR-CPUEXEC] 発火ゼロ (calibrate 3 回のみ)
+```
+= 全 miss が設計通り転送路へ。対照 4.50 t/s との残余差分は remap op 内の同期コピー
+コストで、glru-slot160 監査 (tg≈1.1-1.3) と同じ壁 = 次フェーズ (非同期 overlap) 領域。
+
+### コミット追記
+- c2911218d docs : 天井 ~6 t/s を glru コピー経路限定に表現修正 / 監査 tg=12.91 は
+  --cpu-moe・glru 無し CPU 直計算経路の記録、素ベースライン判定は B の stage-a 再現待ち
+- 7850c38db moe : q* split policy robustness (F3)
