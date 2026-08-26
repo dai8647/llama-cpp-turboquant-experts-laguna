@@ -1219,6 +1219,17 @@ void llama_moe_gpu_expert_slot_auto_init(struct llama_model & model) {
     if (const char * qst = getenv("LLAMA_MOE_QSTAR_STATS")) {
         cache.qstar_stats = qst[0] != '\0' && qst[0] != '0';
     }
+
+    if (cache.qstar_enabled || cache.global_lru_enabled) {
+        // same graphs consideration as the manual init path: per-step slot
+        // decisions cannot survive capture-and-replay, so llama_context
+        // consumes this flag and disables CUDA graph capture when it builds
+        // this context (it runs this function just before that check)
+        cache.graphs_disable_pending = true;
+        LLAMA_LOG_INFO("%s: q*/global-LRU expert paging enabled - CUDA graphs will be disabled for this context\n",
+                __func__);
+    }
+
     if (cache.qstar_enabled) {
         LLAMA_LOG_INFO("%s: q* bandwidth-adaptive policy enabled (threads=%d budget=%.0fus)\n",
                 __func__, cache.qstar_threads, cache.qstar_budget_us);
@@ -2005,15 +2016,14 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                     if (model->moe_gpu_expert_cache.qstar_enabled || model->moe_gpu_expert_cache.global_lru_enabled) {
                         // the per-step residency/mask decisions live in the
                         // eval-time planning op; a captured-and-replayed graph
-                        // would freeze them at warmup values. there is no API
-                        // to disable graphs per-context from here, so the env
-                        // var is the only switch until ggml learns to detect
-                        // the remap op in check_compability.
-                        if (getenv("GGML_CUDA_DISABLE_GRAPHS") == nullptr) {
-                            LLAMA_LOG_WARN("%s: q*/global-LRU expert paging is incompatible with CUDA graph "
-                                    "capture (per-step slot decisions would be frozen); set GGML_CUDA_DISABLE_GRAPHS=1\n",
-                                    __func__);
-                        }
+                        // would freeze them at warmup values. mark the cache so
+                        // llama_context turns off CUDA graph capture on this
+                        // context's accel backends as soon as it exists;
+                        // GGML_CUDA_DISABLE_GRAPHS=1 remains available to kill
+                        // graphs process-wide on top of that.
+                        model->moe_gpu_expert_cache.graphs_disable_pending = true;
+                        LLAMA_LOG_INFO("%s: q*/global-LRU expert paging enabled - CUDA graphs will be disabled for this context\n",
+                                __func__);
                     }
                     if (model->moe_gpu_expert_cache.qstar_enabled) {
                         LLAMA_LOG_INFO("%s: q* bandwidth-adaptive policy enabled (threads=%d budget=%.0fus)\n",
