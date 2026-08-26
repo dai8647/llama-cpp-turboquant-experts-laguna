@@ -23,7 +23,10 @@ param(
     [ValidateSet('glru','qstar')]
     [string]$Mode = 'glru',
     [string]$Tag = "",
-    [int]$IdleAfter = 2
+    [int]$IdleAfter = 2,
+    # -Mode qstar passes --moe-qstar, which only the round-2 branch binary accepts;
+    # point this at that build (omitted = main-tree build-hip binary as before)
+    [string]$BinaryPath = ''
 )
 $ErrorActionPreference = 'Continue'
 if (-not $Tag) { $Tag = "{0}-slot{1}" -f $Mode, $Slots }
@@ -53,7 +56,8 @@ if ($Mode -eq 'glru') { $baseArgs += @('--moe-gpu-expert-global-lru') }
 if ($Mode -eq 'qstar') { $baseArgs += @('--moe-qstar') }
 
 $sw = [Diagnostics.Stopwatch]::StartNew()
-$p = Start-Process -FilePath "$root\build-hip\bin\llama-server.exe" -ArgumentList $baseArgs `
+$serverExe = if ($BinaryPath) { $BinaryPath } else { "$root\build-hip\bin\llama-server.exe" }
+$p = Start-Process -FilePath $serverExe -ArgumentList $baseArgs `
         -RedirectStandardOutput $outLog -RedirectStandardError $errLog -PassThru -WindowStyle Hidden
 
 $ready = $false
