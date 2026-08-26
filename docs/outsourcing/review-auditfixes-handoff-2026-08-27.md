@@ -3,10 +3,11 @@
 - 作成者: reviewer AI
 - 日付: 2026-08-27
 - 対象: 静的監査 `docs/research/static-audit-full-fork-2026-08-26.md` (@071e753e0, main) の High 3 件
-- ブランチ: **`review/audit-fixes`** = `origin/feat/qstar-r2-rebuild` (82fb0af47) + 以下 3 コミット
+- ブランチ: **`review/audit-fixes`** = `origin/feat/qstar-r2-rebuild` (82fb0af47) + 以下 4 コミット
   - `a6ed570f5` moe : actually wire graphs_disable_pending for q*/global-LRU paging
   - `78b4158ff` moe : q* degrade to all-host-exec when no slot can be made resident
   - `7cb31d003` spec : stop leaking target MoE paging flags into draft params
+  - `c01ea1a28` moe : harden slot cache edges flagged by the static audit (**追加・optional**)
 
 A の feat/qstar-r2-rebuild ツリーは直接触っていない。マージ可否・マージ先
 (r2 ブランチ or main) の判断は A に委ねる。
@@ -93,3 +94,22 @@ disabled デフォルトへリセット。ドラフト CLI にはこれらの表
 glru/q* 不使用の Arm a/c が主であり、ここで今回のコードは一切発火しない。
 F3 版 exe 承認 (@1994008ee) も変更なし。今後ビルドされる exe は
 このブランチが入っていても受け入れ可能 (diff は上記の縮退系のみ)。
+
+---
+
+## 追記 (2026-08-27): c01ea1a28 = 監査 Med 由来ハードニング(任意採用)
+
+A の H-1/H-2 cherry-pick 計画には影響しない追加コミット。pick するか否か
+は自由(単体で完結、3 変更とも src/llama.cpp):
+
+1. **bank_ensure で bank バッファ zero-init** — H-2 に残した「未初期化 bank ×
+   weight 0 が NaN dequant されたときだけ毒」という残余リスクを構造的に閉じる。
+   `ggml_backend_buffer_clear` は全実バックエンド実装済み確認済み
+   (CUDA/HIP/Metal/Vulkan/CPU 他・`.clear =` 全列挙 grep)。
+2. **frequency whitelist 適用時に対抗ログ**「global-LRU pool is inactive」—
+   cache 内部では whitelist 非空で global 縮退(モデル.h:1331 の
+   `global_lru && frequency_whitelist.empty()`)だが、直前の
+   「global LRU slot pool enabled」ログと矛盾する状態を黙認していたのを正直化。
+3. **env 上書き WARN** — LLAMA_MOE_QSTAR_THREADS / BUDGET_US が既解決値を
+   置き換えるときに明示的に警告(旧来の無言上書き・「CLI flags win」コメント矛盾の
+   半分だけを塞ぐ安全側修正。優先順位自体の変更はしない)。
