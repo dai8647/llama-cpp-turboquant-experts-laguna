@@ -600,6 +600,13 @@ static bool llama_moe_gpu_expert_bank_ensure(
         return false;
     }
 
+    // zero-init once: masked-out reads (q* dummy reads, unbanked fallbacks)
+    // hit whatever the device hands out otherwise - freshly mapped or
+    // recycled pages give no content guarantee. all-zero banks dequantize
+    // to exact zeros (zero scales / WHT(0)=0), so a stray read cannot
+    // inject NaN into a sum whose router weight is already zeroed.
+    ggml_backend_buffer_clear(bank.buf.get(), 0);
+
     for (const auto & bank_tensor : bank.tensors) {
         cache.register_compute_tensor(bank_tensor.src, bank_tensor.dev);
     }
@@ -1952,6 +1959,13 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                                                      freq_report.stats[idx].expert_id});
                             }
                             model->moe_gpu_expert_cache.set_frequency_whitelist(whitelist);
+                            if (model->moe_gpu_expert_cache.global_lru_enabled) {
+                                // the cache disables global eviction whenever the
+                                // whitelist is non-empty; say so, since this runs
+                                // after the "global LRU slot pool enabled" log
+                                LLAMA_LOG_INFO("%s: global-LRU pool is inactive with a frequency whitelist - eviction stays per-layer\n",
+                                        __func__);
+                            }
                             LLAMA_LOG_INFO("%s: frequency placement: %d/%d experts on GPU (ratio=%.2f)\n",
                                     __func__, (int32_t)whitelist.size(), total_experts, params.moe_gpu_expert_ratio);
                             }
@@ -1980,12 +1994,20 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                         model->moe_gpu_expert_cache.qstar_threads = params.moe_qstar_threads;
                     }
                     if (const char * qt = getenv("LLAMA_MOE_QSTAR_THREADS")) {
+                        if (atoi(qt) != model->moe_gpu_expert_cache.qstar_threads) {
+                            LLAMA_LOG_WARN("%s: LLAMA_MOE_QSTAR_THREADS=%s overrides previously-resolved value (%d)\n",
+                                    __func__, qt, model->moe_gpu_expert_cache.qstar_threads);
+                        }
                         model->moe_gpu_expert_cache.qstar_threads = std::max(1, atoi(qt));
                     }
                     if (params.moe_qstar_budget_us >= 0) {
                         model->moe_gpu_expert_cache.qstar_budget_us = params.moe_qstar_budget_us;
                     }
                     if (const char * qb = getenv("LLAMA_MOE_QSTAR_BUDGET_US")) {
+                        if (atof(qb) != (double) model->moe_gpu_expert_cache.qstar_budget_us) {
+                            LLAMA_LOG_WARN("%s: LLAMA_MOE_QSTAR_BUDGET_US=%s overrides previously-resolved value (%d)\n",
+                                    __func__, qb, model->moe_gpu_expert_cache.qstar_budget_us);
+                        }
                         model->moe_gpu_expert_cache.qstar_budget_us = atof(qb);
                     }
                     if (const char * qst = getenv("LLAMA_MOE_QSTAR_STATS")) {
