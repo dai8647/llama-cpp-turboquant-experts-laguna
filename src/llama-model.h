@@ -664,6 +664,7 @@ struct llama_moe_qstar_layer_exec {
     ggml_tensor * t_y   = nullptr;       // [n_embd, r] f32 out
     std::vector<uint8_t> mem;            // activations/intermediates scratch
     std::vector<uint8_t> work;           // cplan work buffer
+    std::vector<int32_t> ids_buf;        // owns the [r_max] id table; size = r_max
 
     void clear_storage() {
         ready = false;

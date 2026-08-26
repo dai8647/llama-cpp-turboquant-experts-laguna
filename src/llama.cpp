@@ -1434,6 +1434,9 @@ static bool llama_moe_qstar_exec_build(llama_model & model, int32_t layer_id) {
     ex.t_x   = t_x;
     ex.t_y   = t_y;
     cache.qstar_expert_bytes = llama_moe_qstar_expert_bytes(ex);
+    ex.ids_buf.assign(ex.r_max, 0);
+    ex.t_ids->data      = ex.ids_buf.data();
+    ex.t_ids_down->data = ex.ids_buf.data();
 
     LLAMA_LOG_INFO("%s: q* host exec engine ready: layer=%d n_embd=%d n_ff=%d r=%zu fused=%d type=%d bytes/expert=%.2f MiB\n",
             __func__, layer_id, n_embd, n_ff, r_max, fused ? 1 : 0, (int) ex.wtype,
@@ -1460,12 +1463,12 @@ bool llama_moe_gpu_qstar_cpu_exec(struct llama_model & model, int32_t layer_id,
     llama_moe_qstar_layer_exec & ex = it->second;
 
     const int32_t r = std::min<int32_t>(n, (int32_t) ex.r_max);
-    std::vector<int32_t> ids_buf(r);
-    for (int32_t i = 0; i < r; ++i) {
-        ids_buf[i] = experts[i];
+    // graph tensors are sized for r_max and the mul_mat_id kernels read every
+    // id slot; pad unused slots with the last requested id so they never see
+    // garbage indices (extra output rows are ignored by the caller below)
+    for (int32_t i = 0; i < (int32_t) ex.r_max; ++i) {
+        ex.ids_buf[i] = experts[std::min(i, r - 1)];
     }
-    ex.t_ids->data           = ids_buf.data(); // [r, 1]
-    ex.t_ids_down->data      = ids_buf.data(); // [1, r]: same linear layout
     memcpy(ex.t_x->data, x, ex.n_embd*sizeof(float));
     fprintf(stderr, "[QSTAR-CPUEXEC] entry: layer=%d r=%d n_embd=%d qstar_tp=%p threads=%d\n",
             layer_id, r, ex.n_embd, (void*) cache.qstar_tp, cache.qstar_threads);
@@ -1611,6 +1614,14 @@ void llama_moe_gpu_qstar_calibrate(struct llama_model & model) {
         fprintf(stderr, "[QSTAR-CALIB] warmup loop exited\n");
     }
 
+    // plain fprintf: the LLAMA_LOG_INFO variant never reached the log during
+    // early model load, and the calibration numbers must be observable
+    fprintf(stderr, "[QSTAR-CALIB] result: h2d=%.1f GB/s cpu=%.1f GB/s expert=%.2f MiB threads=%d budget_us=%.0f\n",
+            cache.qstar_h2d_bps / 1e9,
+            cache.qstar_cpu_bps / 1e9,
+            cache.qstar_expert_bytes / 1048576.0,
+            cache.qstar_threads,
+            cache.qstar_budget_us);
     LLAMA_LOG_INFO("%s: q* calibrated: h2d=%.1f GB/s cpu=%.1f GB/s expert=%.2f MiB threads=%d budget_us=%.0f\n",
             __func__,
             cache.qstar_h2d_bps / 1e9,
