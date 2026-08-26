@@ -34,7 +34,7 @@
 1. **turbo KV は事実上「SET_ROWS + FLASH_ATTN_EXT」の組合せ専用**。K/V の高速 mul_mat (MMQ) はどのバックエンドにもなく、fork 内の実際のグラフ構築も FA 経路しか組んでいない (fattn インスタンス群 + TurboFlash + cm1)。q8_0 KV と同じ非 FA 構成を turbo で狙うと即サポ外エラーになる (決定的失敗、サイレント破壊ではない)。
 2. embedding 等を turbo にする用法は GET_ROWS 未対応で不可能 — これは設計通り (KV 専用型) なので benign。
 3. **将来レビュー観点**: Vulkan の SET_ROWS ゲートは全 turbo 型で `ne[0] % 128` 要求 (vulkan.cpp:18187 のコメント「128-element block」)、CUDA は T2/T3=%64・T4=%128 (ggml-cuda.cu:5292-5302)。**同一 head_dim でも CUDA では通るのに Vulkan では通らない帯域がある** (%64〜%127 の head_dim、ただし現行主流モデルは 64/128 どちらかの倍数なので実害なし)。バックエンド横断で contract を揃えるか、明示的に документ化する価値はある。
-4. 軽微な疑義 1 件: CPU `ggml_compute_forward_clamp` が K-quant ファミリ + turbo を受容する拡張が入っている (ops.cpp:5813-5815 はその case リスト)。用途が不明 — KV clamp 実験用と思われるが A に出典確認推奨。
+4. 軽微な疑義 1 件: CPU `ggml_compute_forward_clamp` が K-quant ファミリ + turbo を受容する拡張が入っている (ops.cpp:5813-5815 はその case リスト)。→ **出自確定済み・本文書末尾の追記節を参照** (root commit 由来の未完成受容拡張、case 列挙は到達不可)。
 
 ## ② tests/test_moe_frequency_placement.py の生存性
 
@@ -55,3 +55,30 @@ B の P1 (main @1da028abc) で stage-a 再現 tg≈12.3-13.5・graphs ON 13.88�
 ## 変更履歴
 
 - 2026-08-27: 初版 (reviewer AI)
+- 2026-08-27 追記: ①-4 CPU clamp 拡張の出自確定 (A 検証 + review 再検証)
+
+---
+
+## 追記: ①-4 CPU clamp 拡張の出自確定 (2026-08-27, A 検証・review 側追検証込み)
+
+**出自**: root commit `cbc360d19` (2026-07-24, "experts-first MoE + Laguna arch +
+frequency placement", Assisted-by MiMo Code Agent)。
+
+**実態** (`ggml/src/ggml-cpu/ops.cpp`):
+- 実装は `ggml_compute_forward_clamp_f32` (:5705-) / `_f16` (:5741-) の **2 系統のみ**
+- dispatcher switch の K-quant + TQ\*\_1S + TURBO\* + IQ ファミリの case 列挙
+  (:5813-5815 を含む巨大リスト)は、末尾が `default: GGML_ABORT("fatal error")`
+  で終わる — 列挙された quant 型は列挙されているだけで到達すれば即 abort
+  (review 側も ABORT 到達を自前再確認)
+- 換言すると「未完成受容拡張」。動く契約は「clamp ノードは必ず F32/F16 に変換後」
+  のみであり、case 列挙は嘘
+
+**処置方針 (A 推奨・判断保留中)**:
+- 方針 X(推奨): **case 列挙を削除**して default ABORT へ一本化
+- 方針 Y(却下寄り): dequant→clamp→requant 実装追加 — turbo を KV 専用設計とする
+  思想と矛盾するため非推奨
+- ステータス: 削除コミット未着手・担当未定(A 単独判断待ち)。実害なし
+  (switch 経由で quant 型が実行されない限り abort も発生しない)、優先度低
+
+当初 review 側の「KV clamp 実験用と思われる」という推測は不適確だったため、
+本節に差し替え済み。
