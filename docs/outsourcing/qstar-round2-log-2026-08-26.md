@@ -51,3 +51,74 @@
 - 機能 revert も成果
 - 理由 (compute path 別バグ等) を `docs/outsourcing/qstar-revert-reason-2026-08-XX.md` に書く
 - main への戻し方 (cherry-pick -x 等) を明記
+
+## ステップ 12-13: calibrate クラッシュ根本原因修正 + 性能分解 (2026-08-26, coder A)
+
+### 12a. 死亡ノード特定 ([QNODE] trace)
+`ggml-cpu.c` node loop に env-gated `[QNODE]` トレース追加 (LLAMA_QSTAR_NODE_TRACE=1)。
+実行ログ (死亡時, 最終行):
+
+```
+[QSTAR-CALIB] rep=0 entering
+[QSTAR-CPUEXEC] entry: layer=0 r=1 n_embd=2048 qstar_tp=0000000000000000 threads=4
+[QSTAR-CPUEXEC] before ggml_graph_compute: n_nodes=5 work_size=39832 bytes=2039808
+[QNODE] n=0/5 op=30 MUL_MAT_ID ne=[512,8,1] data=000002535D5D7FE0 src0data=00000253B724B3A0 src1data=000002535D5D5FE0
+(プロセス消失 — node 0 の mul_mat_id カーネル内で即死)
+```
+
+### 12b. 根本原因 (3 層, コミット順)
+1. **scratch dangling** (78c4a0486): `owned_tensor`/`own_node` ヘルパーが `mem.resize()` を
+   テンソル毎に呼び、先に配った data() ポインタが realloc で全滅。
+   → offset 集計 + 最後に resize 1 回 + 一括 rebind に書き換え。
+   加えて view (gate_v/up_v/h_cols) は allocator 不在で data==NULL のまま → view_fixups で親 storage へ明示 bind。
+2. **ids バッファ未初期化 = 本命の即死因** (3492f6f49): `cpu_exec` 内のローカル
+   `std::vector<int32_t> ids_buf(r)`。r=1 でもグラフの t_ids_up は [r_max=8] で、mul_mat_id
+   カーネルは id スロットを全部読む → 未初期化ヒープ 7 個分がゴミ expert index として
+   weight を読みに行き node 0 で segv。→ ids_buf を layer_exec メンバに昇格
+   (寿命問題も解消, B レビュー指示通り)、r_max 分確保して余りは最後の要求 id で pad。
+   data バインドは exec_build に一元化し cpu_exec の per-call swap は廃止。
+3. **calibrate 結果行がログに出ない**: LLAMA_LOG_INFO が早期ロード中に握り潰されるため
+   `[QSTAR-CALIB] result:` fprintf を追加。
+
+### 12c. 検証結果 (Huihui-Qwen3.6-35B-A3B Q4_K, slot32+glru+qstar threads=4)
+```
+[QSTAR-CALIB] rep=0/1/2 done ×3 → warmup loop exited
+[QSTAR-CALIB] result: h2d=3.6 GB/s cpu=0.1 GB/s expert=1.95 MiB threads=4 budget_us=30000
+(実リクエスト) [QSTAR-CPUEXEC] entry: layer=38/39 r=8 ... after ggml_graph_compute: status=0
+```
+クラッシュ解消 + 受入バー① (qstar_cpu>0 ログ観測) 到達。
+
+### 13. 速度分解 (B 分析 review-qstar-slowness-analysis-2026-08-26.md の検証)
+同一リクエスト ("Reply with exactly one word: hello", max_tokens=8, temp=0):
+
+| 構成 | eval tok/s | 備考 |
+|---|---|---|
+| q* ON budget 300 (デフォルト) | 0.73 | B 分析通りの CPU 追い出し |
+| q* ON budget 30000 | 1.45 | F1 実施。予測 ~13 t/s には届かず |
+| q* OFF 対照 graphs 無効 | 4.34 | |
+| q* OFF 対照 graphs 有効化試行 | 4.50 | **無意味だった**: glru はコード側で |
+
+F2: `compile_commands.json` 全 obj に `-march=native` 付き → **AVX2 無効説は否定**。
+cpu_bps 0.1 GB/s の別説明を発見: **測定過小バグ** — calibrate GEMV は ids pad により
+r_max=8 experts 分計算するのに bps は r=1×expert_bytes で割るため真値の約 1/8 を表示。
+真値推定 ~0.8-0.9 GB/s (threads=4)。表示修正は round-3 候補。
+
+新発見: 起動ログ `q*/global-LRU expert paging is incompatible with CUDA graph capture;
+set GGML_CUDA_DISABLE_GRAPHS=1` — glru 使用時はコード自身が graphs 強制無効。
+graphs 条件は常に「無効」で統一されており対照比較としては公平。
+
+**転送路理論上限の試算**: MoE 層 ~36 × r=8 × expert 2.04MB ÷ h2d 3.6GB/s ≈ 163ms/token
+→ 天井 ~6 t/s。budget 30000 の実測 1.45 t/s (オーバーヘッド込み) と整合。
+旧監査 ~13 t/s とは環境 (モデル/expert サイズ/h2d) が異なるため直接比較不可。
+このマシン×このモデルでは転送路ベース q* は原理的に ~6 t/s 止まり。
+
+### 受入バーへの影響と次手
+- バー① は観測済みだが cache 冷 (全 miss) 状態の観測であり健全性の証拠でない (B 指摘通り)。
+- F3 (ポリシー堅牢化: b_cpu degenerate 判定 / 予算条項の転送追い出し見直し) と
+  F4 (pinned 一括 copy 再較定) が次の本丸。cpu_bps 表示バグ修正込み。
+- 大型 prefill+glru クラッシュ調査は本 crash fix の上で再開予定。
+
+### コミット
+- 78c4a0486 moe : fix q* scratch dangling + bind view data + env-gated [QNODE] trace
+- 3492f6f49 moe : own q* expert-id buffer in layer exec, pad to r_max, log calibrate result
+- 両方 push 済 (feat/qstar-r2-rebuild)
