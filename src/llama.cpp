@@ -1472,6 +1472,8 @@ bool llama_moe_gpu_qstar_cpu_exec(struct llama_model & model, int32_t layer_id,
     ex.t_ids->data           = ids_buf.data(); // [r, 1]
     ex.t_ids_down->data      = ids_buf.data(); // [1, r]: same linear layout
     memcpy(ex.t_x->data, x, ex.n_embd*sizeof(float));
+    fprintf(stderr, "[QSTAR-CPUEXEC] entry: layer=%d r=%d n_embd=%d qstar_tp=%p threads=%d\n",
+            layer_id, r, ex.n_embd, (void*) cache.qstar_tp, cache.qstar_threads);
 
     // dedicated nested-compute pool; falls back to a single inline worker
     // if the platform refuses to spawn the requested thread count (ggml_threadpool_new
@@ -1496,7 +1498,10 @@ bool llama_moe_gpu_qstar_cpu_exec(struct llama_model & model, int32_t layer_id,
 
     const int64_t bytes = (int64_t) r * cache.qstar_expert_bytes;
     const auto t0 = std::chrono::steady_clock::now();
+    fprintf(stderr, "[QSTAR-CPUEXEC] before ggml_graph_compute: n_nodes=%zu work_size=%zu bytes=%lld\n",
+            ggml_graph_n_nodes(ex.gf), cplan.work_size, (long long) bytes);
     const enum ggml_status st = ggml_graph_compute(ex.gf, &cplan);
+    fprintf(stderr, "[QSTAR-CPUEXEC] after ggml_graph_compute: status=%d\n", (int) st);
     const int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - t0).count();
     if (st != GGML_STATUS_SUCCESS) {
@@ -1527,12 +1532,17 @@ bool llama_moe_qstar_exec_prepare(struct llama_model & model, int32_t layer_id) 
     if (!cache.qstar_enabled) {
         return false;
     }
+    fprintf(stderr, "[QSTAR-PREP] entry: layer=%d qstar_enabled=%d\n", layer_id, (int) cache.qstar_enabled);
     if (!llama_moe_qstar_exec_build(model, layer_id)) {
+        fprintf(stderr, "[QSTAR-PREP] exec_build returned false at layer=%d\n", layer_id);
         return false;
     }
     std::lock_guard<std::recursive_mutex> lock(cache.cache_mutex);
     const auto it = cache.qstar_exec_by_layer.find(layer_id);
-    return it != cache.qstar_exec_by_layer.end() && it->second.supported && it->second.gf != nullptr;
+    const bool ok = it != cache.qstar_exec_by_layer.end() && it->second.supported && it->second.gf != nullptr;
+    fprintf(stderr, "[QSTAR-PREP] exit: layer=%d supported=%d gf=%p\n",
+            layer_id, ok ? (int) it->second.supported : -1, ok ? it->second.gf : nullptr);
+    return ok;
 }
 
 void llama_moe_gpu_qstar_calibrate(struct llama_model & model) {
@@ -1594,11 +1604,16 @@ void llama_moe_gpu_qstar_calibrate(struct llama_model & model) {
         const int32_t one = probe;
         std::vector<float> x(n_embd, 0.5f);
         std::vector<float> partials((size_t) model.hparams.n_expert_used*n_embd, 0.0f);
+        fprintf(stderr, "[QSTAR-CALIB] starting 3-rep host GEMV warmup: layer=%d n_embd=%d\n", layer_id, n_embd);
         for (int rep = 0; rep < 3; ++rep) {
+            fprintf(stderr, "[QSTAR-CALIB] rep=%d entering\n", rep);
             if (!llama_moe_gpu_qstar_cpu_exec(model, layer_id, &one, 1, x.data(), partials.data())) {
+                fprintf(stderr, "[QSTAR-CALIB] rep=%d cpu_exec returned false, breaking\n", rep);
                 break;
             }
+            fprintf(stderr, "[QSTAR-CALIB] rep=%d done\n", rep);
         }
+        fprintf(stderr, "[QSTAR-CALIB] warmup loop exited\n");
     }
 
     LLAMA_LOG_INFO("%s: q* calibrated: h2d=%.1f GB/s cpu=%.1f GB/s expert=%.2f MiB threads=%d budget_us=%.0f\n",
