@@ -117,9 +117,9 @@ $row.crash_marker = [bool]($err -match 'operation not permitted|hipError|HIP err
 $row.last_layer = (($err -split "`n") | Select-String -Pattern 'MoE GPU slot stats' |
     ForEach-Object { $_.Line.Trim() } | Select-Object -Last 1)
 $row.stats = $row.last_layer
-$e1 = Select-String -Path $errLog -Pattern '\[E1-PREFETCH-HIT\] h=([0-9.]+)' -ErrorAction SilentlyContinue
+$e1 = $err | Select-String -Pattern '\[E1-PREFETCH-HIT\] h=([0-9.]+)' -AllMatches -ErrorAction SilentlyContinue
 if ($e1) {
-    $hs = @(); foreach ($m in $e1) { $hs += [double]$m.Matches[0].Groups[1].Value }
+    $hs = @(); foreach ($m in $e1) { foreach ($mm in $m.Matches) { $hs += [double]$mm.Groups[1].Value } }
     $row.e1_h = [math]::Round(($hs | Measure-Object -Average).Average, 3)
     $row.e1_windows = $hs.Count
     Write-Output ("E1: windows={0} h_avg={1:F3}" -f $hs.Count, $row.e1_h)
