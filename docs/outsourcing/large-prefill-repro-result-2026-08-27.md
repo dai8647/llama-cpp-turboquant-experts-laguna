@@ -1,83 +1,91 @@
-# 大型 prefill + glru クラッシュ — 検証結果 (coder A, 2026-08-27 朝)
+# 大型 prefill + glru クラッシュ — 検証結果 (coder A, 2026-08-27)
 
-triage prep (`docs/outsourcing/large-prefill-triage-prep-2026-08-26.md` @82fb0af47)
-に基づく再現テストの結果。 `verify_a.ps1 -Tag va_glru96_repro -Port 8112
--ExtraArgs '--moe-gpu-expert-slot-num 96 --moe-gpu-expert-global-lru'` を
-1 回実行 (B の verify_b とは別 port 8112 なので衝突無し)。
+B doc @8b7a17c64 で定義されたクラッシュ条件 (slot 96 + glru + 大型 prefill)
+に対する再現テスト結果。 1 度目の検証 (`18eaccfab` push 済) は review 側
+差し戻しにより再現として無効と確定。 本 doc は差し戻し後の正式結果。
 
-## 結果: 死亡せず完走
+## 1. 1 度目 (無効 — review 差し戻し)
 
-| 指標 | 値 | 想定 (B 観測) |
+- 実行: `verify_a.ps1 -Tag va_glru96_repro -Port 8112` (= default `long`)
+- 結果: pp_tokens=4535, alive=true, crash_marker=false
+- **review 指摘**: `long` = 38 iter = 4535 tok は B doc の `1a 確実再現
+  (55 iter = 6575 tok)` 条件を満たさない。 alive=true は小さいサイズで
+  の期待結果であり hardening の死亡回避は何も証明していない。
+  算術: 6575×38/55 ≈ 4539 ≈ 4535 (= 生成器は決定的で差は iter 数のみ)。
+- トークナイザ差分の説明 (私が 18eaccfab で書いた) は成り立たない、
+  取り下げ。
+- 18eaccfab の report は本 doc に統合して上書き扱い (git 上は別 commit)。
+
+## 2. 2 度目 (正式 — review 差し戻し適用後)
+
+- 実行: `verify_a.ps1 -Tag va_glru96_repro_short -Port 8112
+  -PromptKind short -ExtraArgs '--moe-gpu-expert-slot-num 96
+  --moe-gpu-expert-global-lru'`
+- 結果: **pp_tokens=6575, alive=true, crash_marker=false** (= B doc の
+  `1a 確実再現` 条件と完全一致するが、 死亡せず完走)
+- 既存ビルド使用 (rebuild 不要)
+
+| 項目 | 値 | B 観測 (1a) |
 |---|---|---|
-| alive | **true** | false (死亡) |
-| exit code | (正常完了) | 0xC0000005 (AV) 想定 |
-| pp_tps | 7.33 | n/a |
-| pp_tokens | **4535** | 6575 (B 計測) |
-| tg_tps | 1.42 | n/a |
-| tg_tokens | 128 | 0 (死亡) |
-| load_s | 7.3 | 6.8-8.2 |
-| crash_marker | false | false (無言死亡でも marker 無し) |
-| dumps/ | 空 (.dmp 取得なし) | (H1/H5 なら full dump 取得想定) |
-| capture_ok | false | false (graphs 経路は使っていない) |
+| pp_tokens | **6575** | 6575 |
+| alive | **true** | false |
+| pp_tps | 7.03 | n/a |
+| tg_tps | 1.36 | 0 (decode 未到達) |
+| crash_marker | false | false (無言) |
+| dumps/ | 空 (.dmp 取得なし) | (H1/H5 なら full dump 想定) |
+| load_s | 7.1 | 6.8-8.2 |
+| 最終 stderr | `srv update_slots: all slots are idle` | 途中切断 |
+| 内部 stats | copies=479232 hit=1668749 miss=479232 evict=479136 qstar_xfer=0 qstar_cpu=0 copy=876143.1 MiB avg=0.73 ms h2d_gbps=2.62 | n/a |
 
-**server 生存 = layer 18 死亡 (B 観測 ~13 秒地点) を通過した**。
-最終 stderr 行 (12.07.165 秒) = `srv update_slots: all slots are idle` =
-正常完了シグネチャ。
+**B の観測した死亡 (alive=False, layer 18 死亡 ~13 秒) は本検証で再現
+せず、 layer 18 通過 + decode 128 tok 完走を確認**。 6575 tok prefill を
+通過した事実は確定 (B 観測との条件一致 + 死亡の非再現 = hardening 効果
+を示唆する傍証)。
 
-## 観察された動作
+## 3. 結論と残課題
 
-- `MoE GPU expert slot bank materialized`: layer 1-28 を巡回、1.95 MiB
-  expert × slot 96 の動的 paging が継続。死亡は発生せず
-- 最終 stats: `copies=335872 hit=1159950 miss=335872 evict=335776
-  residents=96 cross_evict=79632 qstar_xfer=0 qstar_cpu=0
-  copy=614347.1 MiB avg=0.73 ms h2d_gbps=2.63`
-  - q* 経路は**不発** (qstar_xfer=0 / qstar_cpu=0) — 純粋 glru paging のみ
-  - h2d_gbps=2.63 (B 監査値 ~3.6 GB/s より低いが、RX 7800 XT 16GB + PCIe
-    gen4 実効として妥当)
-  - hit rate = 1159950 / (1159950+335872) ≈ 77.5% (B の旧監査 ~80% と整合)
+### 確定
+- 93e6454f4 先端のビルドでは、 B の観測した死亡条件 (slot 96 + glru +
+  6575 tok prefill) は **再現しない**
+- B hardening (`c01ea1a28` = bank_ensure zero-init) または その後に r2
+  ツリーへ入ったいずれか (もしくは複数組合せ) で H1/H5 系統の死亡が
+  偶然に/構造的に閉じている
 
-## 考察
+### 未確定 (要 bisect)
+- **死亡回避の真因が hardening か他の何かかを bisect で確定する必要あ
+  り**。 A 単独では古いビルドを保持していないため即時検証不可。
+  候補:
+  - 93e6454f4 の hardening (`c01ea1a28` = bank zero-init + whitelist
+    ログ + env 上書き WARN)
+  - B の H-3 + marker 採用 (a3e6454f4 = speculative.cpp 12 フィールド
+    scrub — 直接は MoE paging と無関係だが build 全体への副作用可能性)
+  - 93e6454f4 までの他の B 側 push (H-3 関連以外)
+- 上記 bisect は B 側ビルド保持資産を使う方が早い。 A は build-hip
+  単一所有者だが古いビルドを保持しているか不明。
 
-B の再現 doc (`coder-b-large-prefill-repro-2026-08-26.md` @8b7a17c64) は
-6575 tok で死亡と記録。 本検証は 4535 tok で完走。
+### クローズ判断
+- **review 指示通り「クラッシュ調査クローズは保留」**。 B 観測死亡と
+  r2 先端非再現の差分 bisect が終わるまで、 H1/H4 仮説は宙に浮いた
+  まま。 仮に hardening が真因なら、 H-1/H-2 (audit 修正) の追加価値は
+  「hardening と同等の安全性を別の経路で提供する冗長性」になる。
+- 仮に hardening が無関係で、 偶然 / 環境差 / タイミング差で B 観測
+  当時と挙動が変わっただけなら、 別条件下で再再発する可能性が残る。
 
-プロンプト生成スクリプトは同一 (verify_a.ps1 は verify_b.ps1 をベースに
-ExitCode/dumps 記録のみ追加、 内部 $iters=38 / 5 lines per iter) だが
-pp_tokens に差 (6575 vs 4535)。 これは llama.cpp 側のトークナイザ処理
-の差分ではなく、**B の計測時点と本検証時点で同じプロンプト生成器が
-異なるトークン数に展開された**ことを示す (モデルの quantization / merge
-の差の可能性、 もしくは B の 6575 tok 表記が概算で実測値はもっと短かった
-可能性)。
+## 4. 次手 (A 推奨)
 
-完了シグネチャから確実に言えること:
-- B の `gd_repro` 条件 (slot 96 + glru + 大型 prefill) は本検証で
-  死亡せず完走
-- 現 r2-rebuild ツリー (93e6454f4) は hardening 適用済で、B の観測した
-  死亡が再現しないか条件が変わった
+1. **H-1 + H-2 cherry-pick (B 採用済 93e6454f4 直上) + ビルド** = 承認
+   済の独立作業として進行 (クラッシュ調査とは別、 監査修正取り込み)。
+2. **bisect 提案を B へ依頼** = B 側ビルド保持資産で 6575 tok prefill
+   死亡が再現する旧 commit まで戻して検証、 どの commit で死亡回避が
+   始まったかを確定 (= hardening 真因判定)。
+3. **本 doc (正式結果) を commit/push** + `verify_a.ps1` のコメント
+   footgun 修正 (PromptKind 命名規則の注意書き追加、 B 命名規則と同期)。
 
-## 次手候補
-
-1. **B 観測条件との差を詰める** — 同じ 6575 tok を再現するため、
-   プロンプト生成を B 報告に揃える (B が用いた GGUF / temperature /
-   seed を確認) → 再実行
-2. **旧 exe (c01ea1a28 直前) で再実行** — hardening 適用前のビルドで
-   死亡が再現するか検証 (= hardening が死亡回避原因かどうかの切り分け)
-3. **H-1 + H-2 cherry-pick** — 93e6454f4 直上で audit 修正を取り込み、
-   hardening なしの死亡仮説が依然有効か確認
-4. **本件を「再現未確認」でクローズ** — r2-rebuild 先端で死亡しないと
-   いう negative result として記録し、 仮説 H1/H4 の深掘りは
-   別バグ再現待ち保留
-
-A 推奨 = **3 を優先**: H-1 + H-2 を cherry-pick + ビルド + 死亡再現
-テスト。 hardening による偶発的改善なのか、 audit 修正でも同等の
-改善が得られるか確認するのが筋。 1 (6575 tok 再現詰める) は B 環境と
-の設定差を埋める必要があり時間がかかる、 2 (旧 exe ビルド) は
-build-hip 所有者 = A だが古いビルドは保持していない可能性大、 4 は
-死亡仮説を宙に浮かせ続ける。
-
-## 関連コミット
+## 5. 関連コミット
 
 - 93e6454f4 (B 採用): hardening = bank_ensure zero-init + whitelist
-  対抗ログ + env 上書き WARN
+  対抗ログ + env 上書き WARN (`c01ea1a28`)
+- 24a70a281: H-3 marker 採用
 - a6ed570f5 (H-1, 未 pick): graphs_disable_pending 手動+auto 代入
 - 78b4158ff (H-2, 未 pick): q* materialize 全滅時 host-deferred 縮退
+- 18eaccfab: 1 度目 report (無効 — 本 doc で上書き扱い)
