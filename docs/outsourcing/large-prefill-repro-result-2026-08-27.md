@@ -54,14 +54,22 @@ B doc @8b7a17c64 で定義されたクラッシュ条件 (slot 96 + glru + 大�
 ### 未確定 (要 bisect)
 - **死亡回避の真因が hardening か他の何かかを bisect で確定する必要あ
   り**。 A 単独では古いビルドを保持していないため即時検証不可。
-  候補:
-  - 93e6454f4 の hardening (`c01ea1a28` = bank zero-init + whitelist
-    ログ + env 上書き WARN)
-  - B の H-3 + marker 採用 (a3e6454f4 = speculative.cpp 12 フィールド
-    scrub — 直接は MoE paging と無関係だが build 全体への副作用可能性)
-  - 93e6454f4 までの他の B 側 push (H-3 関連以外)
-- 上記 bisect は B 側ビルド保持資産を使う方が早い。 A は build-hip
-  単一所有者だが古いビルドを保持しているか不明。
+  候補 (review 側で hunk レベル解析済、 2 点に絞込み):
+  - **F3 (7850c38db)** = `llm_moe_gpu_slot_remap_qstar` (remap op)
+    を変更。 **q* OFF でも毎トークン実行される** 純 glru 経路の挙動
+    変更 = 候補として有効。 A 候補リストから欠落していた (修正)。
+  - **hardening (93e6454f4)** = `bank_ensure` zero-init は全モード
+    paging 経路で走る。 未初期化 bank 起因の破壊が死亡機序なら
+    直接の説明。
+  - 除外 (review 解析による):
+    - 78c4a0486/3492f6f49: hunk が qstar 関数内のみ、 q* 不発なら
+      未実行 (A 自身 153943603 §12b に大型 prefill 用ではないと記載)
+    - H-3 (7cb31d003) + marker: speculative 限定 / コメントのみ
+- 上記 bisect は B 側ビルド保持資産 + A ビルドを組合せ。 review 提案
+  の 2 ビルドラダーで十分 (= コスト: GPU 40-60 分 + ビルド 2-3 回)。
+- **生存バイナリのビルド元コミット = 93e6454f4 (B 採用 H-3+marker+
+  hardening 直上)**。 bisect の端点になるので後日の疑義防止に明示。
+  (B 受入バー⑤)
 
 ### クローズ判断
 - **review 指示通り「クラッシュ調査クローズは保留」**。 B 観測死亡と
@@ -71,21 +79,34 @@ B doc @8b7a17c64 で定義されたクラッシュ条件 (slot 96 + glru + 大�
 - 仮に hardening が無関係で、 偶然 / 環境差 / タイミング差で B 観測
   当時と挙動が変わっただけなら、 別条件下で再再発する可能性が残る。
 
-## 4. 次手 (A 推奨)
+## 4. 次手 (A 推奨 + review GO)
 
 1. **H-1 + H-2 cherry-pick (B 採用済 93e6454f4 直上) + ビルド** = 承認
    済の独立作業として進行 (クラッシュ調査とは別、 監査修正取り込み)。
-2. **bisect 提案を B へ依頼** = B 側ビルド保持資産で 6575 tok prefill
-   死亡が再現する旧 commit まで戻して検証、 どの commit で死亡回避が
-   始まったかを確定 (= hardening 真因判定)。
-3. **本 doc (正式結果) を commit/push** + `verify_a.ps1` のコメント
-   footgun 修正 (PromptKind 命名規則の注意書き追加、 B 命名規則と同期)。
+2. **B へ Step 0 bisect 依頼**:
+   - 保持クラッシュ時代バイナリを今日再実行、 まだ死ぬか確認 (= 環境
+     / 非決定性なら差分は commit ではなく bisect 中止)
+   - 死ななければ: 新旧各 3 回のクラッシュ率統計へ切替 (= 失敗ではなく
+     H4 競合系の成果)
+   - クラッシュビルドのビルド元コミット特定 (6b23cabbe〜e7ed2fa9e
+     付近と推定)
+3. **A 担当 (Step 1)**: 7850c38db (F3) ビルド + 6575 tok 実行
+   - crash → 帰属 = hardening (bank zero-init) 確定
+   - 生存 → Step 2 へ
+4. **A 担当 (Step 2、条件付き)**: 3492f6f49 ビルド + 6575 tok 実行
+   - crash → 帰属 = F3 確定
+   - 生存 → 前提崩壊で B のコミット特定へ差し戻し
+5. **判定ステップは 2 回実行推奨** (再現性確保)
 
 ## 5. 関連コミット
 
-- 93e6454f4 (B 採用): hardening = bank_ensure zero-init + whitelist
-  対抗ログ + env 上書き WARN (`c01ea1a28`)
+- **93e6454f4** (B 採用) = 生存バイナリのビルド元 (bisect 端点)
+  = hardening = bank_ensure zero-init + whitelist 対抗ログ + env 上書き
+  WARN (`c01ea1a28` 由来)
+- **7850c38db** (F3) = bisect 候補 1 = `llm_moe_gpu_slot_remap_qstar` 修正
+  (q* OFF でも毎トークン実行)
 - 24a70a281: H-3 marker 採用
 - a6ed570f5 (H-1, 未 pick): graphs_disable_pending 手動+auto 代入
 - 78b4158ff (H-2, 未 pick): q* materialize 全滅時 host-deferred 縮退
 - 18eaccfab: 1 度目 report (無効 — 本 doc で上書き扱い)
+- 901bd9a45: 2 度目 + 本 doc 補完 (本 commit)
