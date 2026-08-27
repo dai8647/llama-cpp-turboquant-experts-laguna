@@ -21,7 +21,7 @@
 | # | FreeToken 技術 | うちの現状 | ギャップの内容 | tg への効き目 | 優先度 |
 |---|---|---|---|---|---|
 | **G1** | **Pinned expert banks + direct I/O** (deep-dive §2.2) | pageable メモリ経由 H2D = 2.12-2.69 GB/s | host 側 expert bank を pinned (hipHostMalloc) で確保・aligned chunk を direct I/O で読み込み fill 後に pin。 PCIe 4.0 x16 実効 ~15-20 GB/s へ | **全レバーの土台**。 転送天井 6 t/s → 30-60 t/s 帯へ。 これなしでは他全部が無意味 | **Stage 1 (最優先)** |
-| **G2** | **CUDA-graph 互換 LRU キャッシュ** (論文 §4.1) | glru/q* 有効時は graphs を init 時に自動無効化 (H-1 適用後は INFO 出力のみ・依然 OFF) | single-pass kernel が K 個の eviction 候補を選出 → 論理 routed ID を物理 slot ID か CPU 割当フラグへ書き換え。 固定 slot アドレスで 1 回キャプチャし、リプレイ間に slot 中身だけ更新。 **FreeToken はキャッシュのために graphs を切らない** | **4x の本体**。 素 13 t/s は graphs ON の数字。 glru 経路の 1.0-1.4 t/s には同期コピー＋毎トークン host 起動オーバーヘッドが両方乗っている | **Stage 2** |
+| **G2** | **CUDA-graph 互換 LRU キャッシュ** (論文 §4.1) | glru/q* 有効時は graphs を init 時に自動無効化 (H-1 適用後は INFO 出力のみ・依然 OFF) | single-pass kernel が K 個の eviction 候補を選出 → 論理 routed ID を物理 slot ID か CPU 割当フラグへ書き換え。 固定 slot アドレスで 1 回キャプチャし、リプレイ間に slot 中身だけ更新。 **FreeToken はキャッシュのために graphs を切らない** | ~~4x の本体~~ **訂正 (§7): 実測で graphs 寄与 ≈0 → optional**。 glru 経路の 1.0-1.4 t/s の支配要因は同期コピー | ~~Stage 2~~ **optional (§7 参照)** |
 | **G3** | q★ bandwidth-adaptive miss 分割 (§2.1.1-2) | コードは存在するが全ラウンド qstar_cpu=0 (r2 rebuild 系譜にのみ残存) | 実測 B_P/B_H に基づき miss expert を PCIe 転送班と CPU 並列計算班に分割 | **この機械では低い** — calibrate cpu=1.1 GB/s vs pinned PCIe ~15-20 GB/s = CPU レーンが 15-18 倍遅い。 論文 §2.1.2 自身の HW 依存性主張 (デスクトップ級はほぼ全 miss を PCIe へ) と qstar_cpu=0 は整合 | Stage 4 (条件付き・低) |
 | **G4** | Graph-resident CPU 実行 (§2.1) | 無し (CPU 分岐は graph 外・毎トークン host スケジューリング) | CPU 分岐を同一 graph にキャプチャ。 decode バッチサイズ毎の安定 pinned I/O バッファ + persistent task descriptor・物理コアピン留め C++ ワーカープール・カーネル内 dequant | G3 が効くための前提。 G3 と同理由でこの機械では価値低い | Stage 4 (G3 と同時・低) |
 | **G5** | Frequency-informed eviction (#174) | 純 LRU のみ (decode 相 h=0.413) | decayed-frequency top-K pin + 末尾 LRU。 #174 実測: LRU decode ヒット率 8-18% vs freq-pin oracle 46%・容量曲線はほぼ線形 (キャッシュ増設はほぼ効かない・eviction ポリシーが差) | **うちは pure GPU offload モード** (miss は全部 PCIe 同期ストール・CPU レーンが吸収しない) なので h はクリティカルパス上。 h 0.41→0.5+ = 転送量 -15% 以上。 ただし #174 caveat: hybrid モードでは h は効かない | Stage 3 |
@@ -50,22 +50,27 @@
   1. host 側 expert bank を pinned 化 (hipHostMalloc・pageable からの切替)
   2. 非同期 H2D (stream/event・prefill-PF 機構 = event/inflight/resident 延期/drain, llama.cpp:965-1083 の decode 移植)
   3. 早期 fire = decode の層ホッピング中に次 layer expert の H2D を先行開始
-- **設計制約 (最重要)**: Stage 1 の実装は **graph-capturable な設計**で作ること = VRAM slot アドレスは固定・selection は indirection/gather 経由・動的 remap を避ける。 これを守らないと Stage 2 が全面リライトになる。
+- **設計制約**: Stage 1 の実装は **graph-capturable な設計**で作ること = VRAM slot アドレスは固定・selection は indirection/gather 経由・動的 remap を避ける。 Stage 2 は optional に降格したが (§7)、 固定 slot アドレスは A 案の既存 remap op と整合で追加コストゼロの保険 = 維持。
 - **回避**: クラッシュ中の旧 prefetch 経路 (LLAMA_MOE_PREFETCH_MS>0 の inter-step prefetch) は使わず、生きてる既存 glru コピー経路 (H-1/H-2 適用済) に実装。
 - **規模見積**: +100-200 行 (A 方針 C 見積)。
 - **ゲート**: h2d_gbps ≥ 10 かつ tg ≥ 10 t/s (6575tok 完走・数字必須)。
 
-### Stage 2 = G2: graphs 互換 paging (4x の本体)
+### Stage 2 = G2: graphs 互換 paging (~~4x の本体~~ → optional に降格・§7 訂正参照)
 
-- **内容**: 論文 §4.1 設計 — eviction 候補選出 kernel + 論理→物理 slot ID 書き換え。 固定 slot アドレスで 1 回キャプチャ・リプレイ間に slot 中身を更新。 glru 有効時の graphs 自動無効化 (H-1 で導入したパス) を解除し graphs を再有効化。
+- **訂正 (13:4x)**: B の実測で graphs 寄与 ≈0 が確定 → 本ステージは **optional / 無退行チェック**。 Stage 1 後に tg が頭打ちで、かつ host オーバーヘッドの寄与が計測で示された場合のみ着手。
+- **内容** (着手する場合): 論文 §4.1 設計 — eviction 候補選出 kernel + 論理→物理 slot ID 書き換え。 固定 slot アドレスで 1 回キャプチャ・リプレイ間に slot 中身を更新。 glru 有効時の graphs 自動無効化 (H-1 で導入したパス) を解除し graphs を再有効化。
 - **参照実装**: 上流 llama.cpp PR #25294 (device 側 n_slots slab キャッシュ + CPU id-remap custom op + async I/O ワーカープール・bit-exact 設計) が同設計空間。
-- **ゲート**: **tg 40 t/s 級** (stretch ≥30) + 6575tok 完走。
+- **ゲート** (着手する場合): tg の改善が end-to-end で数字で示せること (40 t/s の本体ゲートは Stage 1 側へ移動・下記)。
+
+### 40 t/s の本体ゲート (Stage 1 に統合・§7 訂正で新設)
+
+- **tg 40 t/s 級 (stretch ≥30) + 6575tok 完走** は Stage 1 機構 (pinned+async+早期 fire) の**オーバーラップ品質**で決まる: pinned 15-20 GB/s でも毎トークン miss 転送 ~366 MiB ≈ 19-25 ms = 転送を compute の裏に隠せなければ 40-52 t/s が天井。 Stage 1 実装時は「早期 fire のリード距離」「inflight コピーの event 同期」「層ホッピング中の転送ウィンドウ」が設計の中心。
 
 ### Stage 3 = G5: frequency pinning (ヒット率レバー)
 
 - **内容**: decayed-frequency top-K pin + 末尾 LRU (#174 の freq-pin oracle 46% を狙う)。
 - **ゲート**: h ≥ 0.5 かつ end-to-end tg 改善が数字で示せること。
-- **注**: Stage 2 で 40 t/s に到達していればスキップ可 (転送が律速でなくなった後では h 改善の tg 寄与が小さい)。
+- **注**: Stage 1 で 40 t/s に到達していればスキップ可 (転送が律速でなくなった後では h 改善の tg 寄与が小さい)。
 
 ### Stage 4 (optional・研究)
 
@@ -76,7 +81,7 @@
 ## §4. なぜこの順序か
 
 1. **G1 が全前提**: pageable 2.12 GB/s のままでは何を乗せても転送天井 ~6 t/s。 まず bandwidth を PCIe 上限まで上げる。
-2. **G2 が乗数**: 素ベースライン 13 t/s は graphs ON の数字。 glru 経路が graphs OFF + 同期コピーを背負っている限り 40 t/s は構造的に不可能。 G1 で bandwidth を直し G2 で毎トークン host オーバーヘッドを消す = FreeToken の 4x の再現パス。
+2. ~~**G2 が乗数**~~ **訂正 (§7)**: B の実測で graphs 寄与 ≈0 が確定 → G2 は乗数ではなかった。 FreeToken の 4x の本体は彼らの環境の host オーバーヘッド+転送隠蔽であり、 llama.cpp ベースラインには host オーバーヘッドが小さい。 **40 t/s の成否は G1 のオーバーラップ品質 (早期 fire で転送を compute の裏に隠す) に一本化** (§3「40 t/s の本体ゲート」参照)。
 3. **G5 は壁突破後の微調整**: h 0.41→0.5 は転送量削減だが、B_P が 15 GB/s+ になれば転送は律速ではなくなる可能性が高い。
 4. **G3/G4 はこの機械では低優先**: 論文自身の HW 依存性主張 + 我々の calibrate 実測 (cpu=1.1 GB/s) が根拠。
 
@@ -94,3 +99,13 @@
 - 5080 16GB: Qwen3.6-35B-A3B NVFP4 で 100 t/s (VRAM 非居住)。 論文: 4060 laptop 39.3 t/s・5090 で 77-83 t/s。
 - うち = RX 7800 XT 16GB (VRAM 644 GB/s) + A3B アクティブ 3B → 計算床は 40 t/s を大きく下回る。 **40 t/s は物理的に現実的**。 足りないのは HW ではなく上記 G1+G2 の機構。
 - 反例注意: GPT-OSS-20B-MXFP4 は FreeToken でも低速 → 「低 VRAM なら --cpu-moe が良い」ケースが存在。 ただし A3B 35B の pure offload は成功例が厚い。
+
+---
+
+## §7. 訂正 (2026-08-27 13:4x): G2「4x の本体」は撤回 — 実測で graphs 寄与 ≈0
+
+B の graphs 帰属測定 (6575tok・glru なし) で **graph 系機構の decode tg 寄与は ≈0 (ノイズ内)** が確定: default 13.13 / ggml capture OFF (`GGML_CUDA_DISABLE_GRAPHS=1`) 13.80 / llama reuse OFF (`LLAMA_GRAPH_REUSE_DISABLE=1`) 12.67。 詳細と経緯は stage2-graphs-compatible-paging-design-2026-08-27.md §4 参照。
+
+- **G2 の優先度訂正**: 「4x の本体」→ **optional / 無退行チェック (Stage 2 降格)**。 FreeToken の graphs 価値は彼らの hybrid CPU レーンの毎トークン host オーバーヘッドが前提で、 llama.cpp ベースラインにはそれが無い (#151 の環境依存警告が実例化)。
+- **§6 の「足りないのは G1+G2」も訂正**: 足りないのは実質 **G1 (pinned+async+オーバーラップ) のみ**。 40 t/s は Stage 1 のオーバーラップ品質に全乗り (pinned 15-20 GB/s でも miss 転送 ~366 MiB/tok ≈ 19-25 ms = 隠さなければ 40-52 t/s 天井)。
+- ステージ計画の更新版: Stage 1 = G1 (**本命・40 t/s の成否はここ**) / Stage 2 = G2 (optional・Stage 1 後に余裕があれば) / Stage 3 = G5 freq-pin / Stage 4 = G7/G3/G4/G6。

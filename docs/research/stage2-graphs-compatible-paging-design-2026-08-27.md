@@ -90,3 +90,24 @@ decode の miss 1 件毎の連鎖:
 - [ ] pinned 確保失敗時のフォールバックが安全か (同期経路戻り or 明確なエラー)
 - [ ] llama-graph.cpp:1837 remap op / llama-context.cpp:471 graphs 無効化が**未変更**か (Stage 1 は触らない約束)
 - [ ] stats に h2d_gbps が実測で出ているか (ゲート判定用)
+
+---
+
+## §4. 訂正 (2026-08-27 13:4x): B の実測で graphs 寄与 ≈0 → 本 doc の前提を降格
+
+**B の graphs 帰属測定 (6575tok・glru なし・既存バイナリ) の結果、 graph 系機構の decode tg への寄与は ≈0 (ノイズ内):**
+
+| run | 設定 | tg |
+|---|---|---|
+| default | llama reuse ON + ggml capture ON | 13.13 |
+| ggml capture OFF | `GGML_CUDA_DISABLE_GRAPHS=1` (common.cuh:1272 で実際に読まれている・review ソース検証済) | 13.80 |
+| llama reuse OFF | `LLAMA_GRAPH_REUSE_DISABLE=1` (llama-context.cpp:278) | 12.67 |
+
+- ggml capture 寄与 ≈ -0.67 (≈0)・llama reuse 寄与 ≈ +0.46 (≈0)。 ラン間分散大 (8.66-13.80) なので単点 delta はノイズ内だが、方向結論 (≈0) は両機構で一致。
+- `GGML_HIP_GRAPHS:BOOL=ON` (build-hip CMakeCache) で capture 機構はバイナリ入り・arch ゲートも gfx1101 は通過 = 「capture がそもそも走っていない」場合も含め、**どちらにしても再有効化のヘッドルームは ≈0**。
+- 注: B が当初「GGML_CUDA_DISABLE_GRAPHS は未読」と結論したのは誤り (review が common.cuh:1272 の getenv を確認)。 `graphs reused`/`graph nodes` は llama レベルのカンタ (llama-context.cpp:4217/:702) で HIP capture の証拠ではない。
+
+**計画への影響:**
+1. **Stage 2 (graphs 再有効化) は「4x の本体」から optional / 無退行チェックへ降格**。 本 doc §2 の設計自体は有効だが (graphs を使うならこの設計)、 優先度は Stage 1 のオーバーラップ品質より下。
+2. **40 t/s は Stage 1 の pinned+async+早期 fire のオーバーラップに全乗り**: pinned 15-20 GB/s でも毎トークン miss 転送 ~366 MiB ≈ 19-25 ms = 隠さなければ 40-52 t/s が天井。 早期 fire で転送を compute の裏に隠せるかが実ゲート。
+3. 方法論教訓 (#151 実例): FreeToken の「graphs が 4x」は彼らの hybrid CPU レーンの毎トークン host オーバーヘッドが前提。 llama.cpp ベースラインは host オーバーヘッドが小さく graphs 寄与 ≈0 = 機構の移植性は環境依存・必ず自環境で測る。
