@@ -104,7 +104,11 @@ r_max=8 experts 分計算するのに bps は r=1×expert_bytes で割るため�
 真値推定 ~0.8-0.9 GB/s (threads=4)。表示修正は round-3 候補。
 
 新発見: 起動ログ `q*/global-LRU expert paging is incompatible with CUDA graph capture;
-set GGML_CUDA_DISABLE_GRAPHS=1` — glru 使用時はコード自身が graphs 強制無効。
+set GGML_CUDA_DISABLE_GRAPHS=1` — glru 使用時はコード自身が graphs を**無効化**
+(出典: `src/llama-context.cpp` の `graphs_disable_pending = true` 設定)。
+H-1 cherry-pick 後 (@8b40eeb6b) は manual + auto 両 init 経路でこのフラグを代入する
+よう更新され、ログ文言も "CUDA graphs will be disabled for this context" の INFO に
+格上げされた。`GGML_CUDA_DISABLE_GRAPHS=1` env は依然 process-wide kill として有効。
 graphs 条件は常に「無効」で統一されており対照比較としては公平。
 
 **転送路理論上限の試算 (glru コピー経路限定)**: MoE 層 ~36 × r=8 × expert 2.04MB ÷
