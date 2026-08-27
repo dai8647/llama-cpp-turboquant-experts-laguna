@@ -23,7 +23,8 @@ param(
     [ValidateSet('glru','qstar')]
     [string]$Mode = 'glru',
     [string]$Tag = "",
-    [int]$IdleAfter = 2
+    [int]$IdleAfter = 2,
+    [switch]$E1 = $false
 )
 $ErrorActionPreference = 'Continue'
 if (-not $Tag) { $Tag = "{0}-slot{1}" -f $Mode, $Slots }
@@ -38,6 +39,7 @@ $env:PATH = 'C:\Program Files\AMD\ROCm\7.1\bin;' + $env:PATH
 $env:LLAMA_MOE_SLOT_STATS = '1'
 $env:GGML_CUDA_DISABLE_GRAPHS = '1'
 Remove-Item Env:LLAMA_MOE_PREFETCH_MS -ErrorAction SilentlyContinue
+if ($E1) { $env:LLAMA_MOE_PREFETCH_MS = '4.0' }
 # q* per-step per-layer decision log (verbose; parsed below)
 if ($Mode -eq 'qstar') { $env:LLAMA_MOE_QSTAR_STATS = '1' } else { Remove-Item Env:LLAMA_MOE_QSTAR_STATS -ErrorAction SilentlyContinue }
 
@@ -130,6 +132,19 @@ if ($Mode -eq 'qstar') {
     } else {
         Write-Output "QSTAR: no [q*] decision lines  <-- q* split NOT engaging (check n_tokens==1 decode + calibration)"
     }
+}
+
+# E1 instrument: aggregate the predicted hit-rate h lines emitted by the
+# inter-step prefetch (requires LLAMA_MOE_PREFETCH_MS, set via -E1).
+$e1 = Select-String -Path $errLog -Pattern '\[E1-PREFETCH-HIT\] h=([0-9.]+)' -ErrorAction SilentlyContinue
+if ($e1) {
+    $hs = @(); foreach ($m in $e1) { $hs += [double]$m.Matches[0].Groups[1].Value }
+    $hMin = ($hs | Measure-Object -Minimum).Minimum
+    $hAvg = ($hs | Measure-Object -Average).Average
+    $hMax = ($hs | Measure-Object -Maximum).Maximum
+    Write-Output ("E1: windows={0} h_min={1:F3} h_avg={2:F3} h_max={3:F3}" -f $hs.Count, $hMin, $hAvg, $hMax)
+} else {
+    Write-Output "E1: no [E1-PREFETCH-HIT] lines  <-- prefetch hit-rate instrument NOT engaged (need -E1)"
 }
 
 Stop-Process -Id $p.Id -Force

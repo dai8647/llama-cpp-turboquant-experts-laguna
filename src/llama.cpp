@@ -33,6 +33,7 @@
 #include <ctime>
 #include <stdexcept>
 #include <vector>
+#include <set>
 
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
@@ -885,10 +886,40 @@ void llama_moe_gpu_expert_slot_prefetch(struct llama_model & model, double budge
         return;
     }
 
+    // E1 instrument: predicted hit-rate h of the inter-step prefetch.
+    // take_last_selections() returns the router's selections of the PREVIOUS
+    // decode step (what this prefetch window is bringing in for the step that
+    // just ran). Comparing that predicted set against THIS step's selections
+    // (the next take_last_selections, one window later) yields the fraction of
+    // prefetched experts the router actually reused -> prefetch prediction
+    // accuracy. One-window-lagged correlation, self-contained here (no decode
+    // access-path changes). Used by the E1 gate: (1-h)*miss_bytes/B_h2d <= 83ms.
+    const auto sels = cache.take_last_selections();
+    {
+        static std::set<std::pair<int32_t, int32_t>> prev_predicted;
+        std::set<std::pair<int32_t, int32_t>> cur_predicted;
+        for (const auto & sel : sels) {
+            for (const int32_t expert_id : sel.second) {
+                cur_predicted.emplace(sel.first, expert_id);
+            }
+        }
+        const int64_t pred_n = (int64_t) prev_predicted.size();
+        int64_t overlap_n = 0;
+        for (const auto & p : cur_predicted) {
+            if (prev_predicted.count(p)) { ++overlap_n; }
+        }
+        if (pred_n > 0) {
+            const double h = (double) overlap_n / (double) pred_n;
+            LLAMA_LOG_INFO("%s: [E1-PREFETCH-HIT] h=%.3f predicted=%lld actual=%lld overlap=%lld\n",
+                    __func__, h, (long long) pred_n, (long long) cur_predicted.size(), (long long) overlap_n);
+        }
+        prev_predicted = std::move(cur_predicted);
+    }
+
     // runs between decode steps, while no graph is in flight, so plain
     // synchronous H2D copies cannot race with backend compute
     const auto t_start = std::chrono::steady_clock::now();
-    for (const auto & [layer_id, ids] : cache.take_last_selections()) {
+    for (const auto & [layer_id, ids] : sels) {
         const auto * bank = static_cast<const llama_moe_gpu_expert_cache &>(cache).bank_for_layer(layer_id);
         if (bank == nullptr) {
             continue;

@@ -11,7 +11,8 @@ param(
     [int]$Ctx = 8192,
     [int]$Predict = 128,
     [string]$PromptKind = 'long',
-    [int]$TimeoutSec = 1500
+    [int]$TimeoutSec = 1500,
+    [switch]$E1 = $false
 )
 $ErrorActionPreference = 'Continue'
 $root  = 'C:\Users\dai86\llama-cpp-turboquant-experts-laguna'
@@ -23,6 +24,7 @@ $env:HIP_VISIBLE_DEVICES = '0'
 $env:PATH = 'C:\Program Files\AMD\ROCm\7.1\bin;' + $env:PATH
 $env:LLAMA_MOE_SLOT_STATS = '1'
 if ($EnvPF -eq '1') { $env:LLAMA_MOE_PREFILL_PF = '1' } else { Remove-Item Env:LLAMA_MOE_PREFILL_PF -ErrorAction SilentlyContinue }
+if ($E1) { $env:LLAMA_MOE_PREFETCH_MS = '4.0' }
 # NOTE: GGML_CUDA_DISABLE_GRAPHS is deliberately NOT set here (graphs ON)
 
 Set-Location $root
@@ -115,14 +117,21 @@ $row.crash_marker = [bool]($err -match 'operation not permitted|hipError|HIP err
 $row.last_layer = (($err -split "`n") | Select-String -Pattern 'MoE GPU slot stats' |
     ForEach-Object { $_.Line.Trim() } | Select-Object -Last 1)
 $row.stats = $row.last_layer
+$e1 = Select-String -Path $errLog -Pattern '\[E1-PREFETCH-HIT\] h=([0-9.]+)' -ErrorAction SilentlyContinue
+if ($e1) {
+    $hs = @(); foreach ($m in $e1) { $hs += [double]$m.Matches[0].Groups[1].Value }
+    $row.e1_h = [math]::Round(($hs | Measure-Object -Average).Average, 3)
+    $row.e1_windows = $hs.Count
+    Write-Output ("E1: windows={0} h_avg={1:F3}" -f $hs.Count, $row.e1_h)
+} else { $row.e1_h = $null }
 
 if (-not $row.alive) {
     Write-Output ("{0}: PROCESS-DIED exit_code={1} dumps=[{2}]" -f $Tag, $row.exit_code, $row.dumps)
     Write-Output ("{0}: last slot stats: {1}" -f $Tag, $row.last_layer)
 }
 
-Add-Content -Path "$root\bench_results.txt" -Value ("{0}: extra='{1}' pf={2} prompt={3} ctx={4} | pp={5} t/s ({6} tok) tg={7} t/s ({8} tok) load={9}s capture_ok={10} crash={11} alive={12} exit_code={13}" -f `
-    $Tag, $ExtraArgs, $EnvPF, $PromptKind, $Ctx, $row.pp_tps, $row.pp_tokens, $row.tg_tps, $row.tg_tokens, $loadS, $row.capture_ok, $row.crash_marker, $row.alive, $row.exit_code) -Encoding UTF8
+Add-Content -Path "$root\bench_results.txt" -Value ("{0}: extra='{1}' pf={2} prompt={3} ctx={4} | pp={5} t/s ({6} tok) tg={7} t/s ({8} tok) load={9}s capture_ok={10} crash={11} alive={12} exit_code={13} e1={14}" -f `
+    $Tag, $ExtraArgs, $EnvPF, $PromptKind, $Ctx, $row.pp_tps, $row.pp_tokens, $row.tg_tps, $row.tg_tokens, $loadS, $row.capture_ok, $row.crash_marker, $row.alive, $row.exit_code, $row.e1_h) -Encoding UTF8
 
 Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
 Start-Sleep -Seconds 1
