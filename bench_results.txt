@@ -39,3 +39,5 @@ NOTE: A's qstar-hui-short1/2/3 (13.78/16.81/16.76 t/s) and qstar-ornith-short1/2
 gd_normal: extra='--moe-gpu-expert-slot-num 30' pf= prompt=short ctx=8192 | pp=172.09 t/s (6575 tok) tg=13.65 t/s (32 tok) load=5.1s capture_ok=False crash=False alive=True
 gd_glru: extra='--moe-gpu-expert-slot-num 96 --moe-gpu-expert-global-lru' pf= prompt=short ctx=8192 | pp= t/s ( tok) tg= t/s ( tok) load=6.8s capture_ok=False crash=False alive=False
 gd_glru_env: extra='--moe-gpu-expert-slot-num 96 --moe-gpu-expert-global-lru' pf= prompt=short ctx=8192 | pp= t/s ( tok) tg= t/s ( tok) load=8.2s capture_ok=False crash=False alive=False
+va_glru96_repro: extra='--moe-gpu-expert-slot-num 96 --moe-gpu-expert-global-lru' pf= prompt=long ctx=8192 | pp=7.33 t/s (4535 tok) tg=1.42 t/s (128 tok) load=7.3s capture_ok=False crash=False alive=True exit_code=
+va_glru96_repro_short: extra='--moe-gpu-expert-slot-num 96 --moe-gpu-expert-global-lru' pf= prompt=short ctx=8192 | pp=7.03 t/s (6575 tok) tg=1.36 t/s (128 tok) load=7.1s capture_ok=False crash=False alive=True exit_code=
