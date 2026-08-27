@@ -2734,6 +2734,43 @@ void ggml_backend_cuda_ext_set_graphs_enabled(ggml_backend_t backend, bool enabl
     cuda_ctx->ext_graphs_disabled = !enable;
 }
 
+// Stage 1: pinned-host alloc/free for the MoE expert-slot bank staging
+// path. thin wrapper over cudaMallocHost (HIP path uses hipHostMalloc via
+// the compat layer). on success *ext_backend_out receives a borrowed
+// pointer to the first CUDA backend so callers can issue async H2D
+// against it via ggml_backend_cuda_ext_h2d_async. on failure the caller
+// is expected to fall back to the synchronous pageable path.
+void * ggml_backend_cuda_pinned_host_malloc(size_t size, ggml_backend_t * ext_backend_out) {
+    if (ext_backend_out != nullptr) {
+        *ext_backend_out = nullptr;
+    }
+    if (size == 0) {
+        return nullptr;
+    }
+    void * host = nullptr;
+    cudaError_t err = cudaMallocHost(&host, size);
+    if (err != cudaSuccess) {
+        return nullptr;
+    }
+    if (ext_backend_out != nullptr) {
+        // first CUDA device's backend - the ext API is per-context so
+        // callers should pass the same backend they use for h2d_async.
+        // the MoE bank code currently issues async H2D against any
+        // accel backend; using the first one is a safe default.
+        extern ggml_backend_t ggml_backend_cuda_init(int device);
+        *ext_backend_out = ggml_backend_cuda_init(0);
+    }
+    return host;
+}
+
+void ggml_backend_cuda_pinned_host_free(void * ptr) {
+    if (ptr == nullptr) {
+        return;
+    }
+    cudaError_t err = cudaFreeHost(ptr);
+    GGML_UNUSED(err);
+}
+
 static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data,
         size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;

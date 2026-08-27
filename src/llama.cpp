@@ -608,6 +608,42 @@ static bool llama_moe_gpu_expert_bank_ensure(
     // inject NaN into a sum whose router weight is already zeroed.
     ggml_backend_buffer_clear(bank.buf.get(), 0);
 
+    // Stage 1: pinned host staging for async H2D. opt-in via
+    // LLAMA_MOE_PINNED_BANK; failure is non-fatal (pinned_enabled stays 0
+    // and the existing pageable path is used). size = n_slots * max(per-expert
+    // bytes) which fits in system RAM comfortably (96 GB available, ~187 MiB
+    // per layer at slot 96). allocation is per-bank (per-layer) and lazy.
+    // pinned host alloc is a thin wrapper around cudaMallocHost (HIP path
+    // uses hipHostMalloc) exposed by ggml-cuda's existing ext API. when
+    // ggml-cuda is not built (pure CPU build) the call is a no-op and
+    // pinned_enabled stays 0; the pageable path is then taken unchanged.
+    if (llama_moe_gpu_expert_slot_pinned_bank_env() && !bank.pinned_enabled) {
+        size_t max_per = 0;
+        for (const auto & bt : bank.tensors) {
+            if (bt.nbytes_per_expert > max_per) {
+                max_per = bt.nbytes_per_expert;
+            }
+        }
+        if (max_per > 0 && bank.n_slots > 0) {
+            const size_t bytes = (size_t) bank.n_slots * max_per;
+            ggml_backend_t ext_backend = nullptr;
+            void * host = ggml_backend_cuda_pinned_host_malloc(bytes, &ext_backend);
+            if (host != nullptr) {
+                bank.pinned_staging       = host;
+                bank.pinned_staging_bytes = bytes;
+                bank.pinned_expert_bytes  = max_per;
+                bank.pinned_enabled       = 1;
+                bank.pinned_backend       = ext_backend;
+                LLAMA_LOG_INFO("%s: MoE GPU expert bank pinned staging: layer=%d slots=%d per_expert=%.2f MiB total=%.2f MiB\n",
+                        __func__, layer_id, bank.n_slots,
+                        max_per / 1024.0 / 1024.0, bytes / 1024.0 / 1024.0);
+            } else {
+                LLAMA_LOG_WARN("%s: MoE GPU expert bank pinned staging alloc failed (%.2f MiB); falling back to pageable H2D\n",
+                        __func__, bytes / 1024.0 / 1024.0);
+            }
+        }
+    }
+
     for (const auto & bank_tensor : bank.tensors) {
         cache.register_compute_tensor(bank_tensor.src, bank_tensor.dev);
     }
@@ -973,6 +1009,19 @@ static void llama_moe_gpu_expert_slot_prefill_configure(llama_moe_gpu_expert_cac
                 __func__, cache.prefill_pf_budget_bytes / 1048576.0,
                 (long long) cache.prefill_pf_max_inflight);
     }
+}
+
+// Stage 1: opt-in env to enable the pinned-host staging path. the actual
+// hipHostMalloc happens lazily per bank inside llama_moe_gpu_expert_bank_ensure
+// once the per-layer expert-tensor sizes are known. default off so existing
+// runs (pageable 2.12 GB/s) keep their behavior.
+static int llama_moe_gpu_expert_slot_pinned_bank_env() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char * e = getenv("LLAMA_MOE_PINNED_BANK");
+        cached = (e != nullptr && e[0] != '\0' && e[0] != '0') ? 1 : 0;
+    }
+    return cached;
 }
 
 void llama_moe_gpu_expert_slot_prefill_prefetch(struct llama_model & model, struct ggml_backend * backend) {

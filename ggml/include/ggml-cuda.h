@@ -63,6 +63,13 @@ GGML_API void   ggml_backend_cuda_ext_event_destroy(ggml_backend_t backend, void
 // instead of exporting GGML_CUDA_DISABLE_GRAPHS globally.
 GGML_API void   ggml_backend_cuda_ext_set_graphs_enabled(ggml_backend_t backend, bool enable);
 
+// extension: pinned host buffer alloc/free for the MoE expert-slot bank
+// staging path. returns NULL on failure (caller falls back to pageable H2D).
+// on success *ext_backend_out is the first CUDA backend suitable for
+// ggml_backend_cuda_ext_h2d_async; it may be NULL on CPU-only builds.
+GGML_API void * ggml_backend_cuda_pinned_host_malloc(size_t size, ggml_backend_t * ext_backend_out);
+GGML_API void   ggml_backend_cuda_pinned_host_free(void * ptr);
+
 #ifdef  __cplusplus
 }
 #endif

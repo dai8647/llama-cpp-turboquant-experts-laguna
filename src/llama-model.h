@@ -606,10 +606,30 @@ struct llama_moe_gpu_expert_bank {
     ggml_backend_buffer_ptr buf;
     std::vector<llama_moe_gpu_expert_bank_tensor> tensors;
 
+    // Stage 1: pinned host staging buffer (hipHostMalloc) for async H2D
+    // via ggml_backend_cuda_ext_h2d_async. enables PCIe gen4 ~15-20 GB/s
+    // vs pageable 2.12 GB/s. opt-in via LLAMA_MOE_PINNED_BANK env /
+    // --moe-gpu-expert-pinned-bank; bank.buf (VRAM) keeps fixed layout
+    // so the graph's mul_mat_id slot addresses stay graph-compatible.
+    void * pinned_staging       = nullptr; // host pinned, or nullptr when disabled
+    size_t pinned_staging_bytes = 0;       // == n_slots * max(nbytes_per_expert)
+    size_t pinned_expert_bytes  = 0;       // bytes for one expert (gate/up/down)
+    int    pinned_enabled       = 0;       // 1 once hipHostMalloc succeeded
+    void * pinned_last_event    = nullptr; // event for the most recent async H2D
+    ggml_backend_t pinned_backend = nullptr; // ext API backend for h2d_async
+
     void clear_storage() {
         tensors.clear();
         buf.reset();
         ctx.reset();
+        // pinned_staging ownership: freed in llama_moe_gpu_expert_bank_destroy
+        // (called from cache teardown). not here so the per-bank lifetime
+        // matches the ggml context.
+        pinned_staging       = nullptr;
+        pinned_staging_bytes = 0;
+        pinned_expert_bytes  = 0;
+        pinned_enabled       = 0;
+        pinned_last_event    = nullptr;
     }
 };
 
