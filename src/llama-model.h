@@ -537,6 +537,24 @@ struct llama_layer {
     struct ggml_tensor * index_q_norm = nullptr;
     struct ggml_tensor * index_k_norm = nullptr;
 
+    // qwen4exp hyper-connections
+    struct ggml_tensor * hc_attn_norm   = nullptr;
+    struct ggml_tensor * hc_attn_down   = nullptr;
+    struct ggml_tensor * hc_attn_up     = nullptr;
+    struct ggml_tensor * hc_attn_inject = nullptr;
+    struct ggml_tensor * hc_ffn_norm    = nullptr;
+    struct ggml_tensor * hc_ffn_down    = nullptr;
+    struct ggml_tensor * hc_ffn_up      = nullptr;
+    struct ggml_tensor * hc_ffn_inject  = nullptr;
+
+    // qwen4exp PLE n-gram embeddings
+    struct ggml_tensor * ple_key        = nullptr;
+    struct ggml_tensor * ple_value      = nullptr;
+    struct ggml_tensor * ple_norm_key   = nullptr;
+    struct ggml_tensor * ple_norm_query = nullptr;
+    struct ggml_tensor * ple_norm_conv  = nullptr;
+    struct ggml_tensor * ple_conv1d     = nullptr;
+
     // gemma4 layer output scale, reused for talkie embedding skip scale
     struct ggml_tensor * out_scale = nullptr;
 
@@ -603,12 +621,29 @@ struct llama_moe_gpu_expert_bank {
 
     ggml_context_ptr ctx;
     ggml_backend_buffer_ptr buf;
+    // pinned host staging: pageable GGUF slices bounce through here so H2D
+    // can use DMA at PCIe bandwidth instead of driver staging
+    ggml_backend_buffer_ptr pinned_buf;
+    size_t pinned_stage_bytes = 0;
+    // LLAMA_MOE_HOST_BANK=1: continuous pinned host slab with every routed
+    // expert of this layer. bank_tensor.src is retargeted here so H2D always
+    // reads pinned memory (no GGUF mmap page faults on miss).
+    ggml_context_ptr host_ctx;
+    ggml_backend_buffer_ptr host_slab;
+    size_t host_slab_bytes = 0;
+    bool host_bank = false;
     std::vector<llama_moe_gpu_expert_bank_tensor> tensors;
 
     void clear_storage() {
         tensors.clear();
         buf.reset();
         ctx.reset();
+        pinned_buf.reset();
+        pinned_stage_bytes = 0;
+        host_ctx.reset();
+        host_slab.reset();
+        host_slab_bytes = 0;
+        host_bank = false;
     }
 };
 
@@ -735,6 +770,23 @@ struct llama_moe_gpu_expert_cache {
     // frequency-based placement: preload experts in this list (frequency order)
     // empty means preload all (full-slot mode)
     std::vector<std::pair<int32_t, int32_t>> frequency_whitelist;
+    // O(1) membership for the LRU pin check (vector scan is too slow on miss)
+    std::unordered_set<uint64_t> frequency_whitelist_set;
+
+    // FreeToken-style global LRU: when slots < experts and no whitelist, the
+    // remap redirects weights to the bank and pages misses on demand
+    bool global_lru_enabled = false;
+    // set from CLI at model load; applied in auto_init after the cache is sized
+    bool global_lru_requested = false;
+    // --moe-hot-expert: enable async expert H2D (prefill PF machinery) for decode too
+    bool decode_pf_requested = false;
+    // frequency whitelist from --moe-freq-report-in (applied in auto_init)
+    std::string freq_report_in;
+    float       freq_ratio = 1.0f;
+    // runtime frequency pin: after auto_pin_after_access hits are recorded,
+    // pin the hottest experts into the slot cache (no 2-pass calibration)
+    int64_t auto_pin_after_access = 0; // 0 = off; default set when --moe-hot-expert
+    bool    auto_pin_done = false;
 
     // pooled remap userdata, one per MoE layer; pointers handed to ggml custom
     // ops must stay valid for as long as the built graph may be reused
@@ -782,17 +834,17 @@ struct llama_moe_gpu_expert_cache {
         if (frequency_whitelist.empty()) {
             return true; // no whitelist = full-slot mode
         }
-        for (const auto& [lid, eid] : frequency_whitelist) {
-            if (lid == layer_id && eid == expert_id) {
-                return true;
-            }
-        }
-        return false;
+        return frequency_whitelist_set.count(key(layer_id, expert_id)) > 0;
     }
 
     void set_frequency_whitelist(const std::vector<std::pair<int32_t, int32_t>>& experts) {
         std::lock_guard<std::recursive_mutex> lock(cache_mutex);
         frequency_whitelist = experts;
+        frequency_whitelist_set.clear();
+        frequency_whitelist_set.reserve(experts.size());
+        for (const auto & [lid, eid] : experts) {
+            frequency_whitelist_set.insert(key(lid, eid));
+        }
     }
 
     void clear() {
@@ -1038,7 +1090,27 @@ struct llama_moe_gpu_expert_cache {
         if (layer_slots == nullptr) {
             return 0;
         }
-        int32_t victim = 0;
+        // frequency pin: never evict a whitelist expert while a non-pinned
+        // victim exists (FreeToken #174 - LRU 8-18% vs freq-pin oracle 46%)
+        const bool pin = !frequency_whitelist.empty();
+        int32_t victim = -1;
+        for (int32_t i = 0; i < n_slots; ++i) {
+            const auto & s = (*layer_slots)[i];
+            if (!s.resident) {
+                continue;
+            }
+            if (pin && is_in_frequency_whitelist(layer_id, s.expert_id)) {
+                continue;
+            }
+            if (victim < 0 || s.last_used < (*layer_slots)[victim].last_used) {
+                victim = i;
+            }
+        }
+        if (victim >= 0) {
+            return victim;
+        }
+        // every resident slot is pinned: fall back to oldest overall
+        victim = 0;
         for (int32_t i = 1; i < n_slots; ++i) {
             if ((*layer_slots)[i].last_used < (*layer_slots)[victim].last_used) {
                 victim = i;
@@ -1141,30 +1213,43 @@ struct llama_moe_gpu_expert_cache {
         }
 
         std::lock_guard<std::recursive_mutex> lock(cache_mutex);
-        record_access(layer_id, expert_id);
 
-        // Pass 1 collection (track_access) counts access only. Plain paging
-        // runs (slots < experts, no whitelist) historically did the same
-        // because graphs never redirect weights to banks in that regime; the
-        // global LRU pool is what makes dynamic banking reachable
-        // end-to-end, so it lifts the skip (graphs extend their redirect
-        // accordingly).
-        if (frequency_whitelist.empty() && n_slots < n_experts &&
-                (track_access || !global_lru_enabled)) {
+        // Pass 1 collection (track_access, no global LRU) counts access only.
+        // Global-LRU paging lifts the skip so warmup still materializes experts
+        // into the bank; track_access then feeds the online frequency pin.
+        if (frequency_whitelist.empty() && n_slots < n_experts && !global_lru_enabled) {
+            if (track_access) {
+                record_access(layer_id, expert_id);
+            }
             return expert_id;
         }
 
-        int32_t slot = find(layer_id, expert_id);
-        if (slot >= 0) {
-            ++n_hit;
-            if (auto * s = slot_at(layer_id, slot)) {
-                s->last_used = ++clock;
+        // hit fast path: single lock, direct hash lookup (called 10*48 times
+        // per decode token, so avoid re-entering find/slot_at locks)
+        {
+            const auto it = expert_to_slot.find(key(layer_id, expert_id));
+            if (it != expert_to_slot.end()) {
+                const int32_t slot_id = it->second;
+                if (slot_id >= 0 && slot_id < n_slots) {
+                    auto & layer_slots = slots_by_layer[layer_id];
+                    if (slot_id < (int32_t) layer_slots.size()) {
+                        auto & s = layer_slots[slot_id];
+                        if (s.resident && s.layer_id == layer_id && s.expert_id == expert_id) {
+                            if (track_access) {
+                                record_access(layer_id, expert_id);
+                            }
+                            ++n_hit;
+                            s.last_used = ++clock;
+                            return slot_id;
+                        }
+                    }
+                }
             }
-            return slot;
         }
 
+        record_access(layer_id, expert_id);
         ++n_miss;
-        slot = find_free(layer_id);
+        int32_t slot = find_free(layer_id);
         if (slot < 0) {
             slot = find_lru_victim(layer_id);
             if (slot >= 0) {
@@ -1197,6 +1282,13 @@ struct llama_moe_gpu_expert_cache {
 
 // inter-step speculative expert prefetch; budget_ms <= 0 disables
 void llama_moe_gpu_expert_slot_prefetch(struct llama_model & model, double budget_ms);
+// elastic VRAM sizing: resolve auto slot count after KV is resident
+void llama_moe_gpu_expert_slot_auto_init(struct llama_model & model);
+// runtime frequency pin (no 2-pass report); no-op until auto_pin_after_access is reached
+void llama_moe_gpu_expert_slot_auto_pin(struct llama_model & model);
+// prefill double-buffering: enqueue predicted experts on the copy stream
+void llama_moe_gpu_expert_slot_prefill_prefetch(struct llama_model & model, struct ggml_backend * backend);
+void llama_moe_gpu_expert_slot_prefill_shutdown(struct llama_model & model);
 
 struct llama_model {
     llm_type type = LLM_TYPE_UNKNOWN;
@@ -1257,6 +1349,11 @@ struct llama_model {
     struct ggml_tensor * per_layer_tok_embd   = nullptr;
     struct ggml_tensor * per_layer_model_proj = nullptr;
     struct ggml_tensor * per_layer_proj_norm  = nullptr;
+
+    // qwen4exp final hyper-connection mixer
+    struct ggml_tensor * hc_head_norm = nullptr;
+    struct ggml_tensor * hc_head_down = nullptr;
+    struct ggml_tensor * hc_head_up   = nullptr;
 
     // eagle3
     struct ggml_tensor * fc  = nullptr;  // feature fusion layer
@@ -1377,6 +1474,7 @@ struct llama_model_base : public llama_model {
     const int TENSOR_SKIP;
     const int TENSOR_SKIP_IF_VIRTUAL;
     const int TENSOR_ALLOW_RESHAPE;
+    const int TENSOR_READ_LAZY;
 
     explicit llama_model_base(const llama_model_params & params);
     virtual ~llama_model_base() = default;

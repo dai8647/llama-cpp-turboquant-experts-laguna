@@ -117,7 +117,8 @@ llama_kv_cache::llama_kv_cache(
            llama_memory_t   mem_other,
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
-    const  layer_share_cb & share) :
+    const  layer_share_cb & share,
+             const char *   name_tag) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
@@ -404,8 +405,8 @@ llama_kv_cache::llama_kv_cache(
         ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, layer_type_k, n_embd_k_gqa_eff, kv_size, n_stream) : nullptr;
         ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, layer_type_v, n_embd_v_gqa_eff, kv_size, n_stream) : nullptr;
 
-        has_k && ggml_format_name(k, "cache_k_l%d", il);
-        has_v && ggml_format_name(v, "cache_v_l%d", il);
+        has_k && ggml_format_name(k, "cache_%sk_l%d", name_tag, il);
+        has_v && ggml_format_name(v, "cache_%sv_l%d", name_tag, il);
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
@@ -2126,6 +2127,57 @@ void llama_kv_cache::set_input_v_rot(ggml_tensor * dst) const {
     memcpy(dst->data, attn_rot_hadamard.at(n_rot).data(), ggml_nbytes(dst));
 }
 
+void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
+    const uint32_t n_tokens = ubatch.n_tokens;
+
+    res.clear();
+    res.resize(n_tokens*n, LLAMA_TOKEN_NULL);
+
+    if (n == 0) {
+        return;
+    }
+
+    // note: apply_ubatch() has already stored the current ubatch, so the cells cover the tokens
+    //       of this very ubatch as well, which is what we want
+
+    // an embd (multimodal) ubatch can repeat one position for a whole image, so positions
+    // do not encode the token order; resolve its predecessors by ubatch order instead
+    std::vector<uint32_t> ord;
+    std::unordered_map<llama_seq_id, std::vector<uint32_t>> seq_idx;
+
+    if (!ubatch.token) {
+        ord.resize(n_tokens);
+        for (uint32_t i = 0; i < n_tokens; ++i) {
+            auto & v = seq_idx[ubatch.seq_id[i][0]];
+            ord[i] = v.size();
+            v.push_back(i);
+        }
+    }
+
+    for (uint32_t i = 0; i < n_tokens; ++i) {
+        const llama_seq_id seq_id = ubatch.seq_id[i][0];
+
+        for (uint32_t j = 0; j < n; ++j) {
+            const llama_pos d = (llama_pos) (n - j);
+
+            llama_pos p;
+            if (!ubatch.token) {
+                const auto & v = seq_idx[seq_id];
+                const int64_t k = (int64_t) ord[i] - d;
+                p = k >= 0 ? ubatch.pos[v[k]] : ubatch.pos[v[0]] + (llama_pos) k;
+            } else {
+                p = ubatch.pos[i] - d;
+            }
+
+            if (p < 0) {
+                continue;
+            }
+
+            res[i*n + j] = v_cells[seq_to_stream[seq_id]].seq_pos_tok_le(seq_id, p);
+        }
+    }
+}
+
 size_t llama_kv_cache::total_size() const {
     size_t size = 0;
 
@@ -2399,6 +2451,19 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
             throw std::runtime_error("failed to restore kv cache");
         }
     }
+}
+
+void llama_kv_cache::state_read_sinfo(
+        llama_io_read_i & io,
+           llama_seq_id   seq_id,
+  llama_state_seq_flags   flags,
+      slot_info_vec_t *   sinfos_out,
+const slot_info_vec_t *   sinfos_in) {
+    // TODO: full sinfo coordination for indexer cache restore; for now delegate to state_read
+    GGML_UNUSED(sinfos_out);
+    GGML_UNUSED(sinfos_in);
+
+    state_read(io, seq_id, flags);
 }
 
 void llama_kv_cache::state_write_meta(llama_io_write_i & io, const cell_ranges_t & cr, llama_seq_id seq_id) const {
@@ -2909,6 +2974,10 @@ const llama_ubatch & llama_kv_cache_context::get_ubatch() const {
 
 uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
+}
+
+void llama_kv_cache_context::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
+    kv->get_prev_tokens(ubatch, n, res);
 }
 
 ggml_type llama_kv_cache_context::type_k() const {

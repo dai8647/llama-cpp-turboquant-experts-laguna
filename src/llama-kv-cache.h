@@ -112,7 +112,8 @@ public:
                llama_memory_t   mem_other,
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,
-        const  layer_share_cb & share);
+        const  layer_share_cb & share,
+                 const char *   name_tag = "");
 
     ~llama_kv_cache() = default;
 
@@ -148,6 +149,20 @@ public:
 
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
+
+    // state_read, plus the cells the restored tokens were placed in
+    // a cache that mirrors another one (the qwen4exp indexer) must not search for its own cells
+    //   sinfos_out: if set, filled with the layout used
+    //   sinfos_in : if set, the layout to use instead of searching
+    void state_read_sinfo(
+            llama_io_read_i & io,
+               llama_seq_id   seq_id,
+      llama_state_seq_flags   flags,
+          slot_info_vec_t *   sinfos_out,
+    const slot_info_vec_t *   sinfos_in);
+
+    // predecessor tokens of each ubatch token, oldest-first, n per token; missing entries are LLAMA_TOKEN_NULL
+    void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
 
     //
     // llama_kv_cache specific API
@@ -381,6 +396,9 @@ public:
     //
 
     uint32_t get_n_kv() const;
+
+    // predecessor tokens of each ubatch token, oldest-first, n per token
+    void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;

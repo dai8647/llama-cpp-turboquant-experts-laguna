@@ -15,6 +15,9 @@ struct llama_kv_cell_ext {
     llama_pos x = 0;
     llama_pos y = 0;
 
+    // token id stored in this cell (PLE n-gram window / predecessor lookup)
+    llama_token tok = 0;
+
     // return true if the current 2D spatial position is greater than other
     bool is_2d_gt(llama_pos ox, llama_pos oy) const {
         return (y > oy) || (y == oy && x > ox);
@@ -31,6 +34,8 @@ struct llama_kv_cell_ext {
 // TODO: add unit tests
 class llama_kv_cells {
 public:
+    using seq_set_t = std::bitset<LLAMA_MAX_SEQ>;
+
     void reset() {
         for (uint32_t i = 0; i < pos.size(); ++i) {
             pos[i]   = -1;
@@ -297,6 +302,13 @@ public:
         return seq[i].count();
     }
 
+    // the full set of sequences this cell is visible to
+    const seq_set_t & seq_get_all(uint32_t i) const {
+        assert(i < pos.size());
+
+        return seq[i];
+    }
+
     // check if the cell contains seq_id
     bool seq_has(uint32_t i, llama_seq_id seq_id) const {
         assert(i < pos.size());
@@ -357,6 +369,38 @@ public:
         assert(seq_pos[seq_id].rbegin()->second > 0);
 
         return seq_pos[seq_id].rbegin()->first;
+    }
+
+    // the token of the cell of sequence seq_id at the largest position <= p
+    // return LLAMA_TOKEN_NULL if the sequence has no cell at or before p
+    // note: used by n-gram input embeddings (qwen4exp PLE)
+    llama_token seq_pos_tok_le(llama_seq_id seq_id, llama_pos p) const {
+        assert(seq_id >= 0);
+        assert(seq_id < LLAMA_MAX_SEQ);
+
+        const auto & sp = seq_pos[seq_id];
+
+        auto it = sp.upper_bound(p);
+        if (it == sp.begin()) {
+            return LLAMA_TOKEN_NULL;
+        }
+
+        --it;
+        const llama_pos target = it->first;
+
+        // linear scan: the fork's seq_pos map stores counts, not cell indices
+        llama_token best = LLAMA_TOKEN_NULL;
+        uint32_t   best_i = 0;
+        for (uint32_t i = 0; i < pos.size(); ++i) {
+            if (pos[i] == target && seq[i].test(seq_id)) {
+                if (best == LLAMA_TOKEN_NULL || i >= best_i) {
+                    best = ext[i].tok;
+                    best_i = i;
+                }
+            }
+        }
+
+        return best;
     }
 
     // note: call only if the cell is not empty
@@ -482,8 +526,6 @@ private:
     //   }
     //
     std::vector<llama_pos> shift;
-
-    using seq_set_t = std::bitset<LLAMA_MAX_SEQ>;
 
     // the bitset seq[i] tells us which sequences are currently occupying the i-th cell
     std::vector<seq_set_t> seq;
