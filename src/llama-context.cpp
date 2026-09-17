@@ -2040,11 +2040,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
             copy_tensor_async_candidates(res->t_candidates,     sampling.candidates, stride, sampling.candidates_count, seq_to_output_row, sched.get());
         }
 
-        // prefill double buffering (opt-in, LLAMA_MOE_PREFILL_PF=1): the
-        // previous ubatch's graph is enqueued and likely still running, so
-        // prefetch the next chunk's predicted experts on the backend copy
-        // stream - miss H2D hides behind compute instead of stalling it
-        if (n_tokens_all > 1 && model.moe_gpu_expert_cache.prefill_pf_enabled) {
+        // prefill/decode double buffering: fire predicted experts on the copy
+        // stream while this graph is still running. decode uses a small
+        // inflight cap (see --moe-hot-expert) so prediction cannot thrash
+        // the global-LRU pool.
+        if (model.moe_gpu_expert_cache.prefill_pf_enabled) {
             ggml_backend_t backend_pf = nullptr;
             for (auto * backend : backend_ptrs) {
                 if (ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
@@ -2060,6 +2060,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
     } while (mctx->next());
+
+    // runtime frequency pin: lock hottest experts after warmup (decode or prefill)
+    llama_moe_gpu_expert_slot_auto_pin(const_cast<llama_model &>(model));
 
     // inter-step speculative expert prefetch: runs while no graph is in
     // flight, so its synchronous H2D copies stay race-free; decode-only

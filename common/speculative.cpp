@@ -2325,6 +2325,18 @@ common_params common_base_params_to_speculative(const common_params & params) {
     result.cache_type_v  = params_spec.cache_type_v;
     result.n_outputs_max = params.n_parallel;
 
+    // draft must not inherit target MoE expert-slot / hot-expert settings
+    result.n_moe_gpu_expert_slot_num = -1;
+    result.moe_gpu_expert_slot_auto  = false;
+    result.moe_gpu_expert_global_lru = false;
+    result.moe_hot_expert            = false;
+    result.moe_expert_placement      = "all-gpu";
+    result.moe_gpu_expert_ratio      = 1.0f;
+    result.moe_freq_report_out.clear();
+    result.moe_freq_report_in.clear();
+    result.moe_freq_report_path.clear();
+    result.moe_expert_map_path.clear();
+
     return result;
 }
 
@@ -2350,6 +2362,17 @@ common_speculative_init_result::common_speculative_init_result(
 
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
+
+    // H-3: draft model load must not start a second expert-slot cache
+    mparams.n_moe_gpu_expert_slot_num = -1;
+    mparams.moe_gpu_expert_slot_auto  = false;
+    mparams.moe_gpu_expert_global_lru = false;
+    mparams.moe_hot_expert            = false;
+    mparams.moe_expert_placement      = nullptr;
+    mparams.moe_gpu_expert_ratio      = 1.0f;
+    mparams.moe_freq_report_in        = nullptr;
+    mparams.moe_freq_report_out       = nullptr;
+    mparams.moe_freq_report_path      = nullptr;
 
     if (spec_mtp) {
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;

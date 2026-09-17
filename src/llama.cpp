@@ -20,6 +20,21 @@
 #include "ggml-cuda.h"
 #include "gguf.h"
 
+// CPU-only builds have no ggml-cuda backend; keep the expert-slot APIs callable
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_CUDA)
+extern "C" {
+void * ggml_backend_cuda_ext_copy_stream(ggml_backend_t) { return nullptr; }
+void   ggml_backend_cuda_ext_h2d_async(ggml_backend_t, struct ggml_tensor *, size_t, const void *, size_t) {}
+void * ggml_backend_cuda_ext_event_create(ggml_backend_t) { return nullptr; }
+void   ggml_backend_cuda_ext_event_record(ggml_backend_t, void *) {}
+bool   ggml_backend_cuda_ext_event_query(void *) { return false; }
+void   ggml_backend_cuda_ext_event_synchronize(void *) {}
+void   ggml_backend_cuda_ext_event_destroy(ggml_backend_t, void *) {}
+void   ggml_backend_cuda_ext_set_graphs_enabled(ggml_backend_t, bool) {}
+bool   ggml_backend_is_cuda(ggml_backend_t) { return false; }
+}
+#endif
+
 #include <algorithm>
 #include <cassert>
 #include <chrono>
@@ -32,6 +47,13 @@
 #include <ctime>
 #include <stdexcept>
 #include <vector>
+
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
@@ -480,6 +502,7 @@ static ggml_tensor * llama_moe_gpu_expert_bank_new_tensor(
 }
 
 static bool llama_moe_gpu_expert_bank_copy_tensor(
+        const llama_moe_gpu_expert_bank & bank,
         const llama_moe_gpu_expert_bank_tensor & bank_tensor,
         int32_t expert_id,
         int32_t slot_id) {
@@ -501,6 +524,19 @@ static bool llama_moe_gpu_expert_bank_copy_tensor(
     // directly; the staging detour only exists for exotic non-host buffers
     if (bank_tensor.src->buffer != nullptr && ggml_backend_buffer_is_host(bank_tensor.src->buffer)) {
         const uint8_t * host_ptr = (const uint8_t *) bank_tensor.src->data + src_offset;
+        // host bank: src already lives in a pinned continuous slab - DMA as-is
+        if (bank.host_bank) {
+            ggml_backend_tensor_set(bank_tensor.dev, host_ptr, dst_offset, nbytes);
+            return true;
+        }
+        // G1: bounce through pinned staging so the H2D is a DMA from pinned
+        // memory. pageable sources otherwise copy at ~2 GB/s on ROCm.
+        if (bank.pinned_buf != nullptr && bank.pinned_stage_bytes >= nbytes) {
+            uint8_t * stage = (uint8_t *) ggml_backend_buffer_get_base(bank.pinned_buf.get());
+            memcpy(stage, host_ptr, nbytes);
+            ggml_backend_tensor_set(bank_tensor.dev, stage, dst_offset, nbytes);
+            return true;
+        }
         ggml_backend_tensor_set(bank_tensor.dev, host_ptr, dst_offset, nbytes);
         return true;
     }
@@ -509,6 +545,31 @@ static bool llama_moe_gpu_expert_bank_copy_tensor(
     ggml_backend_tensor_get(bank_tensor.src, data.data(), src_offset, nbytes);
     ggml_backend_tensor_set(bank_tensor.dev, data.data(), dst_offset, nbytes);
     return true;
+}
+
+static bool llama_moe_pinned_stage_enabled() {
+    const char * env = getenv("LLAMA_MOE_PINNED_STAGE");
+    return env == nullptr || env[0] == '\0' || env[0] != '0';
+}
+
+// C1: continuous pinned host expert bank (opt-in). When on, bank_tensor.src
+// is retargeted to a pinned slab so miss H2D never touches GGUF mmap pages.
+static bool llama_moe_host_bank_enabled() {
+    const char * env = getenv("LLAMA_MOE_HOST_BANK");
+    return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
+static uint64_t llama_moe_host_free_bytes() {
+#if defined(_WIN32)
+    MEMORYSTATUSEX st;
+    st.dwLength = sizeof(st);
+    if (!GlobalMemoryStatusEx(&st)) {
+        return 0;
+    }
+    return (uint64_t) st.ullAvailPhys;
+#else
+    return 0;
+#endif
 }
 
 static bool llama_moe_gpu_expert_bank_ensure(
@@ -603,10 +664,120 @@ static bool llama_moe_gpu_expert_bank_ensure(
         cache.register_compute_tensor(bank_tensor.src, bank_tensor.dev);
     }
 
-    LLAMA_LOG_INFO("%s: MoE GPU expert slot bank allocated: layer=%d slots=%d tensors=%zu buffer=%.2f MiB device=%s\n",
+    // C1 host expert bank: pin every routed expert of this layer into one
+    // continuous host slab, then retarget bank_tensor.src so miss H2D is
+    // always a DMA from pinned memory (no GGUF mmap page faults).
+    if (llama_moe_host_bank_enabled()) {
+        auto * host_buft = ggml_backend_dev_host_buffer_type(dev);
+        size_t host_bytes = 0;
+        for (const auto & bt : bank.tensors) {
+            host_bytes += (size_t) n_experts * bt.nbytes_per_expert;
+        }
+        const uint64_t free_bytes = llama_moe_host_free_bytes();
+        const uint64_t need_bytes = (uint64_t) host_bytes + (4ull << 30);
+        if (host_buft == nullptr) {
+            LLAMA_LOG_WARN("%s: MoE host expert bank skipped: no host buffer type (layer=%d)\n",
+                    __func__, layer_id);
+        } else if (free_bytes != 0 && free_bytes < need_bytes) {
+            LLAMA_LOG_WARN("%s: MoE host expert bank skipped: layer=%d need=%.2f MiB free_ram=%.2f MiB\n",
+                    __func__, layer_id, need_bytes / 1024.0 / 1024.0, free_bytes / 1024.0 / 1024.0);
+        } else {
+            struct ggml_init_params host_ctx_params = {
+                /*.mem_size   =*/ ggml_tensor_overhead() * bank.tensors.size(),
+                /*.mem_buffer =*/ nullptr,
+                /*.no_alloc   =*/ true,
+            };
+            bank.host_ctx.reset(ggml_init(host_ctx_params));
+            if (!bank.host_ctx) {
+                LLAMA_LOG_WARN("%s: MoE host expert bank skipped: ggml_init failed (layer=%d)\n",
+                        __func__, layer_id);
+            } else {
+                std::vector<ggml_tensor *> host_tensors;
+                host_tensors.reserve(bank.tensors.size());
+                size_t slab_bytes = 0;
+                bool shapes_ok = true;
+                for (const auto & bt : bank.tensors) {
+                    ggml_tensor * hs = llama_moe_gpu_expert_bank_new_tensor(
+                            bank.host_ctx.get(), bt.src, bt.expert_dim, n_experts);
+                    if (hs == nullptr) {
+                        shapes_ok = false;
+                        break;
+                    }
+                    ggml_format_name(hs, "moe_host_bank.%d.%s", (int) host_tensors.size(), bt.src->name);
+                    host_tensors.push_back(hs);
+                    slab_bytes += ggml_nbytes(hs);
+                }
+                if (!shapes_ok || host_tensors.empty()) {
+                    bank.host_ctx.reset();
+                    LLAMA_LOG_WARN("%s: MoE host expert bank skipped: host tensor create failed (layer=%d)\n",
+                            __func__, layer_id);
+                } else {
+                    bank.host_slab.reset(ggml_backend_alloc_ctx_tensors_from_buft(bank.host_ctx.get(), host_buft));
+                    if (!bank.host_slab) {
+                        bank.host_ctx.reset();
+                        LLAMA_LOG_WARN("%s: MoE host expert bank skipped: slab alloc failed layer=%d bytes=%.2f MiB\n",
+                                __func__, layer_id, slab_bytes / 1024.0 / 1024.0);
+                    } else {
+                        for (size_t i = 0; i < bank.tensors.size(); ++i) {
+                            auto & bt = bank.tensors[i];
+                            ggml_tensor * hs = host_tensors[i];
+                            if (bt.src == nullptr || bt.src->data == nullptr || hs->data == nullptr) {
+                                continue;
+                            }
+                            if (ggml_is_contiguous(bt.src) && ggml_is_contiguous(hs) &&
+                                ggml_nbytes(bt.src) == ggml_nbytes(hs)) {
+                                memcpy(hs->data, bt.src->data, ggml_nbytes(hs));
+                            } else {
+                                for (int32_t e = 0; e < n_experts; ++e) {
+                                    const size_t src_off = (size_t) e * bt.src->nb[bt.expert_dim];
+                                    const size_t dst_off = (size_t) e * hs->nb[bt.expert_dim];
+                                    memcpy((uint8_t *) hs->data + dst_off,
+                                           (const uint8_t *) bt.src->data + src_off,
+                                           bt.nbytes_per_expert);
+                                }
+                            }
+                            bt.src = hs;
+                        }
+                        bank.host_slab_bytes = slab_bytes;
+                        bank.host_bank = true;
+                        LLAMA_LOG_INFO("%s: MoE host expert bank pinned slab: layer=%d experts=%d bytes=%.2f MiB (H2D from slab)\n",
+                                __func__, layer_id, n_experts, slab_bytes / 1024.0 / 1024.0);
+                    }
+                }
+            }
+        }
+    }
+
+    // G1: one pinned staging buffer sized to hold every tensor slice of one
+    // expert. Copies go pageable -> pinned (host memcpy) -> GPU (DMA). The
+    // prefill-PF path can then issue all async H2Ds from the same stage.
+    // Skipped when the host bank already owns a continuous pinned slab.
+    if (!bank.host_bank && llama_moe_pinned_stage_enabled()) {
+        size_t stage_bytes = 0;
+        for (const auto & bt : bank.tensors) {
+            stage_bytes += bt.nbytes_per_expert;
+        }
+        if (stage_bytes > 0) {
+            auto * host_buft = ggml_backend_dev_host_buffer_type(dev);
+            if (host_buft != nullptr) {
+                bank.pinned_buf.reset(ggml_backend_buft_alloc_buffer(host_buft, stage_bytes));
+                if (bank.pinned_buf != nullptr) {
+                    bank.pinned_stage_bytes = stage_bytes;
+                    LLAMA_LOG_INFO("%s: MoE GPU expert bank pinned stage: layer=%d bytes=%.2f MiB\n",
+                            __func__, layer_id, stage_bytes / 1024.0 / 1024.0);
+                } else {
+                    LLAMA_LOG_WARN("%s: failed to allocate pinned stage for layer=%d (%.2f MiB); using pageable H2D\n",
+                            __func__, layer_id, stage_bytes / 1024.0 / 1024.0);
+                }
+            }
+        }
+    }
+
+    LLAMA_LOG_INFO("%s: MoE GPU expert slot bank allocated: layer=%d slots=%d tensors=%zu buffer=%.2f MiB device=%s pinned=%zu host_bank=%d host_slab=%zu\n",
             __func__, layer_id, bank.n_slots, bank.tensors.size(),
             ggml_backend_buffer_get_size(bank.buf.get()) / 1024.0 / 1024.0,
-            ggml_backend_dev_name(dev));
+            ggml_backend_dev_name(dev), bank.pinned_stage_bytes,
+            bank.host_bank ? 1 : 0, bank.host_slab_bytes);
     return true;
 }
 
@@ -743,9 +914,102 @@ static bool llama_moe_gpu_expert_slot_materialize(
         size_t copied_bytes = 0;
         const bool stats  = llama_moe_gpu_expert_slot_stats_enabled();
         const auto stats_t0 = stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        for (const auto & bank_tensor : bank.tensors) {
-            if (llama_moe_gpu_expert_bank_copy_tensor(bank_tensor, expert_id, slot_id)) {
-                copied_bytes += bank_tensor.nbytes_per_expert;
+
+        // Stage 1 decode path: stage all tensors into pinned then one async
+        // H2D burst + a single event wait. cheaper than N sync tensor_set.
+        bool used_async = false;
+        // C1 host bank: src is already pinned - one async burst straight to GPU
+        if (bank.host_bank) {
+            ggml_backend_t be = model.moe_gpu_expert_cache.prefill_pf_backend;
+            if (be == nullptr) {
+                be = ggml_backend_cuda_init(0);
+            }
+            void * cstream = be ? ggml_backend_cuda_ext_copy_stream(be) : nullptr;
+            if (be != nullptr && cstream != nullptr) {
+                void * event = ggml_backend_cuda_ext_event_create(be);
+                if (event != nullptr) {
+                    bool host_ok = true;
+                    for (const auto & bt : bank.tensors) {
+                        if (bt.src == nullptr || bt.dev == nullptr || bt.expert_dim < 0 || bt.nbytes_per_expert == 0) {
+                            continue;
+                        }
+                        if (bt.src->buffer == nullptr || !ggml_backend_buffer_is_host(bt.src->buffer)) {
+                            host_ok = false;
+                            break;
+                        }
+                        const uint8_t * host = (const uint8_t *) bt.src->data +
+                                (size_t) expert_id * bt.src->nb[bt.expert_dim];
+                        const size_t dst_off = (size_t) slot_id * bt.dev->nb[bt.expert_dim];
+                        ggml_backend_cuda_ext_h2d_async(be, bt.dev, dst_off, host, bt.nbytes_per_expert);
+                        copied_bytes += bt.nbytes_per_expert;
+                    }
+                    if (host_ok) {
+                        ggml_backend_cuda_ext_event_record(be, event);
+                        ggml_backend_cuda_ext_event_synchronize(event);
+                        used_async = true;
+                    } else {
+                        copied_bytes = 0;
+                    }
+                    ggml_backend_cuda_ext_event_destroy(be, event);
+                }
+            }
+        } else if (llama_moe_pinned_stage_enabled() &&
+            bank.pinned_buf != nullptr &&
+            bank.pinned_stage_bytes > 0) {
+            size_t stage_need = 0;
+            for (const auto & bt : bank.tensors) {
+                stage_need += bt.nbytes_per_expert;
+            }
+            if (bank.pinned_stage_bytes >= stage_need) {
+                ggml_backend_t be = model.moe_gpu_expert_cache.prefill_pf_backend;
+                if (be == nullptr) {
+                    be = ggml_backend_cuda_init(0);
+                }
+                void * cstream = be ? ggml_backend_cuda_ext_copy_stream(be) : nullptr;
+                if (be != nullptr && cstream != nullptr) {
+                    uint8_t * stage = (uint8_t *) ggml_backend_buffer_get_base(bank.pinned_buf.get());
+                    size_t off = 0;
+                    std::vector<std::pair<const llama_moe_gpu_expert_bank_tensor *, size_t>> batch;
+                    bool host_ok = true;
+                    for (const auto & bt : bank.tensors) {
+                        if (bt.src == nullptr || bt.dev == nullptr || bt.expert_dim < 0 || bt.nbytes_per_expert == 0) {
+                            continue;
+                        }
+                        if (bt.src->buffer == nullptr || !ggml_backend_buffer_is_host(bt.src->buffer)) {
+                            host_ok = false;
+                            break;
+                        }
+                        const uint8_t * host = (const uint8_t *) bt.src->data +
+                                (size_t) expert_id * bt.src->nb[bt.expert_dim];
+                        memcpy(stage + off, host, bt.nbytes_per_expert);
+                        batch.push_back({&bt, off});
+                        off += bt.nbytes_per_expert;
+                    }
+                    if (host_ok && !batch.empty() && off <= bank.pinned_stage_bytes) {
+                        void * event = ggml_backend_cuda_ext_event_create(be);
+                        if (event != nullptr) {
+                            for (const auto & item : batch) {
+                                const llama_moe_gpu_expert_bank_tensor * btp = item.first;
+                                const size_t soff = item.second;
+                                const size_t dst_off = (size_t) slot_id * btp->dev->nb[btp->expert_dim];
+                                ggml_backend_cuda_ext_h2d_async(be, btp->dev, dst_off, stage + soff, btp->nbytes_per_expert);
+                                copied_bytes += btp->nbytes_per_expert;
+                            }
+                            ggml_backend_cuda_ext_event_record(be, event);
+                            ggml_backend_cuda_ext_event_synchronize(event);
+                            ggml_backend_cuda_ext_event_destroy(be, event);
+                            used_async = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (!used_async) {
+            for (const auto & bank_tensor : bank.tensors) {
+                if (llama_moe_gpu_expert_bank_copy_tensor(bank, bank_tensor, expert_id, slot_id)) {
+                    copied_bytes += bank_tensor.nbytes_per_expert;
+                }
             }
         }
         if (stats) {
@@ -771,7 +1035,7 @@ static bool llama_moe_gpu_expert_slot_materialize(
         slot.resident  = true;
         slot.bank_backed = true;
 
-        LLAMA_LOG_INFO("%s: MoE GPU expert slot bank materialized: slot=%d layer=%d expert=%d tensors=%zu bytes=%.2f MiB buffer=%.2f MiB device=%s\n",
+        LLAMA_LOG_DEBUG("%s: MoE GPU expert slot bank materialized: slot=%d layer=%d expert=%d tensors=%zu bytes=%.2f MiB buffer=%.2f MiB device=%s\n",
                 __func__, slot_id, layer_id, expert_id, bank.tensors.size(),
                 copied_bytes / 1024.0 / 1024.0,
                 ggml_backend_buffer_get_size(bank.buf.get()) / 1024.0 / 1024.0,
@@ -909,7 +1173,68 @@ void llama_moe_gpu_expert_slot_prefetch(struct llama_model & model, double budge
 // chunk (take_last_selections). opt-in: LLAMA_MOE_PREFILL_PF=1.
 // ---------------------------------------------------------------------------
 
-static void llama_moe_gpu_expert_slot_prefill_configure(llama_moe_gpu_expert_cache & cache) {
+static void llama_moe_gpu_expert_slot_preload(const llama_model & model);
+
+// Runtime frequency pin: after enough accesses, lock the hottest experts into
+// the slot cache so LRU cannot evict them. No 2-pass calibration file.
+// C2: trigger on n_hit+n_miss (fallback: access_counts sum), pin per-layer
+// top-K with K ~= 0.9 * n_slots into frequency_whitelist_set.
+void llama_moe_gpu_expert_slot_auto_pin(struct llama_model & model) {
+    auto & cache = model.moe_gpu_expert_cache;
+    if (!cache.enabled() || cache.auto_pin_done || cache.auto_pin_after_access <= 0) {
+        return;
+    }
+
+    const int64_t total_touch = cache.n_hit + cache.n_miss;
+    std::unordered_map<uint64_t, int64_t> counts;
+    {
+        std::lock_guard<std::mutex> lock(cache.access_mutex);
+        counts = cache.access_counts;
+    }
+    int64_t access_sum = 0;
+    for (const auto & kv : counts) {
+        access_sum += kv.second;
+    }
+    const int64_t progress = std::max(total_touch, access_sum);
+    if (progress < cache.auto_pin_after_access) {
+        return;
+    }
+    if (counts.size() < 8) {
+        return;
+    }
+
+    const int32_t pin_per_layer = std::max(1, (int32_t) ((float) cache.size() * 0.9f));
+
+    std::unordered_map<int32_t, std::vector<std::pair<int64_t, int32_t>>> by_layer;
+    for (const auto & kv : counts) {
+        const int32_t lid = (int32_t) (kv.first >> 32);
+        const int32_t eid = (int32_t) (kv.first & 0xffffffffu);
+        by_layer[lid].emplace_back(kv.second, eid);
+    }
+
+    std::vector<std::pair<int32_t, int32_t>> whitelist;
+    for (auto & [lid, vec] : by_layer) {
+        std::sort(vec.begin(), vec.end(), [](const auto & a, const auto & b) {
+            return a.first > b.first;
+        });
+        const int32_t take = std::min<int32_t>(pin_per_layer, (int32_t) vec.size());
+        for (int32_t i = 0; i < take; ++i) {
+            whitelist.emplace_back(lid, vec[i].second);
+        }
+    }
+
+    cache.set_frequency_whitelist(whitelist);
+    cache.auto_pin_done = true;
+    LLAMA_LOG_INFO("%s: runtime frequency pin: %d experts (%d/layer max) after hit=%lld miss=%lld access_sum=%lld layers=%zu\n",
+            __func__, (int) whitelist.size(), pin_per_layer,
+            (long long) cache.n_hit, (long long) cache.n_miss,
+            (long long) access_sum, by_layer.size());
+
+    // materialize the pinned set now so the next steps see hits
+    llama_moe_gpu_expert_slot_preload(model);
+}
+
+void llama_moe_gpu_expert_slot_prefill_configure(llama_moe_gpu_expert_cache & cache) {
     if (const char * pf = getenv("LLAMA_MOE_PREFILL_PF")) {
         cache.prefill_pf_enabled = pf[0] != '\0' && pf[0] != '0';
     }
@@ -1060,6 +1385,10 @@ void llama_moe_gpu_expert_slot_prefill_prefetch(struct llama_model & model, stru
                 cache.release_slot(layer_id, slot);
                 continue;
             }
+            // prefill-PF keeps the pageable source: the single shared pinned
+            // stage is not safe while several experts are in flight (the next
+            // memcpy would race the previous async H2D). decode materialize
+            // uses the stage and is serialized.
             for (const auto & bt : bank->tensors) {
                 const uint8_t * host = (const uint8_t *) bt.src->data +
                         (size_t) expert_id * bt.src->nb[bt.expert_dim];
@@ -1098,6 +1427,7 @@ void llama_moe_gpu_expert_slot_prefill_shutdown(struct llama_model & model) {
 // ---------------------------------------------------------------------------
 
 static void llama_moe_gpu_expert_slot_preload(const llama_model & model); // defined below (shared with manual init)
+static std::string llama_moe_model_fingerprint(const llama_model & model);
 
 void llama_moe_gpu_expert_slot_auto_init(struct llama_model & model) {
     auto & cache = model.moe_gpu_expert_cache;
@@ -1162,6 +1492,14 @@ void llama_moe_gpu_expert_slot_auto_init(struct llama_model & model) {
     }
     const int64_t budget = (int64_t) ((double) vram_free * margin);
 
+    // count MoE layers that would each own a bank of n_slots entries
+    int32_t n_moe_layers = 0;
+    for (const llama_layer & layer : model.layers) {
+        if (layer.ffn_gate_exps || layer.ffn_down_exps || layer.ffn_up_exps || layer.ffn_gate_up_exps) {
+            ++n_moe_layers;
+        }
+    }
+
     int32_t slots_max = (int32_t) model.hparams.n_expert;
     if (const char * cap = getenv("LLAMA_MOE_AUTO_SLOT_CAP")) {
         const int32_t v = atoi(cap);
@@ -1169,13 +1507,35 @@ void llama_moe_gpu_expert_slot_auto_init(struct llama_model & model) {
             slots_max = std::min(slots_max, v);
         }
     }
-    const int32_t slots_min = (int32_t) model.hparams.n_expert_used;
-    int32_t slots = (int32_t) (budget / unit_bytes);
-    slots = std::clamp(slots, slots_min, slots_max);
 
-    LLAMA_LOG_INFO("%s: MoE GPU expert slot auto sizing: free_vram=%.2f MiB total_vram=%.2f MiB margin=%.2f budget=%.2f MiB unit=%.2f MiB/slot slots=%d (clamped to [%d, %d])\n",
+    // slots_budget is what free VRAM can actually hold. never force slots up to
+    // n_expert_used: that is the per-token active count, not a VRAM guarantee.
+    const int32_t slots_budget = unit_bytes > 0 ? (int32_t) (budget / unit_bytes) : 0;
+    const int32_t n_expert     = (int32_t) model.hparams.n_expert;
+    const int32_t n_used       = (int32_t) model.hparams.n_expert_used;
+
+    if (slots_budget < 1) {
+        LLAMA_LOG_WARN("%s: MoE GPU expert slot auto sizing: insufficient VRAM for one slot "
+                "(free=%.2f MiB margin=%.2f unit=%.2f MiB); slot mode disabled\n",
+                __func__, vram_free / 1048576.0, margin, unit_bytes / 1048576.0);
+        cache.clear();
+        return;
+    }
+
+    if (slots_budget < n_used) {
+        LLAMA_LOG_WARN("%s: MoE GPU expert slot auto sizing: VRAM holds only %d slots, below active expert count %d; "
+                "using reduced cache (expect more misses) instead of forcing OOM\n",
+                __func__, slots_budget, n_used);
+    }
+
+    const int32_t slots = std::min(slots_budget, slots_max);
+
+    LLAMA_LOG_INFO("%s: MoE GPU expert slot auto sizing: free_vram=%.2f MiB total_vram=%.2f MiB margin=%.2f "
+            "budget=%.2f MiB unit=%.2f MiB/slot slots_budget=%d slots_max=%d slots=%d "
+            "n_experts=%d n_experts_used=%d n_moe_layers=%d\n",
             __func__, vram_free / 1048576.0, vram_total / 1048576.0, margin,
-            budget / 1048576.0, unit_bytes / 1048576.0, slots, slots_min, slots_max);
+            budget / 1048576.0, unit_bytes / 1048576.0, slots_budget, slots_max, slots,
+            n_expert, n_used, n_moe_layers);
 
     if (slots <= 0) {
         LLAMA_LOG_INFO("%s: MoE GPU expert slot auto sizing: budget too small, slot mode disabled\n", __func__);
@@ -1188,9 +1548,16 @@ void llama_moe_gpu_expert_slot_auto_init(struct llama_model & model) {
     cache.materialize_userdata = (llama_model *) &model;
     cache.owner_model          = &model;
 
-    // same env knobs as the manual path
+    // CLI --moe-gpu-expert-global-lru / --moe-hot-expert, then env override
+    if (cache.global_lru_requested) {
+        cache.global_lru_enabled = true;
+    }
     if (const char * glru = getenv("LLAMA_MOE_GLOBAL_LRU")) {
         cache.global_lru_enabled = glru[0] != '\0' && glru[0] != '0';
+    }
+    if (cache.global_lru_enabled) {
+        // per-step slot decisions are host-side; a captured graph would freeze them
+        cache.graphs_disable_pending = true;
     }
     if (const char * pf = getenv("LLAMA_MOE_PREFETCH_MS")) {
         cache.prefetch_budget_ms = atof(pf);
@@ -1198,9 +1565,99 @@ void llama_moe_gpu_expert_slot_auto_init(struct llama_model & model) {
     // (b) main merge: q* bandwidth-adaptive split dropped (audit 2026-08-25:
     // qstar_cpu=0 across all measured rounds, calibrate crashes mid-loop)
     llama_moe_gpu_expert_slot_prefill_configure(cache);
+    // --moe-hot-expert: async copies on the copy stream for prefill AND decode.
+    // keep the inflight budget small: last-step prediction on 512-expert top-10
+    // thrashes if we copy every selected expert across all layers (measured
+    // 2026-09-16: full predict 10.6 t/s vs sync pinned 13.4 t/s).
+    if (cache.decode_pf_requested) {
+        cache.prefill_pf_enabled = true;
+        if (const char * inf = getenv("LLAMA_MOE_PF_INFLIGHT")) {
+            const int64_t v = atoll(inf);
+            if (v > 0) {
+                cache.prefill_pf_max_inflight = v;
+            }
+        } else {
+            cache.prefill_pf_max_inflight = 24;
+        }
+        if (const char * mb = getenv("LLAMA_MOE_PF_MB")) {
+            const int64_t v = (int64_t) (atof(mb) * 1048576.0);
+            if (v > 0) {
+                cache.prefill_pf_budget_bytes = v;
+            }
+        } else {
+            cache.prefill_pf_budget_bytes = 32LL * 1024 * 1024;
+        }
+    }
+
+    // C2 online frequency pin: collect accesses during warmup, then pin once
+    // override: LLAMA_MOE_AUTO_PIN_AFTER (handoff default ~2000)
+    if (cache.decode_pf_requested || cache.global_lru_enabled) {
+        cache.auto_pin_after_access = 2000;
+        if (const char * ap = getenv("LLAMA_MOE_AUTO_PIN_AFTER")) {
+            const int64_t v = atoll(ap);
+            if (v > 0) {
+                cache.auto_pin_after_access = v;
+            }
+        }
+        cache.track_access = true;
+        LLAMA_LOG_INFO("%s: online frequency pin armed: after %lld accesses, track_access=1\n",
+                __func__, (long long) cache.auto_pin_after_access);
+    }
+
+    // C1: prebuild pinned host slabs for every MoE layer so the first miss
+    // does not stall mid-decode on a multi-GB mmap -> pinned copy.
+    if (cache.enabled() && llama_moe_host_bank_enabled()) {
+        LLAMA_LOG_INFO("%s: prebuilding MoE host expert banks (LLAMA_MOE_HOST_BANK=1)\n", __func__);
+        int n_host_layers = 0;
+        int64_t host_bytes = 0;
+        for (size_t i = 0; i < model.layers.size(); ++i) {
+            const int32_t n_experts = llama_moe_expert_count_from_layer(model.layers[i]);
+            if (n_experts <= 0) {
+                continue;
+            }
+            if (!llama_moe_gpu_expert_bank_ensure(model, (int32_t) i, n_experts)) {
+                continue;
+            }
+            const auto * bank = static_cast<const llama_moe_gpu_expert_cache &>(cache).bank_for_layer((int32_t) i);
+            if (bank != nullptr && bank->host_bank) {
+                ++n_host_layers;
+                host_bytes += (int64_t) bank->host_slab_bytes;
+            }
+        }
+        LLAMA_LOG_INFO("%s: MoE host expert banks ready: layers=%d total=%.2f GiB\n",
+                __func__, n_host_layers, host_bytes / 1073741824.0);
+    }
+
+    // Stage 3 frequency pin: preload the hottest experts into the slot cache
+    if (!cache.freq_report_in.empty()) {
+        llama_moe_freq_report freq_report = load_freq_report(cache.freq_report_in);
+        if (!freq_report.stats.empty()) {
+            const std::string model_fingerprint = llama_moe_model_fingerprint(model);
+            if (!freq_report.model_fingerprint.empty() &&
+                freq_report.model_fingerprint == model_fingerprint) {
+                const int32_t total_experts = freq_report.n_layers * freq_report.n_experts;
+                // cap by actual slots so we only pin what can stay resident
+                const int32_t gpu_count = std::min(slots, std::max(1, (int32_t) (total_experts * cache.freq_ratio)));
+                std::vector<std::pair<int32_t, int32_t>> whitelist;
+                for (int32_t i = 0; i < gpu_count && i < (int32_t) freq_report.sorted_by_frequency.size(); i++) {
+                    const int32_t idx = freq_report.sorted_by_frequency[i];
+                    whitelist.push_back({freq_report.stats[idx].layer_id, freq_report.stats[idx].expert_id});
+                }
+                cache.set_frequency_whitelist(whitelist);
+                LLAMA_LOG_INFO("%s: frequency pin: %d/%d experts whitelisted (slots=%d ratio=%.2f)\n",
+                        __func__, (int) whitelist.size(), total_experts, slots, cache.freq_ratio);
+            } else {
+                LLAMA_LOG_WARN("%s: frequency report fingerprint mismatch; ignoring %s\n",
+                        __func__, cache.freq_report_in.c_str());
+            }
+        } else {
+            LLAMA_LOG_WARN("%s: frequency report empty at %s\n", __func__, cache.freq_report_in.c_str());
+        }
+    }
 
     llama_moe_gpu_expert_slot_preload(model);
-    LLAMA_LOG_INFO("%s: MoE GPU expert slot cache initialized with %d slots (auto)\n", __func__, slots);
+    LLAMA_LOG_INFO("%s: MoE GPU expert slot cache initialized with %d slots (auto) global_lru=%d\n",
+            __func__, slots, cache.global_lru_enabled ? 1 : 0);
 }
 
 static void llama_moe_gpu_expert_slot_preload(const llama_model & model) {
@@ -1448,6 +1905,29 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                     model->moe_gpu_expert_cache.clear();
                 } else {
                     model->moe_gpu_expert_cache.auto_pending = true;
+                    model->moe_gpu_expert_cache.global_lru_requested = params.moe_gpu_expert_global_lru;
+                    model->moe_gpu_expert_cache.decode_pf_requested  = params.moe_hot_expert;
+                    if (params.moe_hot_expert) {
+                        // runtime pin after a short warmup (override: LLAMA_MOE_AUTO_PIN_AFTER)
+                        model->moe_gpu_expert_cache.auto_pin_after_access = 2000;
+                        if (const char * ap = getenv("LLAMA_MOE_AUTO_PIN_AFTER")) {
+                            const int64_t v = atoll(ap);
+                            if (v > 0) {
+                                model->moe_gpu_expert_cache.auto_pin_after_access = v;
+                            }
+                        }
+                        model->moe_gpu_expert_cache.track_access = true;
+                    }
+                    if (params.moe_freq_report_out && params.moe_freq_report_out[0]) {
+                        model->moe_gpu_expert_cache.track_access = true;
+                    }
+                    if (params.moe_freq_report_in && params.moe_freq_report_in[0]) {
+                        model->moe_gpu_expert_cache.freq_report_in = params.moe_freq_report_in;
+                        model->moe_gpu_expert_cache.freq_ratio     = params.moe_gpu_expert_ratio;
+                    } else if (params.moe_freq_report_path && params.moe_freq_report_path[0]) {
+                        model->moe_gpu_expert_cache.freq_report_in = params.moe_freq_report_path;
+                        model->moe_gpu_expert_cache.freq_ratio     = params.moe_gpu_expert_ratio;
+                    }
                     LLAMA_LOG_INFO("%s: MoE GPU expert slot auto sizing requested - deferring until after KV allocation\n", __func__);
                 }
             } else if (requested_slots < 0) {
@@ -1467,11 +1947,40 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                     model->moe_gpu_expert_cache.init(effective_slots);
                     model->moe_gpu_expert_cache.materialize_cb       = llama_moe_gpu_expert_slot_materialize_cb;
                     model->moe_gpu_expert_cache.materialize_userdata = (llama_model *) model;
+                    model->moe_gpu_expert_cache.decode_pf_requested  = params.moe_hot_expert;
+                    if (params.moe_gpu_expert_global_lru) {
+                        model->moe_gpu_expert_cache.global_lru_enabled = true;
+                    }
+                    if (const char * glru = getenv("LLAMA_MOE_GLOBAL_LRU")) {
+                        model->moe_gpu_expert_cache.global_lru_enabled = glru[0] != '\0' && glru[0] != '0';
+                    }
+                    if (model->moe_gpu_expert_cache.global_lru_enabled) {
+                        model->moe_gpu_expert_cache.graphs_disable_pending = true;
+                    }
                     if (const char * pf = getenv("LLAMA_MOE_PREFETCH_MS")) {
                         model->moe_gpu_expert_cache.prefetch_budget_ms = atof(pf);
                     }
                     llama_moe_gpu_expert_slot_prefill_configure(model->moe_gpu_expert_cache);
-                    LLAMA_LOG_INFO("%s: initialized MoE GPU expert slot cache with %d slots (requested %d)\n", __func__, effective_slots, requested_slots);
+                    if (model->moe_gpu_expert_cache.decode_pf_requested) {
+                        model->moe_gpu_expert_cache.prefill_pf_enabled = true;
+                    }
+                    if (model->moe_gpu_expert_cache.decode_pf_requested ||
+                        model->moe_gpu_expert_cache.global_lru_enabled) {
+                        model->moe_gpu_expert_cache.auto_pin_after_access = 2000;
+                        if (const char * ap = getenv("LLAMA_MOE_AUTO_PIN_AFTER")) {
+                            const int64_t v = atoll(ap);
+                            if (v > 0) {
+                                model->moe_gpu_expert_cache.auto_pin_after_access = v;
+                            }
+                        }
+                        model->moe_gpu_expert_cache.track_access = true;
+                        LLAMA_LOG_INFO("%s: online frequency pin armed: after %lld accesses\n",
+                                __func__, (long long) model->moe_gpu_expert_cache.auto_pin_after_access);
+                    }
+                    LLAMA_LOG_INFO("%s: initialized MoE GPU expert slot cache with %d slots (requested %d) global_lru=%d decode_pf=%d\n",
+                            __func__, effective_slots, requested_slots,
+                            model->moe_gpu_expert_cache.global_lru_enabled ? 1 : 0,
+                            model->moe_gpu_expert_cache.prefill_pf_enabled ? 1 : 0);
 
                     // frequency-based placement: set whitelist from freq report
                     const bool is_freq_mode = params.moe_expert_placement &&
@@ -1510,6 +2019,17 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                     // enable access tracking when an output freq report path is specified (Pass 1)
                     if (params.moe_freq_report_out && params.moe_freq_report_out[0]) {
                         model->moe_gpu_expert_cache.track_access = true;
+                    }
+
+                    if (llama_moe_host_bank_enabled() && model->moe_gpu_expert_cache.enabled()) {
+                        LLAMA_LOG_INFO("%s: prebuilding MoE host expert banks (LLAMA_MOE_HOST_BANK=1)\n", __func__);
+                        for (size_t li = 0; li < model->layers.size(); ++li) {
+                            const int32_t n_experts = llama_moe_expert_count_from_layer(model->layers[li]);
+                            if (n_experts <= 0) {
+                                continue;
+                            }
+                            llama_moe_gpu_expert_bank_ensure(*model, (int32_t) li, n_experts);
+                        }
                     }
 
                     llama_moe_gpu_expert_slot_preload(*model);

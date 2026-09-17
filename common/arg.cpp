@@ -2723,6 +2723,26 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_GPU_EXPERT_SLOT_NUM"));
     add_opt(common_arg(
+        {"--moe-gpu-expert-global-lru"},
+        "enable FreeToken-style global LRU paging for MoE expert slots (hot experts only in VRAM)",
+        [](common_params & params) {
+            params.moe_gpu_expert_global_lru = true;
+        }
+    ).set_env("LLAMA_ARG_MOE_GPU_EXPERT_GLOBAL_LRU"));
+    add_opt(common_arg(
+        {"--moe-hot-expert"},
+        "FreeToken hot-expert mode: expert weights stay on host, only a VRAM-resident LRU cache of hot experts is on GPU\n"
+        "(implies --cpu-moe, --moe-gpu-expert-slot-num auto, --moe-gpu-expert-global-lru)",
+        [](common_params & params) {
+            params.moe_hot_expert = true;
+            params.moe_gpu_expert_slot_auto = true;
+            params.n_moe_gpu_expert_slot_num = -1;
+            params.moe_gpu_expert_global_lru = true;
+            params.moe_expert_placement = "cpu-moe";
+            params.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
+        }
+    ).set_env("LLAMA_ARG_MOE_HOT_EXPERT"));
+    add_opt(common_arg(
         {"--moe-expert-placement"}, "{all-gpu,frequency,cpu-moe,map}",
         "MoE expert placement strategy (default: all-gpu)\n"
         "- all-gpu: all experts on GPU (full-slot mode)\n"
