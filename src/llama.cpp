@@ -52,6 +52,9 @@ bool   ggml_backend_is_cuda(ggml_backend_t) { return false; }
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #endif
 

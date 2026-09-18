@@ -44,6 +44,41 @@ slot 統計 (`LLAMA_MOE_SLOT_STATS=1`):
 copies=... hit=... miss=... evict=... copy=... MiB avg=... ms
 ```
 
+## online frequency pin のログ出し方 (HOST_BANK=0)
+
+**禁止**: `LLAMA_MOE_HOST_BANK=1` での起動・実測。
+ON は load 時に全層 expert を pinned へ詰め、CPU~95% / Disk~100% / ROCm error。
+デフォルトは `HOST_BANK=0` のまま。実測は D / F セッションが排他で行う。
+
+online pin は `--moe-hot-expert` だけで有効。`HOST_BANK=0` + `LLAMA_MOE_SLOT_STATS=1` で十分。
+
+```powershell
+$env:LLAMA_MOE_HOST_BANK = "0"   # 必須
+$env:LLAMA_MOE_SLOT_STATS = "1"
+# 既定で auto_pin_after_access=2000。上書きする場合のみ:
+# $env:LLAMA_MOE_AUTO_PIN_AFTER = "2000"
+
+llama-cli -m $M --moe-hot-expert -ngl 99 -c 8192 -t 16 --reasoning off -p "..." -n 128 2> pin_err.log
+```
+
+stderr に現れる順:
+
+```
+online frequency pin armed: after 2000 accesses, track_access=1
+MoE GPU expert slot bank pinned stage: layer=...          # HOST_BANK=0 のときの通常経路
+MoE GPU expert slot cache initialized with N slots (auto) global_lru=1
+runtime frequency pin: P experts (K/layer max) after hit=H miss=M access_sum=S layers=L
+MoE GPU slot stats: copies=C hit=H miss=M evict=E copy=X MiB avg=Y ms
+```
+
+ゲート:
+- pin 1 回だけ (`auto_pin_done`)。ログに `runtime frequency pin` が 1 行
+- pin 後 hit が増え miss/copy が減ること
+- `MoE host expert bank pinned slab` が出たら **HOST_BANK が ON** になっている。すぐ停止して 0 に戻す
+
+起動ヘルパ (`run-qwen4exp-bank.cmd`) は `HOST_BANK=0` 固定。
+`Downloads/run-online-pin-bench.cmd` も同じ制約で使うこと。
+
 ## auto slot の意味
 
 1 slot = 全 MoE 層それぞれの expert 1 個分の合計。

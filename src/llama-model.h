@@ -1207,6 +1207,18 @@ struct llama_moe_gpu_expert_cache {
         return slot;
     }
 
+    // When the graph redirects MoE weights to the bank, remap must emit a
+    // slot id in [0, n_slots). expert_id can be >= n_slots (512 experts vs
+    // ~158 slots) and would OOB-read the bank. Non-bank path keeps expert_id
+    // (full expert tensors are indexed by expert id).
+    int32_t bank_safe_id(int32_t slot, int32_t expert_id) const {
+        if (slot >= 0 && slot < n_slots) {
+            return slot;
+        }
+        const bool banked = !frequency_whitelist.empty() || global_lru_enabled || n_slots >= 512;
+        return banked ? 0 : expert_id;
+    }
+
     int32_t ensure_resident(int32_t layer_id, int32_t expert_id, int32_t n_experts) {
         if (!enabled() || expert_id < 0 || expert_id >= n_experts) {
             return expert_id;
@@ -1261,19 +1273,19 @@ struct llama_moe_gpu_expert_cache {
         }
 
         if (slot < 0) {
-            return expert_id;
+            return bank_safe_id(-1, expert_id);
         }
 
         slot = preload_or_assign_slot(layer_id, expert_id, ++clock);
         if (slot < 0) {
-            return expert_id;
+            return bank_safe_id(-1, expert_id);
         }
 
         if (materialize_cb != nullptr && !materialize_cb(materialize_userdata, slot, layer_id, expert_id, n_experts)) {
             // storage could not be allocated (e.g. VRAM exhausted); undo the
             // resident marking so the expert falls back to its CPU tensor
             release_slot(layer_id, slot);
-            return expert_id;
+            return bank_safe_id(-1, expert_id);
         }
 
         return slot;
