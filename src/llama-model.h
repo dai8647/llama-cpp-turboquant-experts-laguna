@@ -1298,6 +1298,8 @@ void llama_moe_gpu_expert_slot_prefetch(struct llama_model & model, double budge
 void llama_moe_gpu_expert_slot_auto_init(struct llama_model & model);
 // runtime frequency pin (no 2-pass report); no-op until auto_pin_after_access is reached
 void llama_moe_gpu_expert_slot_auto_pin(struct llama_model & model);
+// LLAMA_MOE_SLOT_STATS=1: periodic hit/miss line for llama-server / LlamaDock
+void llama_moe_gpu_expert_slot_stats_dump(struct llama_model & model);
 // prefill double-buffering: enqueue predicted experts on the copy stream
 void llama_moe_gpu_expert_slot_prefill_prefetch(struct llama_model & model, struct ggml_backend * backend);
 void llama_moe_gpu_expert_slot_prefill_shutdown(struct llama_model & model);

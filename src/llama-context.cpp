@@ -2063,6 +2063,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     // runtime frequency pin: lock hottest experts after warmup (decode or prefill)
     llama_moe_gpu_expert_slot_auto_pin(const_cast<llama_model &>(model));
+    // LLAMA_MOE_SLOT_STATS=1: periodic hit/miss for llama-server / LlamaDock
+    llama_moe_gpu_expert_slot_stats_dump(const_cast<llama_model &>(model));
 
     // inter-step speculative expert prefetch: runs while no graph is in
     // flight, so its synchronous H2D copies stay race-free; decode-only

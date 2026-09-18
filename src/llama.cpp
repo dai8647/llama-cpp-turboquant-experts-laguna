@@ -1023,7 +1023,7 @@ static bool llama_moe_gpu_expert_slot_materialize(
             ++cache.n_copy;
             cache.copy_bytes += (int64_t) copied_bytes;
             cache.copy_ns    += copy_ns;
-            if (cache.n_copy % 4096 == 0) {
+            if (cache.n_copy == 1 || cache.n_copy % 256 == 0) {
                 LLAMA_LOG_INFO("%s: MoE GPU slot stats: copies=%lld hit=%lld miss=%lld evict=%lld copy=%.1f MiB avg=%.2f ms\n",
                         __func__, (long long) cache.n_copy, (long long) cache.n_hit, (long long) cache.n_miss,
                         (long long) cache.n_evict, cache.copy_bytes / 1048576.0,
@@ -1235,6 +1235,25 @@ void llama_moe_gpu_expert_slot_auto_pin(struct llama_model & model) {
 
     // materialize the pinned set now so the next steps see hits
     llama_moe_gpu_expert_slot_preload(model);
+}
+
+void llama_moe_gpu_expert_slot_stats_dump(struct llama_model & model) {
+    if (!llama_moe_gpu_expert_slot_stats_enabled()) {
+        return;
+    }
+    auto & cache = model.moe_gpu_expert_cache;
+    if (!cache.enabled()) {
+        return;
+    }
+    const int64_t total = cache.n_hit + cache.n_miss;
+    if (total <= 0 || (total % 256) != 0) {
+        return;
+    }
+    const double rate = 100.0 * (double) cache.n_hit / (double) total;
+    LLAMA_LOG_INFO("moe_hot_expert: hit=%lld miss=%lld hit_rate=%.1f%% evict=%lld slots=%d copies=%lld global_lru=%d\n",
+            (long long) cache.n_hit, (long long) cache.n_miss, rate,
+            (long long) cache.n_evict, cache.size(), (long long) cache.n_copy,
+            cache.global_lru_enabled ? 1 : 0);
 }
 
 void llama_moe_gpu_expert_slot_prefill_configure(llama_moe_gpu_expert_cache & cache) {
@@ -1631,6 +1650,24 @@ void llama_moe_gpu_expert_slot_auto_init(struct llama_model & model) {
                 __func__, n_host_layers, host_bytes / 1073741824.0);
     }
 
+    // LlamaDock / ops: precreate GPU banks when hot-expert LRU is on so the
+    // first build_graph binds bank tensors (not CPU full expert tensors).
+    // HOST_BANK stays off; this is GPU bank only + register_compute_tensor.
+    if (cache.enabled() && cache.global_lru_enabled && !llama_moe_host_bank_enabled()) {
+        int n_gpu_bank_layers = 0;
+        for (size_t i = 0; i < model.layers.size(); ++i) {
+            const int32_t n_experts = llama_moe_expert_count_from_layer(model.layers[i]);
+            if (n_experts <= 0) {
+                continue;
+            }
+            if (llama_moe_gpu_expert_bank_ensure(model, (int32_t) i, n_experts)) {
+                ++n_gpu_bank_layers;
+            }
+        }
+        LLAMA_LOG_INFO("%s: MoE GPU expert banks precreated for global LRU: layers=%d slots=%d\n",
+                __func__, n_gpu_bank_layers, slots);
+    }
+
     // Stage 3 frequency pin: preload the hottest experts into the slot cache
     if (!cache.freq_report_in.empty()) {
         llama_moe_freq_report freq_report = load_freq_report(cache.freq_report_in);
@@ -1661,6 +1698,20 @@ void llama_moe_gpu_expert_slot_auto_init(struct llama_model & model) {
     llama_moe_gpu_expert_slot_preload(model);
     LLAMA_LOG_INFO("%s: MoE GPU expert slot cache initialized with %d slots (auto) global_lru=%d\n",
             __func__, slots, cache.global_lru_enabled ? 1 : 0);
+    {
+        const char * hb = getenv("LLAMA_MOE_HOST_BANK");
+        const char * hp = getenv("LLAMA_MOE_HOST_PIN");
+        LLAMA_LOG_INFO("moe_hot_expert: slots=%d global_lru=%d host_bank=%s host_pin=%s auto_pin_after=%lld slot_stats=%d\n",
+                slots,
+                cache.global_lru_enabled ? 1 : 0,
+                (hb != nullptr && hb[0] != '\0') ? hb : "0(default)",
+                (hp != nullptr && hp[0] != '\0') ? hp : "0(default)",
+                (long long) cache.auto_pin_after_access,
+                llama_moe_gpu_expert_slot_stats_enabled() ? 1 : 0);
+        if (hb != nullptr && hb[0] == '1') {
+            LLAMA_LOG_WARN("moe_hot_expert: LLAMA_MOE_HOST_BANK=1 is FORBIDDEN on this machine (Disk100%/ROCm). Set 0.\n");
+        }
+    }
 }
 
 static void llama_moe_gpu_expert_slot_preload(const llama_model & model) {
