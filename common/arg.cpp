@@ -905,6 +905,11 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         ));
     }
 
+    // upstream e750b887: preserve_reasoning defaults on when not set explicitly
+    if (!params.default_template_kwargs.count("preserve_reasoning")) {
+        params.default_template_kwargs["preserve_reasoning"] = "true";
+    }
+
     return true;
 }
 
@@ -3672,6 +3677,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_REASONING"));
+    add_opt(common_arg(
+        {"--reasoning-effort"}, "LEVEL",
+        "reasoning effort level given to the chat template: 'default' to keep the template default,\n"
+        "or a level such as 'minimal', 'low', 'medium', 'high', 'xhigh' or 'max' (default: default)",
+        [](common_params & params, const std::string & value) {
+            if (value == "default" || value.empty()) {
+                params.default_template_kwargs.erase("reasoning_effort");
+            } else {
+                // JSON-quoted string, same as chat template kwargs consumers expect
+                params.default_template_kwargs["reasoning_effort"] = json(value).dump();
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_REASONING_EFFORT"));
     add_opt(common_arg(
         {"--reasoning-budget"}, "N",
         "token budget for thinking: -1 for unrestricted, 0 for immediate end, N>0 for token budget (default: -1)",
