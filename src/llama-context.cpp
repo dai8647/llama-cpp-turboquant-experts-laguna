@@ -685,17 +685,40 @@ void llama_context::sched_reserve() {
         }
     }
 
+    bool saw_gpu_compute = false;
     for (size_t i = 0; i < backend_ptrs.size(); ++i) {
         ggml_backend_t             backend = backend_ptrs[i];
         ggml_backend_buffer_type_t buft    = backend_buft[i];
         if (!model.hparams.no_alloc) {
             backend_buf_exp_size[i] = ggml_backend_sched_get_buffer_size(sched.get(), backend);
         }
+        const char * bname = ggml_backend_buft_name(buft);
+        const char * dname = ggml_backend_dev_name(ggml_backend_buft_get_device(buft));
+        if (bname != nullptr &&
+                (strstr(bname, "ROCm") != nullptr || strstr(bname, "HIP") != nullptr ||
+                 strstr(bname, "CUDA") != nullptr || strstr(bname, "Vulkan") != nullptr)) {
+            saw_gpu_compute = true;
+        }
+        if (dname != nullptr &&
+                (strstr(dname, "ROCm") != nullptr || strstr(dname, "HIP") != nullptr ||
+                 strstr(dname, "CUDA") != nullptr || strstr(dname, "Vulkan") != nullptr)) {
+            saw_gpu_compute = true;
+        }
+        // Always one line per backend so LlamaDock can grep ROCm0 vs CPU
+        LLAMA_LOG_INFO("compute_buffer: device=%s buft=%s size=%.2f MiB\n",
+                dname != nullptr ? dname : "?",
+                bname != nullptr ? bname : "?",
+                backend_buf_exp_size[i] / 1024.0 / 1024.0);
         if (backend_buf_exp_size[i] > 1) {
             LLAMA_LOG_INFO("%s: %10s compute buffer size = %8.2f MiB\n", __func__,
-                    ggml_backend_buft_name(buft),
+                    bname != nullptr ? bname : "?",
                     backend_buf_exp_size[i] / 1024.0 / 1024.0);
         }
+    }
+    if (saw_gpu_compute) {
+        LLAMA_LOG_INFO("compute_buffer: GPU path active (look for ROCm0/CUDA0 device= line above)\n");
+    } else {
+        LLAMA_LOG_WARN("compute_buffer: no GPU compute buffer — HIP/ROCm init may have failed (PATH / ROCM_PATH / DLL)\n");
     }
 
     if (n_nodes_pp == n_nodes_tg) {
