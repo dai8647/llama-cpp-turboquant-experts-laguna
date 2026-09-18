@@ -1650,22 +1650,26 @@ void llama_moe_gpu_expert_slot_auto_init(struct llama_model & model) {
                 __func__, n_host_layers, host_bytes / 1073741824.0);
     }
 
-    // LlamaDock / ops: precreate GPU banks when hot-expert LRU is on so the
-    // first build_graph binds bank tensors (not CPU full expert tensors).
-    // HOST_BANK stays off; this is GPU bank only + register_compute_tensor.
+    // Optional GPU bank precreate for global LRU (graph binds bank weights).
+    // Default OFF: all-layer bank_ensure at auto_init raised host WS and risked
+    // OOM on 8K + hot-expert (measured 2026-09-18). Opt-in for experiments:
+    //   set LLAMA_MOE_GPU_BANK_PRECREATE=1
     if (cache.enabled() && cache.global_lru_enabled && !llama_moe_host_bank_enabled()) {
-        int n_gpu_bank_layers = 0;
-        for (size_t i = 0; i < model.layers.size(); ++i) {
-            const int32_t n_experts = llama_moe_expert_count_from_layer(model.layers[i]);
-            if (n_experts <= 0) {
-                continue;
+        const char * pre = getenv("LLAMA_MOE_GPU_BANK_PRECREATE");
+        if (pre != nullptr && pre[0] != '\0' && pre[0] != '0') {
+            int n_gpu_bank_layers = 0;
+            for (size_t i = 0; i < model.layers.size(); ++i) {
+                const int32_t n_experts = llama_moe_expert_count_from_layer(model.layers[i]);
+                if (n_experts <= 0) {
+                    continue;
+                }
+                if (llama_moe_gpu_expert_bank_ensure(model, (int32_t) i, n_experts)) {
+                    ++n_gpu_bank_layers;
+                }
             }
-            if (llama_moe_gpu_expert_bank_ensure(model, (int32_t) i, n_experts)) {
-                ++n_gpu_bank_layers;
-            }
+            LLAMA_LOG_INFO("%s: MoE GPU expert banks precreated for global LRU: layers=%d slots=%d\n",
+                    __func__, n_gpu_bank_layers, slots);
         }
-        LLAMA_LOG_INFO("%s: MoE GPU expert banks precreated for global LRU: layers=%d slots=%d\n",
-                __func__, n_gpu_bank_layers, slots);
     }
 
     // Stage 3 frequency pin: preload the hottest experts into the slot cache
