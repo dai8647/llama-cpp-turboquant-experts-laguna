@@ -678,6 +678,21 @@ struct llama_moe_gpu_expert_cache {
     int64_t n_copy = 0;
     int64_t copy_bytes = 0;
     int64_t copy_ns = 0;
+    int64_t n_pinned_stage = 0;
+    int64_t n_pinned_stage_nonhost = 0;
+    int64_t n_host_bank = 0;
+    int64_t n_pageable = 0;
+    int64_t stage_memcpy_ns = 0;
+    int64_t stage_memcpy_bytes = 0;
+    int64_t stage_tensor_get_ns = 0;
+    int64_t stage_tensor_get_bytes = 0;
+    int64_t h2d_wait_ns = 0;
+    int64_t h2d_wait_bytes = 0;
+    int64_t h2d_event_count = 0;
+    int64_t fallback_tensor_get_ns = 0;
+    int64_t fallback_tensor_get_bytes = 0;
+    int64_t fallback_tensor_set_ns = 0;
+    int64_t fallback_tensor_set_bytes = 0;
 
     // inter-step speculative prefetch (LLAMA_MOE_PREFETCH_MS), cache_mutex guarded
     double prefetch_budget_ms = 0.0;
@@ -826,6 +841,21 @@ struct llama_moe_gpu_expert_cache {
         n_copy = 0;
         copy_bytes = 0;
         copy_ns = 0;
+        n_pinned_stage = 0;
+        n_pinned_stage_nonhost = 0;
+        n_host_bank = 0;
+        n_pageable = 0;
+        stage_memcpy_ns = 0;
+        stage_memcpy_bytes = 0;
+        stage_tensor_get_ns = 0;
+        stage_tensor_get_bytes = 0;
+        h2d_wait_ns = 0;
+        h2d_wait_bytes = 0;
+        h2d_event_count = 0;
+        fallback_tensor_get_ns = 0;
+        fallback_tensor_get_bytes = 0;
+        fallback_tensor_set_ns = 0;
+        fallback_tensor_set_bytes = 0;
         last_selections.clear();
     }
 
@@ -870,6 +900,21 @@ struct llama_moe_gpu_expert_cache {
         n_copy = 0;
         copy_bytes = 0;
         copy_ns = 0;
+        n_pinned_stage = 0;
+        n_pinned_stage_nonhost = 0;
+        n_host_bank = 0;
+        n_pageable = 0;
+        stage_memcpy_ns = 0;
+        stage_memcpy_bytes = 0;
+        stage_tensor_get_ns = 0;
+        stage_tensor_get_bytes = 0;
+        h2d_wait_ns = 0;
+        h2d_wait_bytes = 0;
+        h2d_event_count = 0;
+        fallback_tensor_get_ns = 0;
+        fallback_tensor_get_bytes = 0;
+        fallback_tensor_set_ns = 0;
+        fallback_tensor_set_bytes = 0;
         last_selections.clear();
     }
 

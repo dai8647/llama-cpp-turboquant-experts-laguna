@@ -508,7 +508,9 @@ static bool llama_moe_gpu_expert_bank_copy_tensor(
         const llama_moe_gpu_expert_bank & bank,
         const llama_moe_gpu_expert_bank_tensor & bank_tensor,
         int32_t expert_id,
-        int32_t slot_id) {
+        int32_t slot_id,
+        int64_t * get_ns = nullptr,
+        int64_t * set_ns = nullptr) {
     if (bank_tensor.src == nullptr || bank_tensor.dev == nullptr || bank_tensor.expert_dim < 0) {
         return false;
     }
@@ -523,8 +525,8 @@ static bool llama_moe_gpu_expert_bank_copy_tensor(
         return false;
     }
 
-    // host-backed sources (model weights always are) can feed the H2D copy
-    // directly; the staging detour only exists for exotic non-host buffers
+    // Host-backed sources can feed the H2D copy directly. Non-host sources
+    // use a pageable temporary when no per-layer pinned stage is available.
     if (bank_tensor.src->buffer != nullptr && ggml_backend_buffer_is_host(bank_tensor.src->buffer)) {
         const uint8_t * host_ptr = (const uint8_t *) bank_tensor.src->data + src_offset;
         // host bank: src already lives in a pinned continuous slab - DMA as-is
@@ -545,8 +547,18 @@ static bool llama_moe_gpu_expert_bank_copy_tensor(
     }
 
     std::vector<uint8_t> data(nbytes);
+    const auto get_t0 = std::chrono::steady_clock::now();
     ggml_backend_tensor_get(bank_tensor.src, data.data(), src_offset, nbytes);
+    if (get_ns != nullptr) {
+        *get_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - get_t0).count();
+    }
+    const auto set_t0 = std::chrono::steady_clock::now();
     ggml_backend_tensor_set(bank_tensor.dev, data.data(), dst_offset, nbytes);
+    if (set_ns != nullptr) {
+        *set_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - set_t0).count();
+    }
     return true;
 }
 
@@ -921,6 +933,16 @@ static bool llama_moe_gpu_expert_slot_materialize(
         // Stage 1 decode path: stage all tensors into pinned then one async
         // H2D burst + a single event wait. cheaper than N sync tensor_set.
         bool used_async = false;
+        bool used_pinned_stage = false;
+        bool used_pinned_stage_nonhost = false;
+        bool used_host_bank = false;
+        int64_t stage_memcpy_ns = 0;
+        int64_t stage_memcpy_bytes = 0;
+        int64_t stage_tensor_get_ns = 0;
+        int64_t stage_tensor_get_bytes = 0;
+        int64_t h2d_wait_ns = 0;
+        int64_t h2d_wait_bytes = 0;
+        int64_t h2d_event_count = 0;
         // C1 host bank: src is already pinned - one async burst straight to GPU
         if (bank.host_bank) {
             ggml_backend_t be = model.moe_gpu_expert_cache.prefill_pf_backend;
@@ -948,8 +970,14 @@ static bool llama_moe_gpu_expert_slot_materialize(
                     }
                     if (host_ok) {
                         ggml_backend_cuda_ext_event_record(be, event);
+                        const auto h2d_t0 = std::chrono::steady_clock::now();
                         ggml_backend_cuda_ext_event_synchronize(event);
+                        h2d_wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - h2d_t0).count();
+                        h2d_wait_bytes += (int64_t) copied_bytes;
+                        ++h2d_event_count;
                         used_async = true;
+                        used_host_bank = true;
                     } else {
                         copied_bytes = 0;
                     }
@@ -978,13 +1006,32 @@ static bool llama_moe_gpu_expert_slot_materialize(
                         if (bt.src == nullptr || bt.dev == nullptr || bt.expert_dim < 0 || bt.nbytes_per_expert == 0) {
                             continue;
                         }
-                        if (bt.src->buffer == nullptr || !ggml_backend_buffer_is_host(bt.src->buffer)) {
+                        if (bt.src->buffer == nullptr || bt.src->data == nullptr) {
                             host_ok = false;
                             break;
                         }
-                        const uint8_t * host = (const uint8_t *) bt.src->data +
-                                (size_t) expert_id * bt.src->nb[bt.expert_dim];
-                        memcpy(stage + off, host, bt.nbytes_per_expert);
+                        const size_t src_off = (size_t) expert_id * bt.src->nb[bt.expert_dim];
+                        if (src_off + bt.nbytes_per_expert > ggml_nbytes(bt.src)) {
+                            host_ok = false;
+                            break;
+                        }
+                        if (ggml_backend_buffer_is_host(bt.src->buffer)) {
+                            const uint8_t * host = (const uint8_t *) bt.src->data + src_off;
+                            const auto memcpy_t0 = std::chrono::steady_clock::now();
+                            memcpy(stage + off, host, bt.nbytes_per_expert);
+                            stage_memcpy_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now() - memcpy_t0).count();
+                            stage_memcpy_bytes += (int64_t) bt.nbytes_per_expert;
+                        } else {
+                            // GGUF mmap sources are pageable. Read the slice into
+                            // the pinned stage before issuing the async H2D.
+                            const auto get_t0 = std::chrono::steady_clock::now();
+                            ggml_backend_tensor_get(bt.src, stage + off, src_off, bt.nbytes_per_expert);
+                            stage_tensor_get_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now() - get_t0).count();
+                            stage_tensor_get_bytes += (int64_t) bt.nbytes_per_expert;
+                            used_pinned_stage_nonhost = true;
+                        }
                         batch.push_back({&bt, off});
                         off += bt.nbytes_per_expert;
                     }
@@ -999,18 +1046,28 @@ static bool llama_moe_gpu_expert_slot_materialize(
                                 copied_bytes += btp->nbytes_per_expert;
                             }
                             ggml_backend_cuda_ext_event_record(be, event);
+                            const auto h2d_t0 = std::chrono::steady_clock::now();
                             ggml_backend_cuda_ext_event_synchronize(event);
+                            h2d_wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now() - h2d_t0).count();
+                            h2d_wait_bytes += (int64_t) copied_bytes;
+                            ++h2d_event_count;
                             ggml_backend_cuda_ext_event_destroy(be, event);
                             used_async = true;
+                            used_pinned_stage = true;
                         }
                     }
                 }
             }
         }
 
+        const bool used_pageable = !used_async;
+        int64_t fallback_get_ns = 0;
+        int64_t fallback_set_ns = 0;
         if (!used_async) {
             for (const auto & bank_tensor : bank.tensors) {
-                if (llama_moe_gpu_expert_bank_copy_tensor(bank, bank_tensor, expert_id, slot_id)) {
+                if (llama_moe_gpu_expert_bank_copy_tensor(bank, bank_tensor, expert_id, slot_id,
+                        &fallback_get_ns, &fallback_set_ns)) {
                     copied_bytes += bank_tensor.nbytes_per_expert;
                 }
             }
@@ -1023,11 +1080,46 @@ static bool llama_moe_gpu_expert_slot_materialize(
             ++cache.n_copy;
             cache.copy_bytes += (int64_t) copied_bytes;
             cache.copy_ns    += copy_ns;
+            if (used_pinned_stage) {
+                cache.stage_memcpy_ns += stage_memcpy_ns;
+                cache.stage_memcpy_bytes += stage_memcpy_bytes;
+                cache.stage_tensor_get_ns += stage_tensor_get_ns;
+                cache.stage_tensor_get_bytes += stage_tensor_get_bytes;
+            }
+            cache.h2d_wait_ns += h2d_wait_ns;
+            cache.h2d_wait_bytes += h2d_wait_bytes;
+            cache.h2d_event_count += h2d_event_count;
+            cache.fallback_tensor_get_ns += fallback_get_ns;
+            cache.fallback_tensor_get_bytes += used_pageable ? copied_bytes : 0;
+            cache.fallback_tensor_set_ns += fallback_set_ns;
+            cache.fallback_tensor_set_bytes += used_pageable ? copied_bytes : 0;
+            if (used_pinned_stage) {
+                ++cache.n_pinned_stage;
+                if (used_pinned_stage_nonhost) {
+                    ++cache.n_pinned_stage_nonhost;
+                }
+            } else if (used_host_bank) {
+                ++cache.n_host_bank;
+            } else if (used_pageable) {
+                ++cache.n_pageable;
+            }
             if (cache.n_copy == 1 || cache.n_copy % 256 == 0) {
-                LLAMA_LOG_INFO("%s: MoE GPU slot stats: copies=%lld hit=%lld miss=%lld evict=%lld copy=%.1f MiB avg=%.2f ms\n",
+                const double bandwidth_mib_s = cache.copy_ns > 0 ?
+                    cache.copy_bytes * 1e9 / cache.copy_ns / 1048576.0 : 0.0;
+                LLAMA_LOG_INFO("%s: MoE GPU slot stats: copies=%lld hit=%lld miss=%lld evict=%lld copy=%.1f MiB avg=%.2f ms stage=%lld stage_nonhost=%lld host_bank=%lld pageable=%lld bw=%.1f MiB/s\n",
                         __func__, (long long) cache.n_copy, (long long) cache.n_hit, (long long) cache.n_miss,
                         (long long) cache.n_evict, cache.copy_bytes / 1048576.0,
-                        cache.copy_ns / 1e6 / (double) std::max<int64_t>(cache.n_copy, 1));
+                        cache.copy_ns / 1e6 / (double) std::max<int64_t>(cache.n_copy, 1),
+                        (long long) cache.n_pinned_stage, (long long) cache.n_pinned_stage_nonhost,
+                        (long long) cache.n_host_bank, (long long) cache.n_pageable, bandwidth_mib_s);
+                const double h2d_bw = cache.h2d_wait_ns > 0 ?
+                    cache.h2d_wait_bytes * 1e9 / cache.h2d_wait_ns / 1048576.0 : 0.0;
+                LLAMA_LOG_INFO("%s: MoE transfer split: stage_memcpy=%.1f MiB stage_memcpy_ms=%.2f stage_get=%.1f MiB stage_get_ms=%.2f h2d_wait=%.1f MiB h2d_wait_ms=%.2f h2d_bw=%.1f MiB/s fallback_get_ms=%.2f fallback_set_ms=%.2f events=%lld\n",
+                        __func__, cache.stage_memcpy_bytes / 1048576.0, cache.stage_memcpy_ns / 1e6,
+                        cache.stage_tensor_get_bytes / 1048576.0, cache.stage_tensor_get_ns / 1e6,
+                        cache.h2d_wait_bytes / 1048576.0, cache.h2d_wait_ns / 1e6, h2d_bw,
+                        cache.fallback_tensor_get_ns / 1e6, cache.fallback_tensor_set_ns / 1e6,
+                        (long long) cache.h2d_event_count);
             }
         }
 
@@ -1254,6 +1346,17 @@ void llama_moe_gpu_expert_slot_stats_dump(struct llama_model & model) {
             (long long) cache.n_hit, (long long) cache.n_miss, rate,
             (long long) cache.n_evict, cache.size(), (long long) cache.n_copy,
             cache.global_lru_enabled ? 1 : 0);
+    LLAMA_LOG_INFO("moe_hot_expert: transfer_paths stage=%lld stage_nonhost=%lld host_bank=%lld pageable=%lld copy_bw=%.1f MiB/s\n",
+            (long long) cache.n_pinned_stage, (long long) cache.n_pinned_stage_nonhost,
+            (long long) cache.n_host_bank, (long long) cache.n_pageable,
+            cache.copy_ns > 0 ? cache.copy_bytes * 1e9 / cache.copy_ns / 1048576.0 : 0.0);
+    LLAMA_LOG_INFO("moe_hot_expert: transfer_split stage_memcpy=%.1f MiB/%.2f ms stage_get=%.1f MiB/%.2f ms h2d_wait=%.1f MiB/%.2f ms h2d_bw=%.1f MiB/s fallback_get=%.2f ms fallback_set=%.2f ms events=%lld\n",
+            cache.stage_memcpy_bytes / 1048576.0, cache.stage_memcpy_ns / 1e6,
+            cache.stage_tensor_get_bytes / 1048576.0, cache.stage_tensor_get_ns / 1e6,
+            cache.h2d_wait_bytes / 1048576.0, cache.h2d_wait_ns / 1e6,
+            cache.h2d_wait_ns > 0 ? cache.h2d_wait_bytes * 1e9 / cache.h2d_wait_ns / 1048576.0 : 0.0,
+            cache.fallback_tensor_get_ns / 1e6, cache.fallback_tensor_set_ns / 1e6,
+            (long long) cache.h2d_event_count);
 }
 
 void llama_moe_gpu_expert_slot_prefill_configure(llama_moe_gpu_expert_cache & cache) {
