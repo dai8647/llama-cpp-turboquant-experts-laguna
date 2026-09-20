@@ -2499,6 +2499,8 @@ llama_model_params llama_model_default_params() {
         /*.tensor_buft_overrides       =*/ nullptr,
         /*.n_gpu_layers                =*/ -1,
         /*.n_moe_gpu_expert_slot_num   =*/ -1,
+        /*.moe_gpu_expert_slot_auto    =*/ false,
+        /*.moe_gpu_expert_global_lru   =*/ false,
         /*.moe_expert_placement        =*/ nullptr,
         /*.moe_gpu_expert_ratio        =*/ 1.0f,
         /*.moe_freq_report_in         =*/ nullptr,

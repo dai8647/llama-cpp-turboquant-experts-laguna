@@ -639,6 +639,15 @@ struct llama_moe_gpu_expert_cache {
     int64_t n_miss = 0;
     int64_t n_evict = 0;
 
+    // global LRU pool (--moe-gpu-expert-global-lru / LLAMA_MOE_GLOBAL_LRU=1):
+    // the n_slots budget is shared by all layers instead of each layer owning
+    // its own full pool; hot layers take residency from cold ones. banks keep
+    // per-layer capacity n_slots (lazy, stable pointers), only residency is
+    // globally accounted. cache_mutex guarded.
+    bool    global_lru_enabled = false;
+    int64_t n_resident_global  = 0;
+    int64_t n_evict_cross      = 0;
+
     // materialization telemetry (LLAMA_MOE_SLOT_STATS=1), cache_mutex guarded
     int64_t n_copy = 0;
     int64_t copy_bytes = 0;
@@ -1197,6 +1206,21 @@ struct llama_moe_gpu_expert_cache {
 
 // inter-step speculative expert prefetch; budget_ms <= 0 disables
 void llama_moe_gpu_expert_slot_prefetch(struct llama_model & model, double budget_ms);
+
+// elastic VRAM sizing: resolve cache.auto_pending into a concrete slot count
+// from free VRAM after model weights + KV caches are resident; runs the
+// standard preload. no-op unless auto_pending is set.
+void llama_moe_gpu_expert_slot_auto_init(struct llama_model & model);
+
+// prefill double buffering: poll completed background copies, then enqueue
+// predicted-expert H2D copies for the next prefill chunk on backend's copy
+// stream (opt-in via LLAMA_MOE_PREFILL_PF=1). backend may be null (falls back
+// to a no-op).
+void llama_moe_gpu_expert_slot_prefill_prefetch(struct llama_model & model, struct ggml_backend * backend);
+
+// prefill double buffering teardown: synchronize and release any still-in-
+// flight background copies (model unload path).
+void llama_moe_gpu_expert_slot_prefill_shutdown(struct llama_model & model);
 
 struct llama_model {
     llm_type type = LLM_TYPE_UNKNOWN;
