@@ -962,9 +962,9 @@ struct vk_device_struct {
     vk_pipeline pipeline_cpy_f32_quant[GGML_TYPE_COUNT];
     vk_pipeline pipeline_cpy_quant_f32[GGML_TYPE_COUNT];
     vk_pipeline pipeline_cpy_transpose_16, pipeline_cpy_transpose_32;
-    // [src0 0=fp32,1=fp16][dst]
-    vk_pipeline pipeline_set_rows_i32[2][GGML_TYPE_COUNT];
-    vk_pipeline pipeline_set_rows_i64[2][GGML_TYPE_COUNT];
+    // [dst] - set_rows pipelines take an F32 source only (S_TYPE=float)
+    vk_pipeline pipeline_set_rows_i32[GGML_TYPE_COUNT];
+    vk_pipeline pipeline_set_rows_i64[GGML_TYPE_COUNT];
     vk_pipeline pipeline_norm_f32;
     vk_pipeline pipeline_group_norm_f32;
     vk_pipeline pipeline_rms_norm_f32;
@@ -11258,14 +11258,15 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         return ggml_vk_get_cpy_pipeline(ctx, src0, dst, dst->type);
     case GGML_OP_SET_ROWS:
         {
-            if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16) {
+            // the set_rows shaders read the source through an F32 S buffer, so
+            // F16 sources are not supported and fall back to the CPU backend
+            if (src0->type != GGML_TYPE_F32) {
                 return nullptr;
             }
-            const int src_idx = src0->type == GGML_TYPE_F16;
             if (src1->type == GGML_TYPE_I64) {
-                return ctx->device->pipeline_set_rows_i64[src_idx][dst->type];
+                return ctx->device->pipeline_set_rows_i64[dst->type];
             } else if (src1->type == GGML_TYPE_I32) {
-                return ctx->device->pipeline_set_rows_i32[src_idx][dst->type];
+                return ctx->device->pipeline_set_rows_i32[dst->type];
             }
             return nullptr;
         }
@@ -18183,6 +18184,10 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_SET_ROWS:
             {
+                // set_rows shaders read the source through an F32 S buffer
+                if (op->src[0]->type != GGML_TYPE_F32) {
+                    return false;
+                }
                 // turbo shaders use a 128-element block: head_dim must be divisible by 128
                 if ((op->type == GGML_TYPE_TURBO2_0 || op->type == GGML_TYPE_TURBO3_0 || op->type == GGML_TYPE_TURBO4_0)
                     && (op->src[0]->ne[0] % 128 != 0)) {
