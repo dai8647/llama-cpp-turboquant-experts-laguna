@@ -55,3 +55,98 @@ The decode miss wait is on a dedicated copy stream event, not a device-wide or c
 The previously reported `78.3 MiB/s` is an end-to-end materialization rate, not isolated PCIe DMA bandwidth. Its denominator includes source preparation, H2D enqueue, copy-stream event wait, and event cleanup. The `stage=100%`, `stage_nonhost=0`, `pageable=0` result proves that the pinned-stage branch ran, but mmap-backed GGUF pages can still be file-backed while classified as host-backed.
 
 New Session A telemetry separates the components in `MoE transfer split`: `stage_memcpy`, `stage_get`, `h2d_wait`, `h2d_bw`, and synchronous fallback timings. A fresh `build-stage1` canonical run is required before assigning the 78 MiB/s bottleneck to host memcpy/page faults, backend tensor reads, or HIP H2D. See `docs/outsourcing/session-a-78mib-split-2026-09-19.md`.
+
+### 2026-09-21 split smoke result (invalid throughput run)
+
+A stage1-only run was started with `HOST_BANK=0`, `SLOT_STATS=1`, ctx 8192, `-n 256`, `-fa on`, and `-t 12`. It aborted before `Generation` output with a ROCm launch failure, so no gen t/s or cold/warm comparison is valid. The final telemetry emitted before abort was:
+
+```text
+copy_bw=39.4 MiB/s, stage=4864, stage_nonhost=0, pageable=0
+stage_memcpy=6412.5 MiB / 7284.99 ms
+stage_get=0.0 MiB / 0.00 ms
+h2d_wait=6412.5 MiB / 26161.91 ms
+h2d_bw=245.1 MiB/s
+hit=9197 miss=4864 evict=17
+```
+
+The H2D event wait was about 3.6x the host memcpy time in this partial run, and `stage_get` was unused. This points to copy-stream/HIP H2D wait as the dominant measured component for this run, not non-host backend reads. Because the process aborted before generation, these values are diagnostic only and do not establish a throughput result or a cold-vs-warm page-fault comparison. Artifacts: `split_cold_20260921.log` and `split_cold_20260921.err.log`.
+
+## MTP draft-mtp GPU test (2026-09-21)
+
+The `build-mtp` GPU test was executed with `LLAMA_MOE_HOST_BANK=0`, `LLAMA_MOE_SLOT_STATS=1`, ROCm on an AMD Radeon RX 7800 XT, the Qwen3.8-Flash-Next GSQ-RCO Q2_0 target, and the generated 2.84 GiB Q8_0 draft GGUF. No other `llama-cli` or `llama-server` process was running before the test.
+
+Result: **failed before MTP context creation; no decode t/s or acceptance rate**. The target model loaded far enough to allocate the MoE slot banks, but loading the draft failed because the draft GGUF is missing the required `qwen4exp.context_length` metadata key. The log first reports the draft metadata and `nextn_predict_layers = 1`, then fails with:
+
+```text
+error loading model: error loading model hyperparameters: key not found in model: qwen4exp.context_length
+common_speculative_init_result: failed to load draft model
+```
+
+The failure is recorded in `C:\Users\dai86\llama-cpp-turboquant-experts-laguna\mtp_test.log`. There was no ROCm abort or `ggml_cuda_error`; no `creating MTP context`, draft KV allocation, acceptance statistics, or generation benchmark was reached. `LLAMA_MOE_HOST_BANK=0` was confirmed in the slot-bank log (`host_bank=0`).
+
+The draft must be regenerated or metadata-fixed before a valid MTP performance measurement can be made. No source or MTP code was changed.
+
+### MTP draft shape repair attempt (2026-09-21)
+
+The first repaired draft had a writer bug: raw Q8_0 bytes were emitted without a logical tensor shape. The prep script was updated to preserve quantized byte-row shapes for 1D/2D/3D tensors, and the draft was regenerated. The resulting GGUF was verified with these loader-visible shapes:
+
+```text
+block_count=49
+nextn_predict_layers=1
+token_embd.weight       [2560, 248320] q3_K
+output_hc_down.weight   [10240, 320] q8_0
+output_hc_up.weight     [320, 10240] q8_0
+blk.48.ffn_down_exps    [640, 2560, 512] q8_0
+blk.48.ffn_up_exps      [2560, 640, 512] q8_0
+```
+
+`build-mtp` was rebuilt successfully. The retest no longer reports a tensor shape error, but still fails during draft `load_tensors` with:
+
+```text
+llama_model_load: error loading model: invalid vector subscript
+```
+
+The trace shows all 33 draft tensors being indexed with valid shapes immediately before the failure. There is no `n_layer_nextn = 1`, MTP context creation, draft KV allocation, acceptance statistic, or generation rate. No ROCm abort occurred. The remaining issue is an internal vector access in the qwen4exp draft loader path, not the original raw-shape bug. A stack trace or narrow logging around the `load_arch_tensors` vector accesses is required before changing the loader. MTP gen t/s and acceptance remain unmeasured.
+
+## MTP draft-mtp retest (2026-09-21)
+
+The repaired draft was tested with the `build-mtp` binary only:
+
+```text
+build-mtp\\bin\\llama-cli.exe
+--spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.75
+--moe-hot-expert -ngl 99 -fa on -c 8192 -t 12
+LLAMA_MOE_HOST_BANK=0
+LLAMA_MOE_SLOT_STATS=1
+```
+
+Draft path:
+
+```text
+C:\Users\dai86\Downloads\mtp-draft\mtp-Qwen3.8-Flash-Next-draft-q8_0.gguf
+```
+
+Result: **failed during draft model tensor loading**. The target model reached its metadata/tensor-loading phase, and the log emitted `loading draft model`, but draft loading terminated with:
+
+```text
+llama_model_load: error loading model: invalid vector subscript
+common_speculative_init_result: failed to load draft model
+srv llama_server: exiting due to model loading error
+```
+
+No successful MTP markers were reached:
+
+- no `n_layer_nextn = 1`
+- no `creating MTP context`
+- no draft KV allocation
+- no acceptance statistics
+- no `Generation: ... t/s`
+- no ROCm abort
+
+Artifacts:
+
+- `mtp_test2.log`
+- `mtp_test2.stderr.log`
+- `mtp_test2.stdout.log`
+
+The process exited with code 1. This is a draft-loader/vector-shape failure, not a GPU transfer or ROCm runtime failure. Therefore gen t/s and acceptance are **not measured**. No code, `build-stage1`, or `build-mtp` files were modified during this retest.

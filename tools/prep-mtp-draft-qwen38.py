@@ -18,6 +18,7 @@ Transformations:
 
 Run:  PYTHONPATH=<repo>/gguf-py python tools/prep-mtp-draft-qwen38.py
 """
+import math
 import os
 import shutil
 import sys
@@ -38,7 +39,9 @@ KV_KEEP = [
     "general.architecture",
     "general.name",
     "qwen4exp.block_count",
+    "qwen4exp.context_length",
     "qwen4exp.embedding_length",
+    "qwen4exp.embedding_length_per_layer_input",
     "qwen4exp.attention.head_count",
     "qwen4exp.attention.head_count_kv",
     "qwen4exp.attention.layer_norm_rms_epsilon",
@@ -64,6 +67,10 @@ KV_KEEP = [
     "qwen4exp.attention.indexer.key_length",
     "qwen4exp.attention.indexer.top_k",
     "qwen4exp.attention.compress_ratios",
+    "general.type",
+    "general.sampling.temp",
+    "general.sampling.top_k",
+    "general.sampling.top_p",
 ]
 # tokenizer keys copied from the draft itself (it already carries the full vocab)
 TOK_KEEP = [k for k in GGUFReader(DRAFT).fields if k.startswith("tokenizer.") or k == "general.file_type"]
@@ -119,8 +126,16 @@ def main() -> None:
         dr.fields["general.architecture"].data[0]].tobytes().decode().rstrip("\x00"))
 
     # --- metadata ---
+    # The thin draft GGUF carries nearly all qwen4exp hyperparameters itself (verified:
+    # context_length, embedding dims, rope, ssm, hc, indexer, compress_ratios, block_count=49
+    # including the MTP block). The original bug was only that KV_KEEP omitted
+    # context_length / embedding_length_per_layer_input. Read from the draft (dr), falling
+    # back to the trunk (tr) for the few keys the thin draft does not carry.
     for name in KV_KEEP:
-        add_kv(w, dr, name)
+        if name in dr.fields:
+            add_kv(w, dr, name)
+        else:
+            add_kv(w, tr, name)
     for name in TOK_KEEP:
         add_kv(w, dr, name)
     w.add_string("general.name", "Qwen3.8-Flash-Next-MTP-draft")
@@ -135,8 +150,17 @@ def main() -> None:
             # loader expects output_hc_{norm,down,up}; the draft nests them under nextn.hc_head_
             name = name.replace("blk.48.nextn.hc_head_", "output_hc_")
         data = bytes(t.data)
-        w.add_tensor(name, np.frombuffer(data, dtype=np.uint8).reshape(-1),
-                     raw_dtype=t.tensor_type)
+        tensor_bytes = np.frombuffer(data, dtype=np.uint8)
+        if len(t.shape) == 3:
+            row_count = math.prod(t.shape[1:])
+            raw_shape = (t.shape[2], t.shape[1], len(data) // row_count)
+            w.add_tensor(name, tensor_bytes, raw_shape=raw_shape, raw_dtype=t.tensor_type)
+        elif len(t.shape) == 2:
+            w.add_tensor(name, tensor_bytes,
+                         raw_shape=(t.shape[1], len(data) // t.shape[1]),
+                         raw_dtype=t.tensor_type)
+        else:
+            w.add_tensor(name, tensor_bytes, raw_dtype=t.tensor_type)
         n_copied += 1
         if n_copied % 8 == 0:
             print(f"  {n_copied}/{len(dr.tensors) + 1} tensors")
@@ -145,6 +169,7 @@ def main() -> None:
     te_data = bytes(tok_embd.data)
     w.add_tensor("token_embd.weight",
                  np.frombuffer(te_data, dtype=np.uint8),
+                 raw_shape=(tok_embd.shape[1], len(te_data) // tok_embd.shape[1]),
                  raw_dtype=tok_embd.tensor_type)
     n_copied += 1
     print(f"  {n_copied}/{len(dr.tensors) + 1} tensors")
