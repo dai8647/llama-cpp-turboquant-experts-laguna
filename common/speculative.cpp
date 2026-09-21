@@ -2405,6 +2405,10 @@ common_speculative_init_result::common_speculative_init_result(
         }
 
         pimpl->context.reset(ctx_dft);
+
+        // Disable CUDA graphs for draft context: MTP draft graph capture/replay
+        // causes unspecified launch failure (async kernel crash on buffer reallocation).
+        llama_set_graphs_enabled(ctx_dft, false);
     } else if (spec_mtp) {
         model_path = params.model.path;
 
@@ -2417,6 +2421,10 @@ common_speculative_init_result::common_speculative_init_result(
         }
 
         pimpl->context.reset(ctx_dft);
+
+        // Disable CUDA graphs for draft context: MTP draft graph capture/replay
+        // causes unspecified launch failure (async kernel crash on buffer reallocation).
+        llama_set_graphs_enabled(ctx_dft, false);
     }
 }
 

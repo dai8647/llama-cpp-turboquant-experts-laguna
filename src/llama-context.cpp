@@ -1243,6 +1243,15 @@ void llama_context::set_warmup(bool value) {
     //sched_need_reserve = true;
 }
 
+void llama_context::set_graphs_enabled(bool enable) {
+    for (auto * backend : backend_ptrs) {
+        if (ggml_backend_is_cuda(backend)) {
+            ggml_backend_cuda_ext_set_graphs_enabled(backend, enable);
+        }
+    }
+    LLAMA_LOG_INFO("%s: CUDA graphs %s for context\n", __func__, enable ? "enabled" : "disabled");
+}
+
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     if (!sampler && sampling.samplers.count(seq_id) == 0) {
         return true;
@@ -3804,6 +3813,13 @@ void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
 
 void llama_set_warmup(llama_context * ctx, bool warmup) {
     ctx->set_warmup(warmup);
+}
+
+void llama_set_graphs_enabled(llama_context * ctx, bool enable) {
+    if (ctx == nullptr) {
+        return;
+    }
+    ctx->set_graphs_enabled(enable);
 }
 
 void llama_synchronize(llama_context * ctx) {

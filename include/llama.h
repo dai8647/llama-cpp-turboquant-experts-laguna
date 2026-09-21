@@ -1030,6 +1030,11 @@ extern "C" {
     DEPRECATED(LLAMA_API void llama_set_warmup(struct llama_context * ctx, bool warmup),
             "user code should do warmup runs manually [TAG_LLAMA_GRAPH_NO_WARMUP]");
 
+    // Enable or disable CUDA graph capture for this context.
+    // Disabling graphs is necessary when a context runs operations that are incompatible
+    // with graph capture (e.g. MTP draft model with dynamic buffer reallocation).
+    LLAMA_API void llama_set_graphs_enabled(struct llama_context * ctx, bool enable);
+
     // Set abort callback
     LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);
 
