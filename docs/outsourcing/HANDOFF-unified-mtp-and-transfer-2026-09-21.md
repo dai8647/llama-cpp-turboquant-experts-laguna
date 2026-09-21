@@ -136,6 +136,12 @@ ggml-backend.cpp:272: tensor read out of bounds
 
 `l_last-47` is the last trunk layer's hidden-state tensor; it is empty (`nbytes=0`) when the MTP path tries to read it. This is a graph-construction/execution issue after the loader, not a loader or shape issue. No acceptance stats or gen t/s were produced; those remain unmeasured.
 
+### Graph handover fix (2026-09-21)
+
+The qwen4exp trunk graph was gathering the final residual with `inp_out_ids` regardless of `embeddings_nextn_masked`. The target path uses `masked=false` and expects full-row nextn embeddings, so the gather made `l_last-47` shorter than the copy request (and zero bytes during an empty-output prefill). The minimal fix gates the trunk gather on `cparams.embeddings_nextn_masked` and performs a separate final-LM-output gather for the unmasked target path, matching qwen3next.
+
+The build-mtp smoke (`ctx=2048`, `-n 1`, `HOST_BANK=0`, `--no-warmup`) no longer hits the OOB/null-buffer path and reaches draft-mtp initialization and token generation. A canonical `ctx=8192`, `-n 256` run generated 8 tokens and then hit a separate transient ROCm copy-stream creation failure (`hipStreamCreateWithFlags`, current device -1). No valid MTP gen t/s or acceptance result exists yet.
+
 ## 報告
 
 各ブロッカーについて「何が原因だったか / 何を直したか (または設計案) / 実測値 / 残課題」を報告。数値は推測せず、取れなければ「未計測」と明記。

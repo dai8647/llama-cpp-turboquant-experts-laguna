@@ -119,7 +119,27 @@ ggml_backend_tensor_get_async OOB: tensor=l_last-47 offset=0 size=368640 nbytes=
 ggml-backend.cpp:272: tensor read out of bounds
 ```
 
-The last trunk hidden-state tensor (`l_last-47`) is empty when the MTP graph reads itee. This is a graph-construction/execution issue after loading. Acceptance stats and gen t/s remain unmeasured.
+The last trunk hidden-state tensor (`l_last-47`) is empty when the MTP graph reads it. This is a graph-construction/execution issue after loading. Acceptance stats and gen t/s remain unmeasured.
+
+### MTP graph handover fix (2026-09-21)
+
+Root cause: the qwen4exp trunk graph always gathered the last-layer residual through `inp_out_ids`, even when `embeddings_nextn_masked=false`. The target MTP path requests full-row nextn embeddings (`n_rows=ubatch.n_tokens`), but the gathered `l_last-47` tensor had only output rows; during prefill it could have `nbytes=0`. This caused:
+
+```text
+ggml_backend_tensor_get_async OOB: tensor=l_last-47 ... nbytes=0
+```
+
+The fix matches qwen3next: gather the last trunk layer only when `cparams.embeddings_nextn_masked` is true, and gather the final LM output separately when it is false. The smoke run with `build-mtp`, ctx 2048, `-n 1`, `HOST_BANK=0`, and `--no-warmup` then passed the previous OOB/assert path and reached draft-mtp initialization and token generation without OOB, null-buffer, or ROCm errors.
+
+A canonical ctx 8192 / `-n 256` run also reached `adding speculative implementation 'draft-mtp'` and generated 8 tokens, but then stopped on a separate transient GPU resource failure:
+
+```text
+ROCm error: unspecified launch failure
+function: ext_copy_stream_get
+stmt: hipStreamCreateWithFlags(&ext_copy_stream, 0x01)
+```
+
+The canonical run therefore has no valid gen t/s median or acceptance result. Its partial output was 8 tokens at a reported predicted rate around `0.28 t/s`, but this is invalid because the run aborted and must not be used as the MTP benchmark result. Artifact: `mtp_canonical.log`.
 
 ## MTP draft-mtp retest (2026-09-21)
 
