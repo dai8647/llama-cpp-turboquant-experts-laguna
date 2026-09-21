@@ -2676,6 +2676,7 @@ void ggml_backend_cuda_ext_h2d_async(ggml_backend_t backend, ggml_tensor * tenso
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    ggml_cuda_set_device(cuda_ctx->device);
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, host, size,
                                cudaMemcpyHostToDevice, cuda_ctx->ext_copy_stream_get()));
 }
@@ -2684,6 +2685,8 @@ void * ggml_backend_cuda_ext_event_create(ggml_backend_t backend) {
     if (backend == nullptr || !ggml_backend_is_cuda(backend)) {
         return nullptr;
     }
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
     cudaEvent_t event = nullptr;
     CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
     return (void *) event;
@@ -2694,6 +2697,7 @@ void ggml_backend_cuda_ext_event_record(ggml_backend_t backend, void * event) {
         return;
     }
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
     CUDA_CHECK(cudaEventRecord((cudaEvent_t) event, cuda_ctx->ext_copy_stream_get()));
 }
 
@@ -2722,7 +2726,10 @@ void ggml_backend_cuda_ext_event_destroy(ggml_backend_t backend, void * event) {
     if (event == nullptr) {
         return;
     }
-    GGML_UNUSED(backend);
+    if (backend != nullptr && ggml_backend_is_cuda(backend)) {
+        ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+        ggml_cuda_set_device(cuda_ctx->device);
+    }
     CUDA_CHECK(cudaEventDestroy((cudaEvent_t) event));
 }
 

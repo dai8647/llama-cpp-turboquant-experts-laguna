@@ -1510,10 +1510,12 @@ struct ggml_backend_cuda_context {
     // dedicated copy stream for the MoE expert-slot prefetch extension
     // (ggml_backend_cuda_ext_*); never used for compute
     cudaStream_t ext_copy_stream = nullptr;
+    std::mutex ext_copy_stream_mutex;
 
     cudaStream_t ext_copy_stream_get() {
+        std::lock_guard<std::mutex> lock(ext_copy_stream_mutex);
+        ggml_cuda_set_device(device);
         if (ext_copy_stream == nullptr) {
-            ggml_cuda_set_device(device);
             CUDA_CHECK(cudaStreamCreateWithFlags(&ext_copy_stream, cudaStreamNonBlocking));
         }
         return ext_copy_stream;

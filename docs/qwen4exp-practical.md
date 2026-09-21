@@ -141,6 +141,14 @@ stmt: hipStreamCreateWithFlags(&ext_copy_stream, 0x01)
 
 The canonical run therefore has no valid gen t/s median or acceptance result. Its partial output was 8 tokens at a reported predicted rate around `0.28 t/s`, but this is invalid because the run aborted and must not be used as the MTP benchmark result. Artifact: `mtp_canonical.log`.
 
+### MTP copy-stream owner-device fix (2026-09-21)
+
+The target MoE pinned-stage materialize path lazily created a backend-owned copy stream from CPU-side remap/post-graph work. On HIP, the current device is host-thread local, so the stream/event APIs were hardened to select the backend context's owner device on every stream/H2D/event operation and to serialize lazy stream creation with a mutex. No device-0 fallback was added.
+
+A `build-mtp` no-warmup smoke (`ctx=2048`, `-n 1`, `HOST_BANK=0`) reached `adding speculative implementation 'draft-mtp'` and one generated token without the old OOB/null-buffer/copy-stream `current device=-1` failure. The one-token timing is not a performance measurement.
+
+The subsequent canonical ctx8192/256-token run still did not complete: it reached draft-mtp initialization and prompt processing, then stopped on a later ROCm error with no valid acceptance or generation rate. See `docs/outsourcing/HANDOFF-mtp-stream-abort-2026-09-21.md` for the raw artifact paths and remaining capture work.
+
 ## MTP draft-mtp retest (2026-09-21)
 
 The repaired draft was tested with the `build-mtp` binary only:
