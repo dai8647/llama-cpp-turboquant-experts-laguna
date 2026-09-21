@@ -109,6 +109,33 @@ The draft writer was corrected to preserve quantized raw byte-row shapes for 1D/
 
 The next MTP load no longer reports tensor shape errors, but still fails in `load_tensors` with `invalid vector subscript` after all 33 draft tensors are enumerated. No MTP context, draft KV, acceptance, or gen t/s was reached. No ROCm abort occurred. The remaining blocker is an internal vector access in the qwen4exp draft loader path; do not change the loader speculatively until a stack trace or narrow source logging identifies the exact access.
 
+### Root cause found and fixed (2026-09-21, second pass)
+
+Diagnostic logging in `src/models/qwen4exp.cpp` and `src/llama-model.cpp` proved that the draft model loads correctly:
+
+- `n_layer_all=49`, `n_layer_nextn=1`, `n_layer=48`
+- `layers.size()=49`, `load_mtp=1`, `mtp_probe_missing=1`, `mtp_only=1`
+- `loading MTP layer il=48 layers=49` succeeded
+- `adding speculative implementation 'draft-mtp'` was reached
+
+The `invalid vector subscript` exception was not a layer-vector problem. It came from `src/llama-model.cpp`:
+
+```text
+std::upper_bound(...) - splits.begin()  // returned devices.size() at the split endpoint
+devices.at(layer_gpu)                    // std::out_of_range -> "invalid vector subscript"
+```
+
+The fix clamps the upper_bound result to `devices.size()-1` and replaces the `.at()` with a checked `find` on `gpu_buft_list` (committed). This is a single-GPU split-rounding issue that the draft load hit on the first offloaded layer.
+
+With that fix the draft loads and the speculative draft-mtp implementation is installedifting, but generation stops with a new failure:
+
+```text
+ggml_backend_tensor_get_async OOB: tensor=l_last-47 offset=0 size=368640 nbytes=0
+ggml-backend.cpp:272: tensor read out of bounds
+```
+
+`l_last-47` is the last trunk layer's hidden-state tensor; it is empty (`nbytes=0`) when the MTP path tries to read it. This is a graph-construction/execution issue after the loader, not a loader or shape issue. No acceptance stats or gen t/s were produced; those remain unmeasured.
+
 ## 報告
 
 各ブロッカーについて「何が原因だったか / 何を直したか (または設計案) / 実測値 / 残課題」を報告。数値は推測せず、取れなければ「未計測」と明記。

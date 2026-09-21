@@ -108,6 +108,19 @@ llama_model_load: error loading model: invalid vector subscript
 
 The trace shows all 33 draft tensors being indexed with valid shapes immediately before the failure. There is no `n_layer_nextn = 1`, MTP context creation, draft KV allocation, acceptance statistic, or generation rate. No ROCm abort occurred. The remaining issue is an internal vector access in the qwen4exp draft loader path, not the original raw-shape bug. A stack trace or narrow logging around the `load_arch_tensors` vector accesses is required before changing the loader. MTP gen t/s and acceptance remain unmeasured.
 
+### MTP loader root cause (2026-09-21, second pass)
+
+The `invalid vector subscript` was `src/llama-model.cpp`'s `devices.at(layer_gpu)` where `std::upper_bound` on the device splits returned `devices.size()` at a split endpoint. The fix clamps the index to `devices.size()-1` and checks `gpu_buft_list` with `find` instead of `at`. After this fix the draft model loads correctly (`n_layer_all=49`, `n_layer_nextn=1`, `n_layer=48`, `mtp_only=1`, `loading MTP layer il=48 layers=49`) and `adding speculative implementation 'draft-mtp'` is reached.
+
+Generation then fails with a new, non-loader error:
+
+```text
+ggml_backend_tensor_get_async OOB: tensor=l_last-47 offset=0 size=368640 nbytes=0
+ggml-backend.cpp:272: tensor read out of bounds
+```
+
+The last trunk hidden-state tensor (`l_last-47`) is empty when the MTP graph reads itee. This is a graph-construction/execution issue after loading. Acceptance stats and gen t/s remain unmeasured.
+
 ## MTP draft-mtp retest (2026-09-21)
 
 The repaired draft was tested with the `build-mtp` binary only:

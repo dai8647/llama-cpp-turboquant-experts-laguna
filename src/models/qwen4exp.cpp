@@ -153,6 +153,9 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
         }
     }
 
+    LLAMA_LOG_INFO("qwen4exp: hparams n_layer_all=%u n_layer_nextn=%u n_layer=%u\n",
+            hparams.n_layer_all, hparams.n_layer_nextn, hparams.n_layer());
+
     switch (hparams.n_layer()) {
         case 48: type = LLM_TYPE_80B_A3B; break;
         default: type = LLM_TYPE_UNKNOWN;
@@ -203,11 +206,15 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
 
     // An MTP-only file carries just the draft block. Keep walking the trunk so the
     // per-layer bookkeeping still runs, but let its tensors be absent.
-    const bool mtp_only = hparams.n_layer_nextn > 0 && ml.get_weight("blk.0.hc_attn_norm.weight") == nullptr;
+    const bool mtp_probe_missing = ml.get_weight("blk.0.hc_attn_norm.weight") == nullptr;
+    const bool mtp_only = hparams.n_layer_nextn > 0 && mtp_probe_missing;
     const int  trunk_flags = mtp_only ? TENSOR_NOT_REQUIRED : 0;
+    LLAMA_LOG_INFO("qwen4exp: load_arch_tensors layers=%zu n_layer_all=%u n_layer=%u n_layer_nextn=%u load_mtp=%d mtp_probe_missing=%d mtp_only=%d\n",
+            layers.size(), hparams.n_layer_all, n_layer, hparams.n_layer_nextn,
+            ml.load_mtp ? 1 : 0, mtp_probe_missing ? 1 : 0, mtp_only ? 1 : 0);
 
     for (int il = 0; il < n_layer; ++il) {
-        auto & layer = layers[il];
+        auto & layer = layers.at(il);
 
         const int64_t n_ff_exp   = hparams.n_ff_exp ? hparams.n_ff_exp : n_ff / n_expert_used;
         const int64_t n_ff_shexp = hparams.n_ff_shexp ? hparams.n_ff_shexp : n_ff;
@@ -277,7 +284,8 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     // The MTP draft block sits one past the trunk. It is a full qwen4exp layer plus the
     // three nextn tensors, and is skipped unless the file is opened as a draft.
     for (int il = n_layer; il < n_layer + (int) hparams.n_layer_nextn; ++il) {
-        auto & layer = layers[il];
+        LLAMA_LOG_INFO("qwen4exp: loading MTP layer il=%d layers=%zu\n", il, layers.size());
+        auto & layer = layers.at(il);
 
         const int64_t n_ff_exp   = hparams.n_ff_exp   ? hparams.n_ff_exp   : n_ff / n_expert_used;
         const int64_t n_ff_shexp = hparams.n_ff_shexp ? hparams.n_ff_shexp : n_ff;
