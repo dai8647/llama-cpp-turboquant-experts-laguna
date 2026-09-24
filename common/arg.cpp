@@ -2748,6 +2748,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"--moe-gpu-expert-global-lru"},
+        "share the MoE GPU expert slot budget across all layers with a global LRU eviction pool (requires --moe-gpu-expert-slot-num)",
+        [](common_params & params) {
+            params.moe_gpu_expert_global_lru = true;
+        }
+    ).set_env("LLAMA_ARG_MOE_GPU_EXPERT_GLOBAL_LRU"));
+    add_opt(common_arg(
         {"--moe-freq-report-out"}, "PATH",
         "Pass 1: collect MoE expert access statistics and write them to this JSON file after inference (enables access tracking)",
         [](common_params & params, const std::string & value) {

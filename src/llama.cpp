@@ -1195,6 +1195,12 @@ void llama_moe_gpu_expert_slot_auto_init(struct llama_model & model) {
     if (const char * pf = getenv("LLAMA_MOE_PREFETCH_MS")) {
         cache.prefetch_budget_ms = atof(pf);
     }
+    // global-LRU paging freezes per-step slot decisions into a captured
+    // graph; the context must disable capture (consumed after KV allocation)
+    if (cache.global_lru_enabled) {
+        cache.graphs_disable_pending = true;
+        LLAMA_LOG_INFO("%s: global-LRU enabled - CUDA graphs will be disabled for accel backends\n", __func__);
+    }
     // (b) main merge: q* bandwidth-adaptive split dropped (audit 2026-08-25:
     // qstar_cpu=0 across all measured rounds, calibrate crashes mid-loop)
     llama_moe_gpu_expert_slot_prefill_configure(cache);
@@ -1469,6 +1475,20 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                     model->moe_gpu_expert_cache.materialize_userdata = (llama_model *) model;
                     if (const char * pf = getenv("LLAMA_MOE_PREFETCH_MS")) {
                         model->moe_gpu_expert_cache.prefetch_budget_ms = atof(pf);
+                    }
+                    // global LRU: env knob shared with the auto path, or the model params flag
+                    if (const char * glru = getenv("LLAMA_MOE_GLOBAL_LRU")) {
+                        model->moe_gpu_expert_cache.global_lru_enabled = glru[0] != '\0' && glru[0] != '0';
+                    }
+                    if (params.moe_gpu_expert_global_lru) {
+                        model->moe_gpu_expert_cache.global_lru_enabled = true;
+                    }
+                    // global-LRU paging freezes per-step slot decisions into a
+                    // captured graph; the context must disable capture (consumed
+                    // after KV allocation)
+                    if (model->moe_gpu_expert_cache.global_lru_enabled) {
+                        model->moe_gpu_expert_cache.graphs_disable_pending = true;
+                        LLAMA_LOG_INFO("%s: global-LRU enabled - CUDA graphs will be disabled for accel backends\n", __func__);
                     }
                     llama_moe_gpu_expert_slot_prefill_configure(model->moe_gpu_expert_cache);
                     LLAMA_LOG_INFO("%s: initialized MoE GPU expert slot cache with %d slots (requested %d)\n", __func__, effective_slots, requested_slots);

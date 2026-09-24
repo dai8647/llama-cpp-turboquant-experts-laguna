@@ -1027,8 +1027,13 @@ struct llama_moe_gpu_expert_cache {
     }
 
     int32_t find_free(int32_t layer_id) const {
+        if (n_slots <= 0) {
+            return -1;
+        }
         const auto * layer_slots = slots_for_layer(layer_id);
         if (layer_slots == nullptr) {
+            // no per-layer vector yet: all slots are free by construction;
+            // slot 0 is safe, the vector is created lazily on assignment
             return 0;
         }
         for (int32_t i = 0; i < n_slots; ++i) {
@@ -1045,7 +1050,7 @@ struct llama_moe_gpu_expert_cache {
         }
         const auto * layer_slots = slots_for_layer(layer_id);
         if (layer_slots == nullptr) {
-            return 0;
+            return 0; // empty vector: every slot unused, slot 0 wins
         }
         int32_t victim = 0;
         for (int32_t i = 1; i < n_slots; ++i) {
