@@ -691,6 +691,8 @@ static bool llama_moe_gpu_expert_slot_materialize(
     // (the slot is deliberately non-resident while in flight, so find_free
     // can hand it to a new owner). wait for it before touching the region -
     // if the new owner is the same expert the copy already wrote the data.
+    // (no CUDA ext API in this build => no inflight copies ever, skip the wait)
+#ifdef GGML_USE_CUDA
     if (cache.prefill_pf_enabled) {
         std::lock_guard<std::recursive_mutex> lock(cache.cache_mutex);
         for (auto it = cache.prefill_pf_inflight.begin(); it != cache.prefill_pf_inflight.end(); ++it) {
@@ -711,6 +713,7 @@ static bool llama_moe_gpu_expert_slot_materialize(
             break;
         }
     }
+#endif // GGML_USE_CUDA
 
     ggml_backend_dev_t dev = llama_moe_gpu_expert_slot_device(model);
     if (dev == nullptr) {
@@ -925,6 +928,12 @@ static void llama_moe_gpu_expert_slot_prefill_configure(llama_moe_gpu_expert_cac
             cache.prefill_pf_max_inflight = v;
         }
     }
+#ifndef GGML_USE_CUDA
+    if (cache.prefill_pf_enabled) {
+        LLAMA_LOG_WARN("%s: MoE prefill double buffering needs the CUDA ext API - disabled in this build\n", __func__);
+        cache.prefill_pf_enabled = false;
+    }
+#endif
     if (cache.prefill_pf_enabled) {
         LLAMA_LOG_INFO("%s: MoE prefill double buffering enabled (budget=%.2f MiB/ubatch, max_inflight=%lld)\n",
                 __func__, cache.prefill_pf_budget_bytes / 1048576.0,
@@ -937,6 +946,9 @@ void llama_moe_gpu_expert_slot_prefill_prefetch(struct llama_model & model, stru
     if (!cache.enabled() || !cache.prefill_pf_enabled || backend == nullptr) {
         return;
     }
+#ifndef GGML_USE_CUDA
+    return; // no CUDA ext API in this build: misses stay synchronous
+#else
     if (ggml_backend_cuda_ext_copy_stream(backend) == nullptr) {
         return; // unsupported backend: misses stay synchronous
     }
@@ -1075,6 +1087,7 @@ void llama_moe_gpu_expert_slot_prefill_prefetch(struct llama_model & model, stru
             cache.prefill_pf_inflight.push_back({ layer_id, slot, expert_id, event });
         }
     }
+#endif // GGML_USE_CUDA
 }
 
 void llama_moe_gpu_expert_slot_prefill_shutdown(struct llama_model & model) {
@@ -1083,10 +1096,12 @@ void llama_moe_gpu_expert_slot_prefill_shutdown(struct llama_model & model) {
         return;
     }
     std::lock_guard<std::recursive_mutex> lock(cache.cache_mutex);
+#ifdef GGML_USE_CUDA
     for (auto & c : cache.prefill_pf_inflight) {
         ggml_backend_cuda_ext_event_synchronize(c.event);
         ggml_backend_cuda_ext_event_destroy(cache.prefill_pf_backend, c.event);
     }
+#endif
     cache.prefill_pf_inflight.clear();
 }
 

@@ -464,7 +464,9 @@ llama_context::llama_context(
 
         // q*/global-LRU paging freezes per-step slot decisions into a captured
         // graph; disable capture for this context's accel backends instead of
-        // requiring GGML_CUDA_DISABLE_GRAPHS globally (see llama.cpp model load)
+        // requiring GGML_CUDA_DISABLE_GRAPHS globally (see llama.cpp model load).
+        // The ext API only exists when the CUDA/HIP/MUSA backend is compiled in.
+#ifdef GGML_USE_CUDA
         if (model.moe_gpu_expert_cache.graphs_disable_pending) {
             for (auto * backend : backend_ptrs) {
                 if (ggml_backend_is_cuda(backend)) {
@@ -473,6 +475,7 @@ llama_context::llama_context(
             }
             LLAMA_LOG_INFO("%s: q*/global-LRU paging active - CUDA graphs disabled for accel backends\n", __func__);
         }
+#endif
 
         if (!cparams.flash_attn) {
             if (ggml_is_quantized(params.type_v)) {
