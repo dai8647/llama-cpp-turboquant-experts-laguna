@@ -994,7 +994,7 @@ struct llama_moe_gpu_expert_cache {
     // counters, misses only record the access and return -1. kept around as a
     // utility for any future planning pass (q* was dropped in the (b) main
     // merge; the original use case was its transfer-vs-host-exec decision).
-    int32_t find_touch(int32_t layer_id, int32_t expert_id, int64_t step) {
+    int32_t find_touch(int32_t layer_id, int32_t expert_id, [[maybe_unused]] int64_t step) {
         std::lock_guard<std::recursive_mutex> lock(cache_mutex);
         record_access(layer_id, expert_id);
         const int32_t slot = find(layer_id, expert_id);
