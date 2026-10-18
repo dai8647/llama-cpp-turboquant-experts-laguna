@@ -685,14 +685,13 @@ static bool llama_moe_gpu_expert_slot_materialize(
         return false;
     }
 
-    auto & cache = model.moe_gpu_expert_cache;
-
     // a background prefill copy may still be writing this slot's bank region
     // (the slot is deliberately non-resident while in flight, so find_free
     // can hand it to a new owner). wait for it before touching the region -
     // if the new owner is the same expert the copy already wrote the data.
     // (no CUDA ext API in this build => no inflight copies ever, skip the wait)
 #ifdef GGML_USE_CUDA
+    auto & cache = model.moe_gpu_expert_cache;
     if (cache.prefill_pf_enabled) {
         std::lock_guard<std::recursive_mutex> lock(cache.cache_mutex);
         for (auto it = cache.prefill_pf_inflight.begin(); it != cache.prefill_pf_inflight.end(); ++it) {
