@@ -213,3 +213,4 @@ jobs:
       #     cd build
       #     $env:LLAMA_SKIP_TESTS_SLOW_ON_EMULATOR = 1
       #     & $sde -future -- ctest -L main -C Release --verbose --timeout 900
+# ci-trigger: force CI (cpu) to re-run
