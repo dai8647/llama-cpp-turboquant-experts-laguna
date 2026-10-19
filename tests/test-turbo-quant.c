@@ -104,7 +104,7 @@ static int check_chunked_dequant(enum ggml_type type, const char * name, int64_t
 
 /* MSE threshold check. Explicit comparison instead of assert() because tests
  * are built with NDEBUG in Release and assert() would compile out. */
-static int check_mse(const char * name, float mse, float threshold) {
+static int check_mse(const char * name, double mse, double threshold) {
     if (mse > threshold) {
         printf("  %s: FAIL: MSE=%.8f exceeds threshold %.8f\n", name, (double)mse, (double)threshold);
         return 1;
@@ -117,7 +117,7 @@ int main(void) {
     const int d = 128;
     char buf[256];
     float input[128], output[128];
-    double mse, cosv, ni, no;
+    float mse, cosv, ni, no;
     int failures = 0;
 
     printf("=== TurboQuant C Round-Trip Test ===\n\n");
@@ -139,8 +139,8 @@ int main(void) {
     mse = cosv = ni = no = 0;
     for (int i = 0; i < d; i++) { mse += (input[i]-output[i])*(input[i]-output[i]); cosv += input[i]*output[i]; ni += input[i]*input[i]; no += output[i]*output[i]; }
     mse /= d;
-    printf("  MSE=%.8f Cosine=%.6f OutNorm=%.6f\n",  mse, (double)(ni > 0 && no > 0 ? cosv/sqrtf(ni)/sqrtf(no) : 0), (double)(sqrtf(no)));
-    failures += check_mse("turbo3 basis", (float)mse, TURBO3_MSE_THRESHOLD);
+    printf("  MSE=%.8f Cosine=%.6f OutNorm=%.6f\n",  (double)mse, (double)(ni > 0 && no > 0 ? cosv/sqrtf(ni)/sqrtf(no) : 0), (double)sqrtf(no));
+    failures += check_mse("turbo3 basis", (double)mse, (double)TURBO3_MSE_THRESHOLD);
     printf("\n");
 
     /* Test 2: turbo3 large-norm vector */
@@ -154,8 +154,8 @@ int main(void) {
     mse = cosv = ni = no = 0;
     for (int i = 0; i < d; i++) { mse += (input[i]-output[i])*(input[i]-output[i]); cosv += input[i]*output[i]; ni += input[i]*input[i]; no += output[i]*output[i]; }
     mse /= d;
-    printf("  MSE=%.8f Cosine=%.6f InNorm=%.2f OutNorm=%.2f\n",  mse, (double)(cosv/sqrtf(ni)/sqrtf(no)), (double)(sqrtf(ni)), (double)(sqrtf(no)));
-    failures += check_mse("turbo3 sin*10", (float)mse, TURBO3_MSE_THRESHOLD);
+    printf("  MSE=%.8f Cosine=%.6f InNorm=%.2f OutNorm=%.2f\n",  (double)mse, (double)(cosv/sqrtf(ni)/sqrtf(no)), (double)sqrtf(ni), (double)sqrtf(no));
+    failures += check_mse("turbo3 sin*10", (double)mse, (double)TURBO3_MSE_THRESHOLD);
     printf("\n");
 
     /* Test 3: turbo2 (2-bit, worst fidelity) basis + sinusoidal
@@ -174,8 +174,8 @@ int main(void) {
     mse = cosv = ni = no = 0;
     for (int i = 0; i < d; i++) { mse += (input[i]-output[i])*(input[i]-output[i]); cosv += input[i]*output[i]; ni += input[i]*input[i]; no += output[i]*output[i]; }
     mse /= d;
-    printf("  MSE=%.8f Cosine=%.6f OutNorm=%.6f\n",  mse, (double)(ni > 0 && no > 0 ? cosv/sqrtf(ni)/sqrtf(no) : 0), (double)(sqrtf(no)));
-    failures += check_mse("turbo2 basis", (float)mse, TURBO2_MSE_THRESHOLD);
+    printf("  MSE=%.8f Cosine=%.6f OutNorm=%.6f\n",  (double)mse, (double)(ni > 0 && no > 0 ? cosv/sqrtf(ni)/sqrtf(no) : 0), (double)sqrtf(no));
+    failures += check_mse("turbo2 basis", (double)mse, (double)TURBO2_MSE_THRESHOLD);
     printf("\n");
 
     for (int i = 0; i < d; i++) input[i] = sinf(i*0.1f+0.5f) * 10.0f;
@@ -188,8 +188,8 @@ int main(void) {
     mse = cosv = ni = no = 0;
     for (int i = 0; i < d; i++) { mse += (input[i]-output[i])*(input[i]-output[i]); cosv += input[i]*output[i]; ni += input[i]*input[i]; no += output[i]*output[i]; }
     mse /= d;
-    printf("  MSE=%.8f Cosine=%.6f InNorm=%.2f OutNorm=%.2f\n",  mse, (double)(cosv/sqrtf(ni)/sqrtf(no)), (double)(sqrtf(ni)), (double)(sqrtf(no)));
-    failures += check_mse("turbo2 sin*10", (float)mse, TURBO2_MSE_THRESHOLD);
+    printf("  MSE=%.8f Cosine=%.6f InNorm=%.2f OutNorm=%.2f\n",  (double)mse, (double)(cosv/sqrtf(ni)/sqrtf(no)), (double)sqrtf(ni), (double)sqrtf(no));
+    failures += check_mse("turbo2 sin*10", (double)mse, (double)TURBO2_MSE_THRESHOLD);
     printf("\n");
 
     /* Test 4: turbo4
@@ -207,8 +207,8 @@ int main(void) {
     mse = cosv = ni = no = 0;
     for (int i = 0; i < d; i++) { mse += (input[i]-output[i])*(input[i]-output[i]); cosv += input[i]*output[i]; ni += input[i]*input[i]; no += output[i]*output[i]; }
     mse /= d;
-    printf("  MSE=%.8f Cosine=%.6f\n",  mse, (double)(cosv/sqrtf(ni)/sqrtf(no)));
-    failures += check_mse("turbo4 cos*5", (float)mse, TURBO4_MSE_THRESHOLD);
+    printf("  MSE=%.8f Cosine=%.6f\n",  (double)mse, (double)(cosv/sqrtf(ni)/sqrtf(no)));
+    failures += check_mse("turbo4 cos*5", (double)mse, (double)TURBO4_MSE_THRESHOLD);
     printf("\n");
 
     /* Test 5: chunk-boundary invariant for every type with a chunked vec_dot */
